@@ -135,6 +135,8 @@ def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
         raise RuntimeError(
             "CONTROL_PLANE_URL is set but R2G_TENANT is not: name the tenant this r2g serves"
         )
+    if problem := control_plane.sdk_problem():
+        raise RuntimeError(f"CONTROL_PLANE_URL is set but {problem}")
 
     # uvicorn's access logger, once per process however many apps are created.
     logging.getLogger("uvicorn.access").addFilter(_REDACT_TOKEN_IN_QUERY)

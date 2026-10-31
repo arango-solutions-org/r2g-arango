@@ -31,7 +31,10 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `$VAR` API key is refused, and so is a `base_url` without the request's own key, which
   would otherwise receive the server's key. r2g declares
   `mapping.update`, `data.load` and `data.migrate` (each taking a class optionally) and
-  `transformation.update`, which need the control plane's SDK with optional terms.
+  `transformation.update`, which need the control plane's SDK with optional terms
+  (arango-argos, `sdk/python`, 0.1.0 or later). Under a control plane the Studio refuses
+  to start on an older SDK, and `control-plane.Dockerfile` refuses to build with one: an
+  older SDK rejects a policy declaring these actions and then denies every action.
   Without `CONTROL_PLANE_URL` nothing changes.
 
 - **Mapping elements name the ontology term they stand for (PRD P14.8).** A table may

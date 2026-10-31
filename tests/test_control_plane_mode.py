@@ -367,6 +367,35 @@ def test_r2g_tenant_is_required_in_this_mode(tmp_path, monkeypatch):
     create_app(catalog_dir=str(tmp_path))
 
 
+@pytest.mark.parametrize("policy, refusal", [
+    (None, "is not installed"),                                            # no SDK
+    (types.ModuleType("control_plane_sdk.policy"), "no optional terms"),   # one before 0.1.0
+])
+def test_the_studio_does_not_start_on_an_sdk_without_optional_terms(
+    tmp_path, monkeypatch, policy, refusal
+):
+    """An older SDK rejects the policy declaring r2g's actions and then denies every action,
+    so the Studio refuses to start rather than refuse every change (P14.13)."""
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://cp.test/api")
+    monkeypatch.setenv("R2G_TENANT", "local")
+    monkeypatch.setitem(sys.modules, "control_plane_sdk.policy", policy)
+    with pytest.raises(RuntimeError, match=refusal):
+        create_app(catalog_dir=str(tmp_path))
+    # Outside a control plane the SDK is not needed.
+    monkeypatch.delenv("CONTROL_PLANE_URL")
+    create_app(catalog_dir=str(tmp_path))
+
+
+def test_the_studio_starts_on_an_sdk_with_optional_terms(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://cp.test/api")
+    monkeypatch.setenv("R2G_TENANT", "local")
+    policy = types.ModuleType("control_plane_sdk.policy")
+    policy.TARGET_KINDS = frozenset({"ontology-term", "optional-ontology-term"})  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "control_plane_sdk.policy", policy)
+    assert control_plane.sdk_problem() is None
+    create_app(catalog_dir=str(tmp_path))
+
+
 class TestCreatingIsScopedToo:
     """POST /api/projects and the demo preset have no name in the path, so the
     middleware's route check cannot see them (P14.3)."""
