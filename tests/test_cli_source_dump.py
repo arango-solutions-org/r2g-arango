@@ -257,3 +257,52 @@ class TestSourceDump:
             )
         assert result.exit_code == 0, result.output
         assert "postgresql (pg_src)" in result.output or "pg_src" in result.output
+
+
+class TestStreamSchemaFromSnapshot:
+    """``r2g stream --source <name>`` without ``--schema`` reads the source's latest
+    snapshot, as the Studio's load does, so a catalog project loads from the command line."""
+
+    def _run(self, args, tmp_path):
+        from r2g.config import ConfigManager
+
+        schema = Schema(tables={"users": Table(
+            name="users", columns=[Column(name="id", data_type="integer", is_primary_key=True)],
+            primary_key=["id"])})
+        config_path = tmp_path / "mapping.yaml"
+        ConfigManager.save_config(ConfigManager.generate_default_config(schema), str(config_path))
+        seen = {}
+
+        class _Pipeline:
+            def __init__(self, **kw):
+                seen["schema"] = kw["schema"]
+                self.errors = {}
+                self.previews = {}
+
+            def run(self, **kw):
+                return {"documents": [], "edges": [], "elapsed": 0.0}
+
+        with patch("r2g.connectors.base.create_source_connector",
+                   lambda *a, **kw: _FakeConnector()), \
+                patch("r2g.connectors.arango_writer.ArangoWriter"), \
+                patch("r2g.streaming.pipeline.StreamingPipeline", _Pipeline):
+            result = runner.invoke(app, ["stream", *args, "--config", str(config_path),
+                                         "--dry-run"])
+        return result, seen
+
+    def test_the_latest_snapshot_is_the_schema(self, catalog_with_source, tmp_path):
+        result, seen = self._run(["--source", "pg_src"], tmp_path)
+        assert result.exit_code == 0, result.output
+        assert set(seen["schema"].tables) == {"users", "orders"}
+
+    def test_a_source_without_a_snapshot_says_how_to_take_one(self, catalog_with_source,
+                                                               tmp_path):
+        CatalogManager(str(tmp_path / "catalog")).add_source(
+            "bare", "postgresql", "postgresql://localhost/x")
+        result, seen = self._run(["--source", "bare"], tmp_path)
+        assert result.exit_code == 1 and "r2g source snapshot bare" in result.output
+        assert not seen
+
+    def test_a_connection_string_still_needs_a_schema(self, tmp_path):
+        result, seen = self._run(["--pg-conn", "postgresql://localhost/x"], tmp_path)
+        assert result.exit_code == 2 and "--schema is needed" in result.output
