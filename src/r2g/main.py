@@ -937,7 +937,10 @@ def stream(
             "SQL Server, Snowflake, and ClickHouse"
         ),
     ),
-    schema_file: str = typer.Option(..., "--schema", "-s", help="Path to schema.json"),
+    schema_file: Optional[str] = typer.Option(
+        None, "--schema", "-s",
+        help="Path to schema.json (with --source, default: the source's latest snapshot)",
+    ),
     config_path: str = typer.Option(..., "--config", "-c", help="Mapping config YAML"),
     endpoint: str = typer.Option(
         "http://127.0.0.1:8529", "--endpoint", help="ArangoDB endpoint URL", envvar="ARANGO_ENDPOINT"
@@ -1005,9 +1008,20 @@ def stream(
     if not pg_conn and not source_name:
         console.print("[red]Specify either --source <name> or --pg-conn <url>.[/red]")
         raise typer.Exit(code=2)
+    snapshot_schema: Schema | None = None
+    if not schema_file:
+        if not source_name:
+            console.print("[red]--schema is needed with --pg-conn.[/red]")
+            raise typer.Exit(code=2)
+        snap = _get_catalog().get_latest_snapshot(source_name)
+        if snap is None:
+            console.print(f"[red]Source '{source_name}' has no snapshot.[/red] "
+                          f"Take one with `r2g source snapshot {source_name}`, or pass --schema.")
+            raise typer.Exit(code=1)
+        snapshot_schema = snap.schema_data
 
     try:
-        schema = Schema.load_from_file(schema_file)
+        schema = snapshot_schema or Schema.load_from_file(str(schema_file))
         mapping = ConfigManager.load_config(config_path)
 
         writer = ArangoWriter(

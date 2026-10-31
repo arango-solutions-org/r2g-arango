@@ -19,9 +19,13 @@ from fastapi.testclient import TestClient
 
 from r2g import control_plane, governed
 from r2g.catalog import CatalogManager
+from r2g.config import ConfigManager
 from r2g.mapping_changes import (
     PROJECT_WIDE,
+    GraphState,
     Item,
+    graph_items,
+    load_collections,
     load_items,
     migration_items,
     save_changes,
@@ -420,12 +424,33 @@ class FakePipeline:
         return {"documents": [], "edges": []}
 
 
+def laid_out(config: MappingConfig) -> GraphState:
+    """A target already holding the graph ``config`` declares, and every collection."""
+    defs = ConfigManager.graph_edge_definitions(config)
+    names = {c.target_collection for c in config.collections.values()}
+    names |= {n for d in defs for n in (d["edge_collection"], *d["from_vertex_collections"],
+                                        *d["to_vertex_collections"])}
+    return GraphState(defs, frozenset(names))
+
+
 @pytest.fixture
-def no_database(monkeypatch: pytest.MonkeyPatch) -> None:
+def no_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[GraphState | None]:
+    """No real target. It holds the saved mapping's graph and collections, unless a test
+    puts another state first in the returned list."""
     from r2g.ui import server
+
+    states: list[GraphState | None] = []
+
+    def state(*args: Any) -> GraphState | None:
+        if states:
+            return states[0]
+        return laid_out(ConfigManager.load_config(
+            tmp_path / "projects" / "library-catalog" / "mapping.yaml"))
 
     monkeypatch.setattr(server, "ArangoWriter", lambda **kw: object())
     monkeypatch.setattr(server, "StreamingPipeline", FakePipeline)
+    monkeypatch.setattr(server, "_graph_state", state)
+    return states
 
 
 def test_what_a_load_writes():
@@ -714,3 +739,55 @@ def test_a_project_starting_from_a_left_over_mapping_is_checked_on_it(cp, tmp_pa
     assert client.post("/api/projects", headers=as_(OWNER), json=body).status_code == 201
     assert "library-catalog/collections/books" in {
         e.entity for _, e in cp.recorded if e.action == "mapping.update"}
+
+
+# --- a load declares the named graph: checked when that changes something ------------------
+
+
+def test_declaring_the_graph_is_checked_only_when_it_changes_something():
+    config = mapping()
+    writes = load_collections(config, include=["authors", "members"])
+    assert writes == {"authors", "members"}
+    assert graph_items(config, laid_out(config), writes) == []      # nothing new: no check
+    [new] = graph_items(config, GraphState(None, frozenset()), writes)
+    assert (new.where, new.terms) == ("graph", (PROJECT_WIDE,))
+    assert new.what == ("graph: new", "creates, empty: books, borrowed_by, loans, wrote")
+    # A collection the graph names and the database lacks is created, empty, unchecked
+    # otherwise; one the load itself writes is checked on its class already.
+    missing = laid_out(config)
+    missing = GraphState(missing.declared, missing.collections - {"loans", "authors"})
+    assert [i.what for i in graph_items(config, missing, writes)] == [("creates, empty: loans",)]
+    other = GraphState(laid_out(config).declared[:1], laid_out(config).collections)
+    assert [i.what for i in graph_items(config, other, writes)] == [
+        ("graph: declared differently",)]
+    assert [i.what for i in graph_items(config, None, writes)] == [
+        ("graph: the target database could not be read",)]
+
+
+def test_a_load_that_would_lay_out_the_graph_needs_the_project_wide_rules(
+        studio, cp, no_database, tmp_path):
+    no_database.append(GraphState(None, frozenset()))                # a new database
+    body = {"include_tables": ["authors", "members"]}
+    r = studio.post("/api/projects/library-catalog/load", headers=as_(ANALYST), json=body)
+    assert r.status_code == 403, r.text
+    assert [(x["where"], x["term"]) for x in r.json()["detail"]["refused"]] == [("graph", None)]
+    assert CatalogManager(tmp_path).get_history(project_name="library-catalog") == []
+    # An owner lays it out, and that is recorded with the load.
+    r = studio.post("/api/projects/library-catalog/load", headers=as_(OWNER), json=body)
+    assert r.status_code == 202, r.text
+    graph = [e for _, e in cp.recorded if e.entity == "library-catalog/graph"]
+    assert [(e.term, e.decision.outcome) for e in graph] == [(None, "denied"),
+                                                             (None, "permitted")]
+    # Once laid out, the analyst's same load is checked on its tables only.
+    no_database.clear()
+    r = studio.post("/api/projects/library-catalog/load", headers=as_(ANALYST), json=body)
+    assert r.status_code == 202, r.text
+
+
+def test_a_dry_run_load_does_not_read_the_target(studio, cp, no_database, monkeypatch):
+    from r2g.ui import server
+
+    monkeypatch.setattr(server, "_graph_state", lambda *a: pytest.fail("read the target"))
+    r = studio.post("/api/projects/library-catalog/load", headers=as_(ANALYST),
+                    json={"include_tables": ["authors"], "dry_run": True})
+    assert r.status_code == 202

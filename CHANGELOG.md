@@ -24,8 +24,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are refused saying why (sources, targets and catalogs, deleting the project, demo
   presets, governance files); any other is refused by default. A load that drops its
   collections is checked on everything those collections hold, so in the graph layout with
-  shared collections, on every class. Creating a project no longer reads a mapping file
-  outside the tenant's catalog folder or inside another project's folder, and a project
+  shared collections, on every class. A load ends by declaring the project's named graph,
+  which creates any collection it names that the database lacks, empty: that step is
+  checked on the project-wide rules when it changes something (a new graph, one declared
+  differently, or a collection the load does not itself write), and recorded with the
+  load; once a project is laid out, a load is checked on its tables alone. Creating a
+  project no longer reads a mapping file outside the tenant's catalog folder or inside
+  another project's folder, and a project
   that starts from a folder left by a deleted one is checked on that folder's mapping.
   Suggesting an ontology no longer reads the server's environment for a request: a
   `$VAR` API key is refused, and so is a `base_url` without the request's own key, which
@@ -68,6 +73,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With `CONTROL_PLANE_URL` unset nothing changes.
 
 ### Changed
+
+- **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
+  latest snapshot is the schema, as for the Studio's load, so a catalog project loads
+  from the command line with its source and mapping alone. `--pg-conn` still needs
+  `--schema`; a source with no snapshot says how to take one.
 
 - **The CLI honours `R2G_CATALOG_DIR`**, as the MCP server already did, so storage can
   be per tenant (PRD P14.6).

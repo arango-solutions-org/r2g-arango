@@ -9,7 +9,7 @@ import re
 import secrets
 import threading
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, cast
 from urllib.parse import unquote_plus
 
 import yaml
@@ -63,6 +63,35 @@ def _resolve_env_ref(value: str) -> str:
 # The environment variables a suggestion request may name as its API key. Any other
 # name could hand one of the server's secrets to the provider (and back in its error).
 _LLM_KEY_VARS = frozenset({"OPENAI_API_KEY", "ANTHROPIC_API_KEY"})
+
+
+def _graph_state(endpoint: str, database: str, username: str, password: str,
+                 graph_name: str) -> Any:
+    """What a load's target holds now (:class:`r2g.mapping_changes.GraphState`): the named
+    graph's declaration and the collections. A database that does not exist yet holds
+    nothing. None when the target cannot be read, which the check treats as a change."""
+    from arango import ArangoClient
+    from arango.exceptions import ArangoServerError
+
+    from r2g.mapping_changes import GraphState
+
+    client = ArangoClient(hosts=endpoint)
+    try:
+        db = client.db(database, username=username, password=password)
+        try:
+            names = frozenset(c["name"] for c in cast(list[dict[str, Any]], db.collections()))
+        except ArangoServerError as exc:
+            if exc.error_code == 1228:  # database not found: the load creates it
+                return GraphState(None, frozenset())
+            raise
+        declared = (cast(list[dict[str, Any]], db.graph(graph_name).edge_definitions())
+                    if db.has_graph(graph_name) else None)
+        return GraphState(declared, names)
+    except Exception as exc:
+        logger.warning("load_target_unreadable", error_type=type(exc).__name__)
+        return None
+    finally:
+        client.close()
 
 
 def _redact_dlq_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -1880,13 +1909,18 @@ def create_app(
 
         g, written = None, []
         if governed:  # P14.10: every table and relationship it writes, on its class
-            from r2g.mapping_changes import load_items
+            from r2g.mapping_changes import graph_items, load_collections, load_items
 
             if body.emit_governance:
                 raise HTTPException(status_code=403, detail=governing.classify(
                     "POST", f"/api/projects/{name}/governance/emit")[1])
             written = load_items(config, body.include_tables, body.exclude_tables,
                                  drop=body.drop_collections)
+            if not body.dry_run:  # it ends by declaring the named graph: checked if it changes
+                state = await run_in_threadpool(_graph_state, *_resolve_target(project),
+                                                body.graph_name or name)
+                written += graph_items(config, state, load_collections(
+                    config, body.include_tables, body.exclude_tables))
             g = await _govern(request, name, "data.load", written)
 
         # Phase 9b governance gate: exclude above-threshold, unmasked fields by
