@@ -4425,7 +4425,7 @@ async function previewTable(sourceName, tableName) {
     html += '</tbody></table></div>';
     openModal('Preview: ' + tableName, html);
   } catch (e) {
-    toast('Preview failed: ' + e.message, 'error');
+    toast('Preview failed: ' + errorDetail(e), 'error');
   }
 }
 

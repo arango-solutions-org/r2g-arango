@@ -170,6 +170,15 @@ def test_every_change_route_is_governed_read_or_refused_as_the_prd_lists(cp, tmp
         "POST /api/projects/{name}/migrate", "PUT /api/projects/{name}/mapping"]
 
 
+def test_the_only_read_refused_is_the_one_returning_a_sources_rows(cp, tmp_path):
+    app = create_app(catalog_dir=str(tmp_path), host="0.0.0.0")
+    refused = sorted(route.path for route in app.routes
+                     if "GET" in getattr(route, "methods", set())
+                     and governed.classify("GET", route.path.replace("{name}", "x")
+                                           .replace("{table}", "t"))[0] == "refused")
+    assert refused == ["/api/sources/{name}/preview/{table}"]
+
+
 def test_a_change_route_nobody_classified_is_refused_by_default():
     kind, why = governed.classify("POST", "/api/projects/x/brand-new-thing")
     assert kind == "refused" and "not governed" in why
@@ -188,11 +197,13 @@ def test_a_change_route_nobody_classified_is_refused_by_default():
     ("DELETE", "/api/projects/library-catalog", "names this transformation project"),
     ("POST", "/api/demo-presets/snowflake-customer-360/install", "adds a source"),
     ("POST", "/api/projects/library-catalog/governance/emit", "governance files"),
+    ("GET", "/api/sources/library-csv/preview/authors", "returns the source's rows"),
 ])
 def test_a_refused_route_says_why_and_changes_nothing(studio, tmp_path, method, path, says):
     before = (tmp_path / "catalog.json").read_bytes() if (tmp_path / "catalog.json").exists() \
         else None
-    r = studio.request(method, path, headers=as_(OWNER), json={})
+    r = studio.request(method, path, headers=as_(OWNER),
+                       json=None if method == "GET" else {})
     assert r.status_code == 403 and says in r.json()["detail"]
     after = (tmp_path / "catalog.json").read_bytes() if (tmp_path / "catalog.json").exists() \
         else None

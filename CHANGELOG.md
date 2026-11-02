@@ -17,6 +17,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under a control plane, a table preview is refused (PRD P14.12).** The preview returns
+  up to 1,000 of a source's rows, of any source in the tenant, and every read was served
+  without the policy deciding, so anyone who could open r2g in one project could read the
+  rows of every source. It now answers 403 with why; standalone r2g is unchanged. The
+  preview's error message now shows the API's reason rather than its raw reply.
 - **Under a control plane, a load that lays out the project is checked on the
   project-wide rules (PRD P14.10).** A load ends by declaring the project's named graph,
   which creates any collection it names that the database lacks, empty. That step is now
