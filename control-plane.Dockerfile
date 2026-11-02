@@ -31,6 +31,8 @@ RUN pip install --no-cache-dir ".[ui]"
 RUN --mount=type=bind,from=control_plane_sdk,target=/sdk \
     if [ -f /sdk/pyproject.toml ]; then pip install --no-cache-dir /sdk; \
     else echo "missing --build-context control_plane_sdk=<control plane repo>/sdk/python" >&2; exit 1; fi
+# The image would refuse to start on an SDK without optional terms (P14.13): fail here.
+RUN python -c "import sys; from r2g.control_plane import sdk_problem; sys.exit(sdk_problem())"
 RUN mkdir -p /data && chown r2g:r2g /data
 ENV R2G_CATALOG_DIR=/data
 USER r2g

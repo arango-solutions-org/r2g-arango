@@ -16,6 +16,21 @@ def _wide_terminal(monkeypatch):
     """
     monkeypatch.setenv("COLUMNS", "200")
 
+
+@pytest.fixture(autouse=True)
+def _control_plane_sdk_policy(monkeypatch):
+    """Stand in for the control plane's SDK policy module (P14.13), which is not installed
+    here, so a Studio under a control plane starts. A test replaces it to check the refusal.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    if importlib.util.find_spec("control_plane_sdk") is None:
+        policy = types.ModuleType("control_plane_sdk.policy")
+        policy.TARGET_KINDS = ("ontology-term", "optional-ontology-term")  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "control_plane_sdk.policy", policy)
+
 SAMPLE_ROWS = [
     ("1", "Alice", "alice@example.com", "30", "true"),
     ("2", "Bob", "bob@example.com", "25", "true"),

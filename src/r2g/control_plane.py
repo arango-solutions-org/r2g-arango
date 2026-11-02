@@ -23,6 +23,7 @@ interface below, which keeps the server testable without the SDK.
 
 from __future__ import annotations
 
+import importlib
 import os
 import threading
 import time
@@ -40,6 +41,23 @@ ACTIONS: dict[str, dict[str, str | None]] = {
     "data.migrate": {"tool": TOOL_ID, "version": "1", "targets": "optional-ontology-term"},
     "transformation.update": {"tool": TOOL_ID, "version": "1", "targets": None},
 }
+
+
+def sdk_problem() -> str | None:
+    """Why the installed control-plane SDK cannot decide r2g's :data:`ACTIONS`, or ``None``.
+
+    They need its optional terms (FR-5.8, SDK 0.1.0). An older SDK rejects the policy that
+    declares them and then denies every action, so r2g refuses to start on one (P14.13).
+    """
+    need = "the control plane's SDK 0.1.0 or later (arango-argos, sdk/python)"
+    try:
+        policy = importlib.import_module("control_plane_sdk.policy")
+    except ImportError:
+        return f"{need} is not installed"
+    # TARGET_KINDS came with optional terms; an older SDK has neither.
+    if "optional-ontology-term" not in getattr(policy, "TARGET_KINDS", ()):
+        return f"the installed control-plane SDK has no optional terms: install {need}"
+    return None
 
 
 class ContextRejected(Exception):  # noqa: N818 - mirrors the SDK's TokenRejected
