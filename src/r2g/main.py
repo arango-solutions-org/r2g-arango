@@ -937,7 +937,10 @@ def stream(
             "SQL Server, Snowflake, and ClickHouse"
         ),
     ),
-    schema_file: str = typer.Option(..., "--schema", "-s", help="Path to schema.json"),
+    schema_file: Optional[str] = typer.Option(
+        None, "--schema", "-s",
+        help="Path to schema.json (with --source, default: the source's latest snapshot)",
+    ),
     config_path: str = typer.Option(..., "--config", "-c", help="Mapping config YAML"),
     endpoint: str = typer.Option(
         "http://127.0.0.1:8529", "--endpoint", help="ArangoDB endpoint URL", envvar="ARANGO_ENDPOINT"
@@ -948,10 +951,11 @@ def stream(
     batch_size: int = typer.Option(10000, "--batch-size", "-b", help="Rows per batch"),
     on_duplicate: str = typer.Option("replace", "--on-duplicate", help="ArangoDB on-duplicate strategy"),
     graph_name: Optional[str] = typer.Option(None, "--graph-name", help="Create a named graph after import"),
-    pg_schema: str = typer.Option(
-        "public",
+    pg_schema: Optional[str] = typer.Option(
+        None,
         "--pg-schema",
-        help="Source namespace/schema to stream (meaning depends on source type)",
+        help="Source namespace/schema to stream (meaning depends on source type; default: "
+             "the snapshot's when the schema comes from it, else public)",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Validate connections and preview data without writing to ArangoDB"
@@ -1005,9 +1009,26 @@ def stream(
     if not pg_conn and not source_name:
         console.print("[red]Specify either --source <name> or --pg-conn <url>.[/red]")
         raise typer.Exit(code=2)
+    snapshot_schema: Schema | None = None
+    if not schema_file:
+        if not source_name:
+            console.print("[red]--schema is needed with --pg-conn.[/red]")
+            raise typer.Exit(code=2)
+        snap = _get_catalog().get_latest_snapshot(source_name)
+        if snap is None:
+            console.print(f"[red]Source '{source_name}' has no snapshot.[/red] "
+                          f"Take one with `r2g source snapshot {source_name}`, or pass --schema.")
+            raise typer.Exit(code=1)
+        snapshot_schema = snap.schema_data
+        if pg_schema and pg_schema != snap.pg_schema:
+            console.print(f"[red]The snapshot of '{source_name}' describes '{snap.pg_schema}', "
+                          f"not '{pg_schema}'.[/red] Pass --schema to stream another namespace.")
+            raise typer.Exit(code=2)
+        pg_schema = snap.pg_schema  # its tables are read where they were described
+    namespace = pg_schema or "public"
 
     try:
-        schema = Schema.load_from_file(schema_file)
+        schema = snapshot_schema or Schema.load_from_file(str(schema_file))
         mapping = ConfigManager.load_config(config_path)
 
         writer = ArangoWriter(
@@ -1029,7 +1050,7 @@ def stream(
             source_connector = create_source_connector(
                 source.source_type or "postgresql",
                 source.connection_string,
-                schema_name=pg_schema,
+                schema_name=namespace,
                 source_params=source.source_params,
             )
             source_label = f"{source.source_type} ({source_name})"
@@ -1038,7 +1059,7 @@ def stream(
 
             assert pg_conn is not None  # guarded above: --source or --pg-conn required
             source_connector = create_source_connector(
-                "postgresql", pg_conn, schema_name=pg_schema
+                "postgresql", pg_conn, schema_name=namespace
             )
             source_label = pg_conn.split("@")[-1] if "@" in pg_conn else pg_conn
 
@@ -1049,7 +1070,7 @@ def stream(
             config=mapping,
             batch_size=batch_size,
             on_duplicate=on_duplicate,
-            pg_schema=pg_schema,
+            pg_schema=namespace,
             dry_run=dry_run,
             drop_collections=drop_collections,
             workers=workers,

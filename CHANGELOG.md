@@ -7,6 +7,24 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
+  latest snapshot is the schema, read from the namespace the snapshot was taken from, as
+  for the Studio's load, so a catalog project loads from the command line with its source
+  and mapping alone. A `--pg-schema` that differs from the snapshot's is refused.
+  `--pg-conn` still needs `--schema`; a source with no snapshot says how to take one.
+
+### Fixed
+
+- **Under a control plane, a load that lays out the project is checked on the
+  project-wide rules (PRD P14.10).** A load ends by declaring the project's named graph,
+  which creates any collection it names that the database lacks, empty. That step is now
+  checked when it changes something (a new graph, one declared differently, or a
+  collection the load does not itself write), and recorded with the load; a target that
+  cannot be read counts as a change. Once a project is laid out, a load is checked on its
+  tables alone.
+
 ## [0.9.0] — 2026-10-31
 
 ### Added

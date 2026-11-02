@@ -18,7 +18,10 @@ or the graph layout.
 
 Loads and migrations are checked on what they write: each table whose rows they write, on its
 class, and each relationship, on its start table's class; a load that drops its collections,
-on everything each dropped collection holds.
+on everything each dropped collection holds. A load ends by declaring the named graph over every
+relationship of the mapping, which also creates, empty, any collection the graph names and the
+database lacks: that step is checked on the project-wide rules when it changes something, and
+only then.
 """
 
 from __future__ import annotations
@@ -130,14 +133,7 @@ def load_items(config: MappingConfig, include: Iterable[str] | None = None,
     first also removes what every other table wrote there, so with ``drop`` each collection
     it drops is checked on everything that collection holds (in the labelled-property-graph
     layout, the shared collections: every class)."""
-    inc = None if include is None else set(include)
-    exc = set(exclude or ())
-
-    def loads(table: str) -> bool:
-        return (inc is None or table in inc) and table not in exc
-
-    tables = [(key, c) for key, c in sorted(config.collections.items()) if loads(c.source_table)]
-    edges = [e for e in config.edges if loads(e.from_collection)]
+    tables, edges = _loaded(config, include, exclude)
     items = [Item(f"collections/{key}", (c.term,), ("load",)) for key, c in tables]
     items += [Item(edge_where(e), start_classes(config, e.from_collection), ("load",))
               for e in edges]
@@ -150,6 +146,71 @@ def load_items(config: MappingConfig, include: Iterable[str] | None = None,
         items += [Item(f"collections/{name}", written_by(name, config), ("drop",))
                   for name in sorted(dropped)]
     return items
+
+
+def _loaded(config: MappingConfig, include: Iterable[str] | None,
+            exclude: Iterable[str] | None,
+            ) -> tuple[list[tuple[str, CollectionMapping]], list[EdgeDefinition]]:
+    """The tables and relationships a load writes, filtered as the load filters them."""
+    inc = None if include is None else set(include)
+    exc = set(exclude or ())
+
+    def loads(table: str) -> bool:
+        return (inc is None or table in inc) and table not in exc
+
+    tables = [(key, c) for key, c in sorted(config.collections.items()) if loads(c.source_table)]
+    return tables, [e for e in config.edges if loads(e.from_collection)]
+
+
+def load_collections(config: MappingConfig, include: Iterable[str] | None = None,
+                     exclude: Iterable[str] | None = None) -> set[str]:
+    """The database collections a load writes rows into."""
+    if config.graph_layout == "lpg":
+        return {config.lpg.node_collection, config.lpg.edge_collection}
+    tables, edges = _loaded(config, include, exclude)
+    return {c.target_collection for _, c in tables} | {e.edge_collection for e in edges}
+
+
+@dataclass(frozen=True)
+class GraphState:
+    """What a load's target holds now: the named graph's edge definitions (None when there
+    is no such graph) and the names of its collections."""
+
+    declared: list[dict[str, Any]] | None
+    collections: frozenset[str]
+
+
+def _definitions(defs: Iterable[dict[str, Any]]) -> set[tuple[str, tuple[str, ...],
+                                                             tuple[str, ...]]]:
+    return {(d["edge_collection"], tuple(sorted(d["from_vertex_collections"])),
+             tuple(sorted(d["to_vertex_collections"]))) for d in defs}
+
+
+def graph_items(config: MappingConfig, state: GraphState | None,
+                writes: set[str]) -> list[Item]:
+    """What a load's last step changes. It declares the named graph over every relationship
+    of the mapping, and the database then creates, empty, each collection the graph names and
+    it lacks. That is the project's layout rather than any one class's data, so it is checked
+    on the project-wide rules, and only when it changes something: a new graph, one declared
+    differently, or a collection created that the load does not itself write. ``state`` None
+    means the target could not be read, and is checked as a change."""
+    from r2g.config import ConfigManager
+
+    wanted = ConfigManager.graph_edge_definitions(config)
+    if state is None:
+        what = ["graph: the target database could not be read"]
+    else:
+        what = []
+        if state.declared is None:
+            what.append("graph: new")
+        elif _definitions(state.declared) != _definitions(wanted):
+            what.append("graph: declared differently")
+        named = {n for d in wanted for n in (d["edge_collection"], *d["from_vertex_collections"],
+                                              *d["to_vertex_collections"])}
+        created = sorted(named - state.collections - writes)
+        if created:
+            what.append("creates, empty: " + ", ".join(created))
+    return [Item("graph", (PROJECT_WIDE,), tuple(what))] if what else []
 
 
 def written_by(name: str, *configs: MappingConfig) -> tuple[str | None, ...]:
