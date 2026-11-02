@@ -791,3 +791,62 @@ def test_a_dry_run_load_does_not_read_the_target(studio, cp, no_database, monkey
     r = studio.post("/api/projects/library-catalog/load", headers=as_(ANALYST),
                     json={"include_tables": ["authors"], "dry_run": True})
     assert r.status_code == 202
+
+
+def _server_error(code: int) -> Exception:
+    from arango.exceptions import CollectionListError
+
+    err = CollectionListError.__new__(CollectionListError)
+    err.error_code = code
+    return err
+
+
+class _Client:
+    """A stand-in for ``arango.ArangoClient``: ``fails`` is what listing collections
+    raises, if anything."""
+
+    def __init__(self, fails: Exception | None, graph: list[dict[str, Any]] | None):
+        self.fails, self.graph, self.closed = fails, graph, False
+
+    def __call__(self, hosts: str) -> "_Client":
+        return self
+
+    def db(self, *args: Any, **kwargs: Any) -> Any:
+        client = self
+
+        class _Db:
+            def collections(self) -> list[dict[str, Any]]:
+                if client.fails is not None:
+                    raise client.fails
+                return [{"name": "authors"}, {"name": "wrote"}]
+
+            def has_graph(self, name: str) -> bool:
+                return client.graph is not None
+
+            def graph(self, name: str) -> Any:
+                return type("G", (), {"edge_definitions": lambda _: client.graph})()
+
+        return _Db()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("fails, graph, expected", [
+    (None, None, GraphState(None, frozenset({"authors", "wrote"}))),
+    (None, [{"edge_collection": "wrote"}],
+     GraphState([{"edge_collection": "wrote"}], frozenset({"authors", "wrote"}))),
+    (_server_error(1228), None, GraphState(None, frozenset())),   # no database yet: empty
+    (_server_error(11), None, None),                              # forbidden: unreadable
+    (ConnectionError("refused"), None, None),                     # unreachable: unreadable
+])
+def test_what_the_target_holds(monkeypatch, fails, graph, expected):
+    """The graph step's check reads the target; one it cannot read counts as a change."""
+    import arango
+
+    from r2g.ui.server import _graph_state
+
+    client = _Client(fails, graph)
+    monkeypatch.setattr(arango, "ArangoClient", client)
+    assert _graph_state("http://db", "lib", "u", "p", "library-catalog") == expected
+    assert client.closed

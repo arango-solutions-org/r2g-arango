@@ -273,17 +273,21 @@ class TestStreamSchemaFromSnapshot:
         ConfigManager.save_config(ConfigManager.generate_default_config(schema), str(config_path))
         seen = {}
 
+        def connector(*a, **kw):
+            seen["read_from"] = kw["schema_name"]
+            return _FakeConnector()
+
         class _Pipeline:
             def __init__(self, **kw):
                 seen["schema"] = kw["schema"]
+                seen["pg_schema"] = kw["pg_schema"]
                 self.errors = {}
                 self.previews = {}
 
             def run(self, **kw):
                 return {"documents": [], "edges": [], "elapsed": 0.0}
 
-        with patch("r2g.connectors.base.create_source_connector",
-                   lambda *a, **kw: _FakeConnector()), \
+        with patch("r2g.connectors.base.create_source_connector", connector), \
                 patch("r2g.connectors.arango_writer.ArangoWriter"), \
                 patch("r2g.streaming.pipeline.StreamingPipeline", _Pipeline):
             result = runner.invoke(app, ["stream", *args, "--config", str(config_path),
@@ -294,6 +298,19 @@ class TestStreamSchemaFromSnapshot:
         result, seen = self._run(["--source", "pg_src"], tmp_path)
         assert result.exit_code == 0, result.output
         assert set(seen["schema"].tables) == {"users", "orders"}
+        assert (seen["read_from"], seen["pg_schema"]) == ("public", "public")
+
+    def test_the_tables_are_read_where_the_snapshot_found_them(self, catalog_with_source,
+                                                                tmp_path):
+        mgr = CatalogManager(str(tmp_path / "catalog"))
+        mgr.create_snapshot("pg_src", mgr.get_latest_snapshot("pg_src").schema_data,
+                            pg_schema="sales")
+        result, seen = self._run(["--source", "pg_src"], tmp_path)
+        assert result.exit_code == 0, result.output
+        assert (seen["read_from"], seen["pg_schema"]) == ("sales", "sales")
+        result, seen = self._run(["--source", "pg_src", "--pg-schema", "public"], tmp_path)
+        assert result.exit_code == 2 and "describes 'sales'" in result.output
+        assert not seen
 
     def test_a_source_without_a_snapshot_says_how_to_take_one(self, catalog_with_source,
                                                                tmp_path):
