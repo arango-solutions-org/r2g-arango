@@ -3629,7 +3629,8 @@ function showSourceProps(tableName) {
 
   const srcName = currentSourceName || document.querySelector('.source-name')?.textContent;
   if (srcName) {
-    html += `<div class="prop-group"><button class="btn" data-src="${escHtml(srcName)}" data-table="${escHtml(tableName)}" onclick="previewTable(this.dataset.src, this.dataset.table)">Preview Data</button></div>`;
+    // Under a control plane a row preview is refused (P14.12), so it is not offered.
+    if (!CP.on) html += `<div class="prop-group"><button class="btn" data-src="${escHtml(srcName)}" data-table="${escHtml(tableName)}" onclick="previewTable(this.dataset.src, this.dataset.table)">Preview Data</button></div>`;
   }
 
   body.innerHTML = html;
@@ -4425,7 +4426,7 @@ async function previewTable(sourceName, tableName) {
     html += '</tbody></table></div>';
     openModal('Preview: ' + tableName, html);
   } catch (e) {
-    toast('Preview failed: ' + e.message, 'error');
+    toast('Preview failed: ' + errorDetail(e), 'error');
   }
 }
 
@@ -5687,7 +5688,7 @@ function suggestOntology() {
       <label style="display:block;margin-bottom:6px;font-size:12px;color:var(--text-dim)">Base URL (openai-compatible / local only)</label>
       <input id="onto-base-url" type="text" placeholder="e.g. http://localhost:11434/v1"
              style="width:100%;box-sizing:border-box;margin-bottom:10px" />
-      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-dim);margin-bottom:6px">
+      <label style="display:${CP.on ? 'none' : 'flex'};align-items:center;gap:8px;font-size:12px;color:var(--text-dim);margin-bottom:6px">
         <input id="onto-sample" type="checkbox" style="width:auto;margin:0" />
         Sample a few example values from non-sensitive columns to ground the model
       </label>
@@ -6327,8 +6328,9 @@ function _menuSourceTable(tableName) {
       hint: 'Open the detail panel for this source table.' },
     { label: 'Inspect FKs', icon: '\u29C9', onClick: () => showSourceFkSummary(tableName),
       hint: 'List the declared and inferred foreign keys involving this table.' },
-    { label: 'Preview data', icon: '\u26ED', onClick: () => previewTable(currentSourceName, tableName),
-      hint: 'Fetch and show a small sample of rows from this table.' },
+    // Under a control plane a row preview is refused (P14.12), so it is not offered.
+    ...(CP.on ? [] : [{ label: 'Preview data', icon: '\u26ED', onClick: () => previewTable(currentSourceName, tableName),
+      hint: 'Fetch and show a small sample of rows from this table.' }]),
     '-',
     menuCopy('Copy table name', tableName, 'Copy the source table name to the clipboard.'),
     { label: 'Expand all tables', onClick: () => expandAllTables(true),

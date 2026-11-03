@@ -93,6 +93,11 @@ REFUSED: tuple[tuple[str, str, str], ...] = (
      "a demo preset adds a source, and " + _SHARED.format("sources")),
     ("POST", f"{_PROJECT}/governance/emit",
      "governance files are written to the server's disk outside the policy"),
+    # A read, but of the source's rows, of any source in the tenant: the policy decides on
+    # mapping items, not on reading data, so nothing would check who sees them.
+    ("GET", r"/api/sources/[^/]+/preview/[^/]+",
+     "a table preview returns the source's rows, which the policy does not govern; sources "
+     "are shared by every project in the tenant, so it would show any of them"),
 )
 
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -104,8 +109,12 @@ def _match(pattern: str, path: str) -> bool:
 
 def classify(method: str, path: str) -> tuple[str, str | None]:
     """How a request is treated under a control plane: ``read``, ``governed`` (the route
-    asks the policy itself), or ``refused`` with the reason."""
+    asks the policy itself), or ``refused`` with the reason. A read is served unless it is
+    refused by name."""
     if method in _READ_METHODS:
+        for m, p, why in REFUSED:
+            if m == method and _match(p, path):
+                return "refused", f"Not available under the control plane: {why}"
         return "read", None
     if any(m == method and _match(p, path) for m, p in GOVERNED):
         return "governed", None
