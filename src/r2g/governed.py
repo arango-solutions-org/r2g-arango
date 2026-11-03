@@ -96,8 +96,8 @@ REFUSED: tuple[tuple[str, str, str], ...] = (
     # A read, but of the source's rows, of any source in the tenant: the policy decides on
     # mapping items, not on reading data, so nothing would check who sees them.
     ("GET", r"/api/sources/[^/]+/preview/[^/]+",
-     "a table preview returns the source's rows, which the policy does not govern, and "
-     + _SHARED.format("sources")),
+     "a table preview returns the source's rows, which the policy does not govern; sources "
+     "are shared by every project in the tenant, so it would show any of them"),
 )
 
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
