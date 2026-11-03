@@ -1695,6 +1695,14 @@ def create_app(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to load mapping config: {e}")
 
+        if governed and body.sample:
+            # Sampling sends the source's values to the model at an address the request may
+            # choose, and the policy does not decide on reading data, as for the preview.
+            raise HTTPException(
+                status_code=403,
+                detail="Not available under the control plane: sampling sends the source's "
+                       "values to the model, and the policy does not govern reading data; "
+                       "ask without sample, from the schema alone")
         engine_norm = (body.engine or "llm").strip().lower()
         if engine_norm not in ("llm", "rsa"):
             raise HTTPException(status_code=400, detail=f"Unknown engine '{body.engine}'")

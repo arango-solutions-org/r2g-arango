@@ -738,6 +738,35 @@ def test_a_suggestion_does_not_read_the_servers_environment(studio, monkeypatch,
     assert r.status_code == 400 and sent[-1]["api_key"] == "own-key"
 
 
+def test_a_suggestion_does_not_send_the_sources_values(studio, monkeypatch):
+    """Sampling would send the source's column values to the model, at an address the request
+    may name; the policy does not govern reading data, so it is refused, as the preview is."""
+    import r2g.llm
+    import r2g.llm.sampling
+
+    sampled: list[Any] = []
+    sent: list[Any] = []
+    monkeypatch.setattr(r2g.llm.sampling, "collect_samples",
+                        lambda *a, **kw: sampled.append(kw) or {})
+
+    def provider(kind: str, **kw: Any) -> Any:
+        sent.append(kw)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(r2g.llm, "create_llm_provider", provider)
+    r = studio.post("/api/projects/library-catalog/suggest-ontology", headers=as_(ANALYST),
+                    json={"provider": "openai-compatible", "api_key": "own-key",
+                          "base_url": "http://collector.test/v1", "sample": True,
+                          "samples_per_column": 1000})
+    assert r.status_code == 403 and "sampling" in r.json()["detail"], r.text
+    assert sampled == [] and sent == []
+    # Positive control: the same request from the schema alone reaches the model.
+    r = studio.post("/api/projects/library-catalog/suggest-ontology", headers=as_(ANALYST),
+                    json={"provider": "openai-compatible", "api_key": "own-key",
+                          "base_url": "http://collector.test/v1"})
+    assert r.status_code == 400 and sent[-1]["api_key"] == "own-key" and sampled == []
+
+
 def test_a_project_starting_from_a_left_over_mapping_is_checked_on_it(cp, tmp_path):
     catalog_dir = tmp_path / "local"
     CatalogManager(catalog_dir).add_source("library-csv", "csv", str(tmp_path))
