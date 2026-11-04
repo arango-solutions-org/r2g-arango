@@ -261,3 +261,26 @@ class TestCsvSince:
         with CsvConnector(str(dated_dir)).open_session() as sess:
             with pytest.raises(RuntimeError, match="is not a number"):
                 sess.count_rows("events", since_column="score", since_value="yesterday")
+
+    def test_count_then_stream_reads_the_file_once(self, dated_dir, monkeypatch):
+        from r2g.input import dump_reader
+
+        reads: list[str] = []
+        real = dump_reader.DumpReader.read_dataframe
+
+        def counting(self):
+            reads.append(str(self.file_path))
+            return real(self)
+
+        monkeypatch.setattr(dump_reader.DumpReader, "read_dataframe", counting)
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            n = sess.count_rows(
+                "events", since_column="last_modified_date", since_value="2026-11-02T09:00:00",
+            )
+            rows = list(sess.stream_rows(
+                "events", since_column="last_modified_date", since_value="2026-11-02T09:00:00",
+            ))
+            # a different bound is a different frame: read again
+            again = sess.count_rows("events", since_column="last_modified_date", since_value="2026-11-03")
+        assert n == len(rows) == 2 and again == 1
+        assert len(reads) == 2

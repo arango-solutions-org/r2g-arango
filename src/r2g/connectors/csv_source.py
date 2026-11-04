@@ -311,6 +311,18 @@ class CsvSession:
         self.delimiter = delimiter
         self.has_header = has_header
         self.directory = resolve_source_directory(connection_string)
+        # The pipeline counts a table and then streams it. With a bound both
+        # need the whole file in a frame, so the frame filtered for the count
+        # is kept for the stream that follows: one read per table, not two.
+        self._since_frame: tuple[tuple[str, str, str], pl.DataFrame] | None = None
+
+    def _frame_since(self, table: str, column: str, value: str) -> pl.DataFrame:
+        key = (table, column, value)
+        if self._since_frame is not None and self._since_frame[0] == key:
+            return self._since_frame[1]
+        frame = rows_since(self._reader(table).read_dataframe(), column, value)
+        self._since_frame = (key, frame)
+        return frame
 
     def _resolve(self, table: str) -> Path:
         path = resolve_csv_table_path(self.directory, table)
@@ -333,8 +345,7 @@ class CsvSession:
         since_value: Optional[str] = None,
     ) -> int:
         if since_column and since_value is not None:
-            frame = self._reader(table).read_dataframe()
-            return int(rows_since(frame, since_column, since_value).height)
+            return int(self._frame_since(table, since_column, since_value).height)
         return self._reader(table).row_count()
 
     def stream_rows(
@@ -345,13 +356,13 @@ class CsvSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
-        reader = self._reader(table)
         if since_column and since_value is not None:
-            frame = rows_since(reader.read_dataframe(), since_column, since_value)
+            frame = self._frame_since(table, since_column, since_value)
+            self._since_frame = None  # the stream is the last use of this frame
             for row in frame.iter_rows(named=True):
                 yield dict(row)
             return
-        yield from reader.read_rows()
+        yield from self._reader(table).read_rows()
 
     def dump_table_to_csv(
         self,

@@ -48,7 +48,8 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since column and value and ignored them, so an incremental run against a CSV directory
   re-read every row and, with `--on-duplicate replace`, rewrote the whole table while
   reporting success. It now keeps the rows at or after the bound, comparing a timestamp
-  column as a timestamp, a numeric column as a number and anything else as text, and a
+  column as a timestamp, a numeric column as a number and anything else as text (ISO 8601
+  strings in one format order correctly; other date formats do not), and a
   null never qualifies. A since column the file lacks is an error rather than a full reload.
 - **A streaming load never loads a document without a field calculated on ArangoDB
   (PRD P5c.1.5).** Before anything is written, each expression the load would send to
