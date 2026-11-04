@@ -197,6 +197,9 @@ class SnowflakeConnector:
         return schema
 
     def _process_table(self, conn: Any, table_name: str, *, is_view: bool = False) -> Table:
+        """Introspect one object. A view (plain or materialized) gets its
+        columns only: Snowflake allows no primary or foreign key constraint on
+        either, so ``SHOW PRIMARY KEYS`` / ``SHOW IMPORTED KEYS`` are not run."""
         columns = self._fetch_columns(conn, table_name)
         pks = [] if is_view else self._fetch_primary_key(conn, table_name)
         fks = [] if is_view else self._fetch_foreign_keys(conn, table_name)
