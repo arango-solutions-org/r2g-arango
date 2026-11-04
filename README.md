@@ -285,6 +285,11 @@ on the machine or container running r2g at the path resolved from
 `SNOWFLAKE_PRIVATE_KEY_FILE`; an environment reference does not upload or copy
 the key.
 
+A snapshot lists base tables only (dynamic tables included). Add
+`&include_views=true` to also list the schema's views and materialized views,
+for a schema whose joinable objects are views; a view declares no keys, so
+give it a reviewed key overlay or run FK inference.
+
 ### Snowflake quick start
 
 Install the connector, register the source, and capture its schema:

@@ -196,8 +196,8 @@ class TestIntrospection:
         return {
             # tables list
             "INFORMATION_SCHEMA.TABLES": (
-                ["TABLE_NAME"],
-                [("USERS",), ("ORDERS",)],
+                ["TABLE_NAME", "TABLE_TYPE"],
+                [("USERS", "BASE TABLE"), ("ORDERS", "BASE TABLE")],
             ),
             # columns for any table
             "INFORMATION_SCHEMA.COLUMNS": (
@@ -364,3 +364,82 @@ class TestIntrospection:
         assert pg_type_to_json_type(created_at.data_type) == "string"
         id_col = next(c for c in users.columns if c.name == "ID")
         assert pg_type_to_json_type(id_col.data_type) == "float"
+
+
+class _RecordingConnection(_FakeConnection):
+    """A fake connection that also keeps every (sql, params) it was asked to run."""
+
+    def __init__(self, scripted: dict[str, tuple]) -> None:
+        super().__init__(scripted)
+        self.executed: list[tuple[str, object]] = []
+
+    def cursor(self) -> _FakeCursor:
+        recorder = self
+
+        class _Cur(_FakeCursor):
+            def execute(self, sql: str, params=None) -> None:
+                recorder.executed.append((" ".join(sql.split()), params))
+                super().execute(sql, params)
+
+        return _Cur(self._scripted)
+
+
+class TestIncludeViews:
+    """``include_views=true`` lists views beside tables; off, a snapshot is tables only."""
+
+    def _scripted(self) -> dict[str, tuple]:
+        scripted = TestIntrospection()._scripted_schema()
+        scripted["INFORMATION_SCHEMA.TABLES"] = (
+            ["TABLE_NAME", "TABLE_TYPE"],
+            [("ACCOUNT_VW", "VIEW"), ("ORDERS", "BASE TABLE"), ("USERS", "BASE TABLE")],
+        )
+        return scripted
+
+    def _run(self, monkeypatch, url: str):
+        scripted = self._scripted()
+        captured: dict = {}
+        holder: dict = {}
+
+        def fake_connect(**kwargs):
+            captured.update(kwargs)
+            holder["conn"] = _RecordingConnection(scripted)
+            return holder["conn"]
+
+        _install_fake_snowflake(monkeypatch, fake_connect)
+        schema = SnowflakeConnector(url).get_schema()
+        return schema, captured, holder["conn"].executed
+
+    def test_off_by_default_lists_base_tables_only(self, monkeypatch):
+        _, captured, executed = self._run(
+            monkeypatch, "snowflake://svc:xxx@xy12345/ANALYTICS/CORE"
+        )
+        sql, params = next(e for e in executed if "INFORMATION_SCHEMA.TABLES" in e[0])
+        assert "TABLE_TYPE IN (%s)" in sql
+        assert params == ("CORE", "BASE TABLE")
+        assert "_include_views" not in captured and "include_views" not in captured
+
+    def test_on_lists_views_and_materialized_views_too(self, monkeypatch):
+        schema, captured, executed = self._run(
+            monkeypatch, "snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=true"
+        )
+        sql, params = next(e for e in executed if "INFORMATION_SCHEMA.TABLES" in e[0])
+        assert "TABLE_TYPE IN (%s, %s, %s)" in sql
+        assert params == ("CORE", "BASE TABLE", "VIEW", "MATERIALIZED VIEW")
+        assert set(schema.tables) == {"ACCOUNT_VW", "ORDERS", "USERS"}
+        assert "_include_views" not in captured and "include_views" not in captured
+
+    def test_a_view_has_columns_but_is_not_asked_for_keys(self, monkeypatch):
+        schema, _, executed = self._run(
+            monkeypatch, "snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=true"
+        )
+        view = schema.tables["ACCOUNT_VW"]
+        assert [c.name for c in view.columns] == ["ID", "NAME", "METADATA", "CREATED_AT"]
+        assert view.primary_key == [] and view.foreign_keys == []
+        key_queries = [sql for sql, _ in executed if sql.startswith("SHOW ")]
+        assert key_queries, "base tables are still asked for their keys"
+        assert not any('"ACCOUNT_VW"' in sql for sql in key_queries)
+        assert schema.tables["USERS"].primary_key == ["ID"]
+
+    def test_the_flag_must_be_a_boolean_word(self):
+        with pytest.raises(ValueError, match="include_views must be true or false"):
+            SnowflakeConnector("snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=maybe")
