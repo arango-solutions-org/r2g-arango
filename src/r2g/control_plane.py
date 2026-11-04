@@ -49,7 +49,7 @@ def sdk_problem() -> str | None:
     They need its optional terms (FR-5.8, SDK 0.1.0). An older SDK rejects the policy that
     declares them and then denies every action, so r2g refuses to start on one (P14.13).
     """
-    need = "the control plane's SDK 0.1.0 or later (arango-argos, sdk/python)"
+    need = "the control plane's Python SDK (control_plane_sdk) 0.1.0 or later"
     try:
         policy = importlib.import_module("control_plane_sdk.policy")
     except ImportError:

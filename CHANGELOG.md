@@ -16,6 +16,18 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listed. A view declares no keys and is not asked for any: they come from a reviewed key
   overlay or FK inference. The flag is consumed by r2g, never forwarded to the driver.
 
+- **Expression rules (PRD P5c.1.4).** `docs/EXPRESSION-RULES.md` decides how a field
+  expression behaves wherever it runs: blanks in arithmetic and conditions, what may be
+  a condition, `&&` and `||`, joining text, `+`, text that isn't a number, how numbers
+  are written as text, character positions, division, comparing text with numbers,
+  empty text, `COALESCE` and `??`, and time zones. Each rule was measured on r2g's
+  evaluator, ArangoDB 3.12 and Postgres 16. Its worked examples now run against the
+  mapping check and the evaluator, and in the integration job against AQL delegation.
+  Neither route follows every rule yet: the evaluator breaks 15 examples, AQL
+  delegation breaks 21, and the mapping check misses 7 refusals. Each break is
+  recorded, so a fix fails the build until its record is removed. No behaviour changes
+  in this release.
+
 ### Changed
 
 - **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
@@ -26,6 +38,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under a control plane, a table preview is refused (PRD P14.12).** The preview returns
+  up to 1,000 of a source's rows, of any source in the tenant, and every read was served
+  without the policy deciding, so anyone who could open r2g in one project could read the
+  rows of every source. It now answers 403 with why; standalone r2g is unchanged. The
+  preview's error message now shows the API's reason rather than its raw reply, and under a
+  control plane the Studio no longer offers the preview.
+- **Under a control plane, a suggested ontology is made from the schema alone.** With
+  `sample`, `suggest-ontology` sent up to `samples_per_column` values of each column to the
+  model, at an address the request could name, without the policy deciding; that is now
+  refused with why, and the Studio hides the option.
 - **Under a control plane, a load that lays out the project is checked on the
   project-wide rules (PRD P14.10).** A load ends by declaring the project's named graph,
   which creates any collection it names that the database lacks, empty. That step is now
@@ -61,7 +83,7 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would otherwise receive the server's key. r2g declares
   `mapping.update`, `data.load` and `data.migrate` (each taking a class optionally) and
   `transformation.update`, which need the control plane's SDK with optional terms
-  (arango-argos, `sdk/python`, 0.1.0 or later). Under a control plane the Studio refuses
+  (`control_plane_sdk`, 0.1.0 or later). Under a control plane the Studio refuses
   to start on an older SDK, and `control-plane.Dockerfile` refuses to build with one: an
   older SDK rejects a policy declaring these actions and then denies every action.
   Without `CONTROL_PLANE_URL` nothing changes.

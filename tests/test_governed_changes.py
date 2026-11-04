@@ -170,6 +170,15 @@ def test_every_change_route_is_governed_read_or_refused_as_the_prd_lists(cp, tmp
         "POST /api/projects/{name}/migrate", "PUT /api/projects/{name}/mapping"]
 
 
+def test_the_only_read_refused_is_the_one_returning_a_sources_rows(cp, tmp_path):
+    app = create_app(catalog_dir=str(tmp_path), host="0.0.0.0")
+    refused = sorted(route.path for route in app.routes
+                     if "GET" in getattr(route, "methods", set())
+                     and governed.classify("GET", route.path.replace("{name}", "x")
+                                           .replace("{table}", "t"))[0] == "refused")
+    assert refused == ["/api/sources/{name}/preview/{table}"]
+
+
 def test_a_change_route_nobody_classified_is_refused_by_default():
     kind, why = governed.classify("POST", "/api/projects/x/brand-new-thing")
     assert kind == "refused" and "not governed" in why
@@ -188,11 +197,13 @@ def test_a_change_route_nobody_classified_is_refused_by_default():
     ("DELETE", "/api/projects/library-catalog", "names this transformation project"),
     ("POST", "/api/demo-presets/snowflake-customer-360/install", "adds a source"),
     ("POST", "/api/projects/library-catalog/governance/emit", "governance files"),
+    ("GET", "/api/sources/library-csv/preview/authors", "returns the source's rows"),
 ])
 def test_a_refused_route_says_why_and_changes_nothing(studio, tmp_path, method, path, says):
     before = (tmp_path / "catalog.json").read_bytes() if (tmp_path / "catalog.json").exists() \
         else None
-    r = studio.request(method, path, headers=as_(OWNER), json={})
+    r = studio.request(method, path, headers=as_(OWNER),
+                       json=None if method == "GET" else {})
     assert r.status_code == 403 and says in r.json()["detail"]
     after = (tmp_path / "catalog.json").read_bytes() if (tmp_path / "catalog.json").exists() \
         else None
@@ -725,6 +736,35 @@ def test_a_suggestion_does_not_read_the_servers_environment(studio, monkeypatch,
                     json={"provider": "openai", "api_key": "own-key",
                           "base_url": "http://collector.test/v1"})
     assert r.status_code == 400 and sent[-1]["api_key"] == "own-key"
+
+
+def test_a_suggestion_does_not_send_the_sources_values(studio, monkeypatch):
+    """Sampling would send the source's column values to the model, at an address the request
+    may name; the policy does not govern reading data, so it is refused, as the preview is."""
+    import r2g.llm
+    import r2g.llm.sampling
+
+    sampled: list[Any] = []
+    sent: list[Any] = []
+    monkeypatch.setattr(r2g.llm.sampling, "collect_samples",
+                        lambda *a, **kw: sampled.append(kw) or {})
+
+    def provider(kind: str, **kw: Any) -> Any:
+        sent.append(kw)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(r2g.llm, "create_llm_provider", provider)
+    r = studio.post("/api/projects/library-catalog/suggest-ontology", headers=as_(ANALYST),
+                    json={"provider": "openai-compatible", "api_key": "own-key",
+                          "base_url": "http://collector.test/v1", "sample": True,
+                          "samples_per_column": 1000})
+    assert r.status_code == 403 and "sampling" in r.json()["detail"], r.text
+    assert sampled == [] and sent == []
+    # Positive control: the same request from the schema alone reaches the model.
+    r = studio.post("/api/projects/library-catalog/suggest-ontology", headers=as_(ANALYST),
+                    json={"provider": "openai-compatible", "api_key": "own-key",
+                          "base_url": "http://collector.test/v1"})
+    assert r.status_code == 400 and sent[-1]["api_key"] == "own-key" and sampled == []
 
 
 def test_a_project_starting_from_a_left_over_mapping_is_checked_on_it(cp, tmp_path):
