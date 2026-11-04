@@ -16,12 +16,20 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty text, `COALESCE` and `??`, and time zones. Each rule was measured on r2g's
   evaluator, ArangoDB 3.12 and Postgres 16. Its worked examples now run against the
   mapping check and the evaluator, and in the integration job against AQL delegation.
-  Neither route follows every rule yet: the evaluator breaks 15 examples, AQL
-  delegation breaks 21, and the mapping check misses 7 refusals. Each break is
-  recorded, so a fix fails the build until its record is removed. No behaviour changes
-  in this release.
+  Neither route follows every rule yet: the evaluator breaks 11 examples, AQL
+  delegation breaks 24, and the mapping check misses 7 refusals. Each break is
+  recorded, so a fix fails the build until its record is removed. Of the rules, only
+  rule 8 changes behaviour in this release (below).
 
 ### Changed
+
+- **Numbers are written as text by the expression rules' rule 8.** A whole number
+  below 10^16 has no decimal point, and any other number is written with the fewest
+  digits that read back as the same number. A decimal column's value is written as the
+  number stored in the document. So `CONCAT(@tenant, "_", @id)` with `id` 42.0 or a
+  decimal `42.00` gives `"7_42"` (was `"7_42.0"` or `"7_42.00"`), and a decimal `1.50`
+  gives `"1.5"`. The local evaluator and AQL delegation now agree on these. A stored
+  field built this way changes on the next full reload; document keys do not change.
 
 - **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
   latest snapshot is the schema, read from the namespace the snapshot was taken from, as
