@@ -2,10 +2,13 @@
 
 **Status:** accepted 2026-11-04. Required by PRD P5c.1.4. r2g's routes do not all
 follow it yet: see "Where the rules are checked" below.
-**Why it exists:** r2g can calculate a field in two ways. It can use its own Python
-evaluator, or it can send the expression to ArangoDB. The two give different answers
-for the same row, because nobody has decided what the right answer is. This page
-decides it. Every way of calculating a field, now and later, must follow it. That
+**Why it exists:** r2g can calculate a field in two ways. It uses its own Python
+evaluator when the evaluator can read the expression. On the streaming path, it sends
+the expression to ArangoDB when the evaluator can't, for example because it uses a
+function the evaluator lacks. The two follow different rules, because nobody has
+decided what the right answer is. So adding one such function to an expression can
+change the answer for all of it, since the whole expression then runs on ArangoDB.
+This page decides the rules. Every way of calculating a field, now and later, must follow it. That
 includes the Python evaluator, ArangoDB, streaming, and SQL sent to the source
 database.
 **Background:** [`research/transformation-language-evaluation.md`](research/transformation-language-evaluation.md),
@@ -58,6 +61,10 @@ Every "today" answer below was measured, not assumed:
 - **Postgres:** version 16.14, run on 2026-11-03.
 - **DuckDB, ClickHouse and CEL:** the 2026-09-29 probes in
   [`research/transformation-language-probes/`](research/transformation-language-probes/).
+
+The tables under each rule record those measurements. Nothing re-checks them. The tests
+hold each route to the worked examples in `tests/expression_rules_cases.py`, not to
+these tables, so a table can fall out of date as routes are fixed.
 
 ---
 
@@ -130,7 +137,7 @@ write the test.
 | `@a \|\| false`, `a` blank | false | false | blank | **blank** |
 | `@a \|\| true`, `a` blank | true | true | true | **true** |
 | `@a && true`, `a` blank | false | blank | blank | **blank** |
-| `@a && false`, `a` blank | false | false | false | **false** |
+| `@a && false`, `a` blank | false | blank | false | **false** |
 | `"y" && "x"` | true | `"x"`, which is one of the operands | not allowed | **refused**, see rule 3 |
 
 A blank decides the answer only when the other side can't: `blank || true` is true
@@ -290,7 +297,8 @@ added later. It would need to be defined here first.
 
 Both give the first argument that isn't blank. Neither is ArangoDB syntax, so the
 ArangoDB route must translate them to `NOT_NULL`. Today an expression that uses
-either one fails as soon as it is sent to the server.
+either one fails if it is sent to the server, which happens when it also uses
+something r2g's evaluator can't read.
 
 ### 14. Times are in UTC
 
@@ -317,7 +325,10 @@ against them:
 - **The ArangoDB route:** the same examples, sent through the delegation query exactly
   as the streaming pipeline sends them
   (`tests/integration/test_expression_rules_server.py`, which runs in CI's
-  integration job).
+  integration job). A load sends an expression this way only when r2g's evaluator
+  can't read it. Every example here can be read, so the test sends each one on
+  purpose. A break it records applies to any expression that reaches ArangoDB and
+  uses the same construct.
 
 Where a route breaks a rule today, the example records how, in words. Those examples
 run as expected failures. When a fix makes one pass, the build fails until its record
