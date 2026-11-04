@@ -124,6 +124,9 @@ _STREAM_ROUTE = re.compile(r"^/api/projects/[^/]+/load/[^/]+/stream$")
 #: Under a control plane these need no context: the page and its assets, and how to
 #: start. Everything else needs one, so a route added later is closed until opened here.
 _OPEN_PATHS = frozenset({"", "/", "/api/health", "/api/mode"})
+#: What the control plane may read with its own service token (P14.14): a project's mapping
+#: (graph-data, which carries each element's ontology term), and nothing else.
+_SERVICE_READS = re.compile(r"^/api/projects/[^/]+/graph-data$")
 _OPEN_PREFIXES = ("/static/",)
 
 
@@ -188,6 +191,19 @@ def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
         if not token:
             return JSONResponse({"detail": "A context token is required"}, status_code=401)
         gateway = control_plane.get()
+        if request.method == "GET" and _SERVICE_READS.match(path):
+            # The control plane reading a project's mapping on its own behalf (P14.14), to
+            # join the project ontology to where its data lives. Its service token is
+            # accepted here and nowhere else; a user's context goes on as usual.
+            try:
+                await run_in_threadpool(gateway.verify_service, token)
+            except control_plane.ContextUnavailable as exc:
+                return JSONResponse({"detail": f"Cannot check the token: {exc}"},
+                                    status_code=503)
+            except control_plane.ContextRejected:
+                pass  # not a service token: checked as a user's context below
+            else:
+                return await call_next(request)
         try:
             identity = await run_in_threadpool(gateway.verify, token)
             if identity.tenant != tenant:
