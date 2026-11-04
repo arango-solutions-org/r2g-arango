@@ -35,6 +35,7 @@ Usage::
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable
 
 
@@ -338,7 +339,20 @@ def _to_string(v: Any) -> str:
         return ""
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, (float, Decimal)):
+        return _number_text(float(v))
     return str(v)
+
+
+def _number_text(x: float) -> str:
+    """A number written as text, by rule 8 of docs/EXPRESSION-RULES.md: a whole number
+    below 10**16 without a decimal point (``42``), any other in the fewest digits that read
+    back as the same number (``0.30000000000000004``, ``1e+20``, ``1e-5``). A decimal is
+    written as the floating-point number r2g stores for it, so ``42.00`` is ``42``."""
+    if x.is_integer() and abs(x) < 1e16:
+        return str(int(x))
+    mantissa, _, exponent = repr(x).partition("e")
+    return f"{mantissa}e{int(exponent):+d}" if exponent else mantissa
 
 
 def _to_number(v: Any) -> float | int | None:

@@ -88,6 +88,11 @@ class NodeTransformer:
         """True when one or more expressions must be evaluated server-side."""
         return bool(self._delegated)
 
+    @property
+    def delegated_expressions(self) -> list[FieldExpression]:
+        """The expressions evaluated server-side, in mapping order."""
+        return list(self._delegated)
+
     def delegated_reference_columns(self) -> set[str]:
         """Source columns the delegated expressions read (for row projection)."""
         cols: set[str] = set()
@@ -96,15 +101,16 @@ class NodeTransformer:
             cols.update(extract_bind_references(fx.expression))
         return cols
 
-    def build_delegation_query(self) -> str:
+    def build_delegation_query(self, expressions: Optional[list[FieldExpression]] = None) -> str:
         """Build an AQL query computing all delegated targets for a row batch.
 
         The query takes a ``@rows`` bind parameter (a list of projected source
         rows) and returns one object per row with each delegated target mapped
-        to its server-evaluated value, in input order.
+        to its server-evaluated value, in input order. ``expressions`` limits it
+        to those (default: every delegated expression).
         """
         parts = []
-        for fx in self._delegated:
+        for fx in self._delegated if expressions is None else expressions:
             key = json.dumps(fx.target)
             parts.append(f"    {key}: {rewrite_bind_params(fx.expression)}")
         body = ",\n".join(parts)
