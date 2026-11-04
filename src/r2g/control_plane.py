@@ -124,6 +124,12 @@ class Entry:
 class ControlPlane(Protocol):
     def verify(self, token: str) -> Identity: ...
 
+    def verify_service(self, token: str) -> None:
+        """Accept the control plane's own short-lived service token for this tool, or raise
+        :class:`ContextRejected` (:class:`ContextUnavailable` when keys cannot be fetched).
+        The control plane reads with it on its own behalf, never as a user (P14.14)."""
+        ...
+
     def project(self, identity: Identity) -> Project: ...
 
     def decide(self, identity: Identity, action: str, term: str | None) -> Decision:
@@ -178,6 +184,16 @@ class _Sdk:
             token=token,
             verified=verified,
         )
+
+    def verify_service(self, token: str) -> None:
+        from control_plane_sdk import ContextError, TokenRejected, Unavailable
+
+        try:
+            self.client.verify_service(token)
+        except (TokenRejected, ContextError) as exc:
+            raise ContextRejected(str(exc)) from exc
+        except Unavailable as exc:
+            raise ContextUnavailable(str(exc)) from exc
 
     def project(self, identity: Identity) -> Project:
         from control_plane_sdk import ControlPlaneError, ProjectNotFound, TokenRejected

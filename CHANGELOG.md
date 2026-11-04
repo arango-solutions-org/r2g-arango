@@ -9,6 +9,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The control plane reads a project's mapping on its own behalf (PRD P14.14).** Under a
+  control plane, `GET /api/projects/{name}/graph-data` accepts the control plane's
+  short-lived service token for r2g, so it can join the project ontology to where the
+  project's data lives without a user's pass for r2g. No other route accepts it.
+
 - **Expression rules (PRD P5c.1.4).** `docs/EXPRESSION-RULES.md` decides how a field
   expression behaves wherever it runs: blanks in arithmetic and conditions, what may be
   a condition, `&&` and `||`, joining text, `+`, text that isn't a number, how numbers

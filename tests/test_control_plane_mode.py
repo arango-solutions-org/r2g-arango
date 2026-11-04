@@ -27,6 +27,8 @@ from r2g.ui.server import create_app
 TOKEN = "context-for-equity"
 OTHER_TENANT = "context-for-globex"
 UNAVAILABLE = "context-while-down"
+SERVICE = "control-plane-service-token"
+SERVICE_UNAVAILABLE = "service-token-while-down"
 STATIC = Path(__file__).resolve().parents[1] / "src" / "r2g" / "ui" / "static"
 
 
@@ -59,6 +61,12 @@ class FakeControlPlane:
             tenant="globex" if token == OTHER_TENANT else "local",
             project="equity", ontology=("fibo-equity", "working"), token=token)
 
+    def verify_service(self, token: str) -> None:
+        if token == SERVICE_UNAVAILABLE:
+            raise control_plane.ContextUnavailable("keys could not be fetched")
+        if token != SERVICE:
+            raise control_plane.ContextRejected("not a service token for r2g")
+
     def project(self, identity: control_plane.Identity) -> control_plane.Project:
         return control_plane.Project("equity", "Equity research", "customer-360")
 
@@ -87,6 +95,37 @@ def governed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 def bearer(token: str = TOKEN) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+class TestTheControlPlanesOwnReads:
+    """P14.14: the control plane reads a project's mapping with its service token, to join
+    the project ontology to where its data lives, and reads nothing else with it."""
+
+    def test_its_service_token_reads_a_projects_mapping(self, governed):
+        # Past the gate: the route answers (400, the fixture's source has no snapshot),
+        # where a forged token is refused at the gate.
+        for name in ("customer-360", "someone-elses"):
+            path = f"/api/projects/{name}/graph-data"
+            assert governed.get(path, headers=bearer(SERVICE)).status_code == 400
+            assert governed.get(path, headers=bearer("forged")).status_code == 401
+
+    def test_its_service_token_reads_nothing_else(self, governed):
+        for path in ("/api/projects", "/api/sources", "/api/projects/customer-360",
+                     "/api/projects/customer-360/graph-data/extra"):
+            assert governed.get(path, headers=bearer(SERVICE)).status_code == 401, path
+        r = governed.post("/api/projects/customer-360/graph-data", headers=bearer(SERVICE))
+        assert r.status_code == 401
+
+    def test_a_users_context_still_reads_only_the_project_it_opens(self, governed):
+        assert governed.get("/api/projects/customer-360/graph-data",
+                            headers=bearer()).status_code == 400
+        assert governed.get("/api/projects/someone-elses/graph-data",
+                            headers=bearer()).status_code == 404
+
+    def test_an_unreachable_control_plane_is_503(self, governed):
+        r = governed.get("/api/projects/customer-360/graph-data",
+                         headers=bearer(SERVICE_UNAVAILABLE))
+        assert r.status_code == 503
 
 
 class TestMode:
