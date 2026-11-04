@@ -193,3 +193,71 @@ class TestCsvBaseDirJail:
         monkeypatch.setenv("R2G_CSV_BASE_DIR", str(base))
         with pytest.raises(CsvSourceError):
             CsvSession(str(outside))
+
+
+class TestCsvSince:
+    """``stream --since`` on a CSV source: the session filters, as the SQL sessions do."""
+
+    @pytest.fixture
+    def dated_dir(self, tmp_path: Path) -> Path:
+        (tmp_path / "events.csv").write_text(
+            "id,last_modified_date,score\n"
+            "1,2026-11-01T09:00:00,10\n"
+            "2,2026-11-02T09:00:00,20\n"
+            "3,2026-11-03T09:00:00,30\n"
+            "4,,40\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_without_since_everything_is_read(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            assert sess.count_rows("events") == 4
+            assert len(list(sess.stream_rows("events"))) == 4
+
+    def test_since_keeps_rows_at_or_after_the_bound(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            rows = list(sess.stream_rows(
+                "events", since_column="last_modified_date", since_value="2026-11-02T09:00:00",
+            ))
+            count = sess.count_rows(
+                "events", since_column="last_modified_date", since_value="2026-11-02T09:00:00",
+            )
+        assert [r["id"] for r in rows] == [2, 3]
+        assert count == 2
+
+    def test_a_null_never_qualifies(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            rows = list(sess.stream_rows(
+                "events", since_column="last_modified_date", since_value="2000-01-01T00:00:00",
+            ))
+        assert [r["id"] for r in rows] == [1, 2, 3]
+
+    def test_numeric_column_compares_as_a_number(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            rows = list(sess.stream_rows("events", since_column="score", since_value="30"))
+        assert [r["id"] for r in rows] == [3, 4]
+
+    def test_typed_timestamp_column_compares_as_a_timestamp(self, tmp_path):
+        import polars as pl
+
+        from r2g.connectors.csv_source import rows_since
+
+        frame = pl.DataFrame({
+            "id": [1, 2],
+            "ts": ["2026-11-01 09:00:00", "2026-11-02 09:00:00"],
+        }).with_columns(pl.col("ts").str.to_datetime())
+        kept = rows_since(frame, "ts", "2026-11-02T00:00:00Z")
+        assert kept["id"].to_list() == [2]
+
+    def test_missing_since_column_is_an_error_not_a_full_reload(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            with pytest.raises(RuntimeError, match="not a column of this CSV table"):
+                list(sess.stream_rows("events", since_column="updated_at", since_value="2026-11-02"))
+            with pytest.raises(RuntimeError, match="not a column of this CSV table"):
+                sess.count_rows("events", since_column="updated_at", since_value="2026-11-02")
+
+    def test_bad_bound_for_the_column_type_is_an_error(self, dated_dir):
+        with CsvConnector(str(dated_dir)).open_session() as sess:
+            with pytest.raises(RuntimeError, match="is not a number"):
+                sess.count_rows("events", since_column="score", since_value="yesterday")

@@ -17,6 +17,12 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`stream --since` on a CSV source now filters (PRD P6.4).** The CSV session accepted the
+  since column and value and ignored them, so an incremental run against a CSV directory
+  re-read every row and, with `--on-duplicate replace`, rewrote the whole table while
+  reporting success. It now keeps the rows at or after the bound, comparing a timestamp
+  column as a timestamp, a numeric column as a number and anything else as text, and a
+  null never qualifies. A since column the file lacks is an error rather than a full reload.
 - **Under a control plane, a load that lays out the project is checked on the
   project-wide rules (PRD P14.10).** A load ends by declaring the project's named graph,
   which creates any collection it names that the database lacks, empty. That step is now
