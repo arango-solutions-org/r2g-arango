@@ -316,8 +316,9 @@ class TestRunPipeline:
                 {"id": 2, "name": "Alan Turing", "email": "t@b.com"},
             ],
         })
-        # Server returns one computed object per row, in order.
-        mock_writer.execute_aql.return_value = [
+        # Server returns one computed object per row, in order (nothing for the
+        # up-front check, which runs the expression over no rows).
+        mock_writer.execute_aql.side_effect = lambda q, b: [] if b == {"rows": []} else [
             {"slug": "Ada-Lovelace"},
             {"slug": "Alan-Turing"},
         ]
@@ -329,7 +330,8 @@ class TestRunPipeline:
         )
         pipeline.run()
 
-        mock_writer.execute_aql.assert_called_once()
+        check, batch = mock_writer.execute_aql.call_args_list
+        assert check[0][1] == {"rows": []}
         # The bound rows project only the referenced column.
         _query, bind = mock_writer.execute_aql.call_args[0]
         assert bind == {"rows": [{"name": "Ada Lovelace"}, {"name": "Alan Turing"}]}
@@ -338,7 +340,8 @@ class TestRunPipeline:
         slugs = {d["_key"]: d.get("slug") for d in imported}
         assert slugs == {"1": "Ada-Lovelace", "2": "Alan-Turing"}
 
-    def test_aql_delegation_failure_still_imports(self, simple_schema, mock_writer):
+    @staticmethod
+    def _delegating(simple_schema):
         from r2g.types import FieldExpression
 
         config = MappingConfig(
@@ -356,18 +359,54 @@ class TestRunPipeline:
             },
             edges=[],
         )
-        connector = FakeConnector({"users": [{"id": 1, "name": "Ada", "email": "a@b"}]})
-        mock_writer.execute_aql.side_effect = RuntimeError("AQL boom")
-        pipeline = _pipeline(
-            source_connector=connector,
-            arango_writer=mock_writer,
-            schema=Schema(tables={"users": simple_schema.tables["users"]}),
-            config=config,
-        )
+        rows = [{"id": 1, "name": "Ada", "email": "a@b"}, {"id": 2, "name": "Alan", "email": "t@b"}]
+        return config, FakeConnector({"users": rows}), Schema(tables={"users": simple_schema.tables["users"]})
+
+    @pytest.mark.parametrize("answer", [RuntimeError("AQL boom"), [{"slug": "Ady"}]],
+                             ids=["server error", "one object for two rows"])
+    def test_a_failed_delegation_rejects_the_batch(self, simple_schema, mock_writer, answer):
+        """A batch whose server step fails is not loaded without its fields: each of its
+        documents goes to the dead-letter queue with the reason (P5c.1.5)."""
+        config, connector, schema = self._delegating(simple_schema)
+
+        def server(query, bind):
+            if bind == {"rows": []}:
+                return []
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        mock_writer.execute_aql.side_effect = server
+        dlq = MagicMock()
+        pipeline = _pipeline(source_connector=connector, arango_writer=mock_writer,
+                             schema=schema, config=config, dlq=dlq)
         result = pipeline.run()
-        # Import still happens (without the delegated field), and the error is recorded.
-        mock_writer.import_batch.assert_called()
-        assert "errors" in result
+        mock_writer.import_batch.assert_not_called()
+        rejected = [c.args for c in dlq.record_failure.call_args_list]
+        assert [(coll, doc["_key"]) for coll, doc, _ in rejected] == [("users", "1"), ("users", "2")]
+        assert all("batch not loaded" in why for _, _, why in rejected)
+        assert any("batch not loaded" in e for e in result["errors"]["users"])
+
+    def test_an_expression_the_server_cannot_evaluate_stops_the_load_first(
+            self, simple_schema, mock_writer):
+        """Checked once over no rows before anything is written, naming collection and field."""
+        from r2g.streaming.pipeline import DelegationError
+
+        config, connector, schema = self._delegating(simple_schema)
+        mock_writer.execute_aql.side_effect = RuntimeError("[ERR 1540] usage of unknown function")
+        pipeline = _pipeline(source_connector=connector, arango_writer=mock_writer,
+                             schema=schema, config=config)
+        with pytest.raises(DelegationError, match="Collection 'users', field 'slug'.*1540"):
+            pipeline.run()
+        mock_writer.ensure_collection.assert_not_called()
+        mock_writer.import_batch.assert_not_called()
+
+    def test_a_dry_run_asks_the_server_nothing(self, simple_schema, mock_writer):
+        config, connector, schema = self._delegating(simple_schema)
+        pipeline = _pipeline(source_connector=connector, arango_writer=mock_writer,
+                             schema=schema, config=config, dry_run=True)
+        pipeline.run()
+        mock_writer.execute_aql.assert_not_called()
 
     def test_run_with_graph_creates_graph(self, simple_schema, simple_config, mock_writer):
         connector = FakeConnector({"users": [], "orders": []})

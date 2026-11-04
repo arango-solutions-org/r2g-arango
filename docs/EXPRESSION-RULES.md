@@ -32,7 +32,7 @@ Each row is one decision, accepted on 2026-11-04.
 | 5 | How are blanks joined into text? | `CONCAT` treats a blank as empty text. `CONCAT_SEPARATOR` leaves blanks out | **Yes**, for `CONCAT_SEPARATOR` |
 | 6 | What does `+` do with text? | Nothing. `+` is for numbers. Join text with `CONCAT` | **Yes** |
 | 7 | What is text that isn't a number, as a number? | Blank | No |
-| 8 | How are numbers written as text? | Whole numbers without a decimal point. Others in the shortest exact form | **Yes** |
+| 8 | How are numbers written as text? | Whole numbers below 10^16 without a decimal point. Others in the shortest exact form | No: r2g changed to it on 2026-11-04 |
 | 9 | Where do text positions start, and what do they count? | At 0, counting characters | No |
 | 10 | What is `7 / 2`, and what is dividing by zero? | `3.5`. Dividing by zero gives a blank | No |
 | 11 | Can text be compared with a number? | No. Refused when checked, blank if it slips through | **Yes** |
@@ -222,15 +222,24 @@ So the text depends on both the engine and the source column's type. Postgres ke
 a decimal column's trailing zeros. r2g's local route keeps them too, but its server
 route drops them.
 
-**The rule:** a whole number is written without a decimal point (`42`). Any other
-number is written in the shortest form that reads back as exactly the same number
-(`0.30000000000000004`, `1e+20`). This is how ArangoDB and JSON write numbers, and
-it is how the value looks once it is stored in a document.
+**The rule:** a whole number below 10^16 is written as plain digits, without a
+decimal point (`42`, `100000000`). Any other number is written with the fewest digits
+that read back as exactly the same number: in plain decimals from 0.0001 up, and
+otherwise with an exponent (`0.30000000000000004`, `1e+20`, `1e-5`). A decimal
+column's value is written as the floating-point number r2g stores for it in the
+document, so `42.00` is written `42`.
 
-**What changes for r2g:** text built from a whole-number floating-point or decimal
-value changes, for example `"7_42.0"` becomes `"7_42"`. A document's own key is not
-affected, because r2g builds `_key` from the primary key and expressions can't write
-it. A stored field that holds such text will change on the next full reload.
+ArangoDB writes most numbers this way, but not all of them. Measured on 3.12.12, it
+writes a whole number ending in eight or more zeros with an exponent (`1e+8`,
+`1.2e+9`, while `120000000` stays plain), some whole numbers from 2^53 up with `.0`
+(`10000000000000000.0`), and a fraction below 0.0001 in plain decimals (`0.00001`).
+These are recorded as breaks of the ArangoDB route.
+
+**What changed for r2g (2026-11-04):** text built from a whole-number floating-point
+or decimal value changed, for example `"7_42.0"` became `"7_42"`, and a decimal lost
+its trailing zeros (`"1.50"` became `"1.5"`). A document's own key is not affected,
+because r2g builds `_key` from the primary key and expressions can't write it. A
+stored field that holds such text changes on the next full reload.
 
 ### 9. Text positions start at 0 and count characters
 
@@ -296,9 +305,10 @@ added later. It would need to be defined here first.
 | both work | **both rejected.** ArangoDB calls it `NOT_NULL` | `COALESCE` works, `??` doesn't exist | **keep both** |
 
 Both give the first argument that isn't blank. Neither is ArangoDB syntax, so the
-ArangoDB route must translate them to `NOT_NULL`. Today an expression that uses
-either one fails if it is sent to the server, which happens when it also uses
-something r2g's evaluator can't read.
+ArangoDB route must translate them to `NOT_NULL`. Today ArangoDB rejects an
+expression that uses either one. Such an expression reaches the server only when it
+also uses something r2g's evaluator can't read, and a streaming load then refuses it
+before writing anything.
 
 ### 14. Times are in UTC
 
@@ -340,8 +350,8 @@ own evaluator.
 
 - **Bring both routes into line.**
   - Context: the tests record each route's breaks. Today the mapping check misses 7
-    expressions it should refuse, the evaluator breaks 15 examples, and the ArangoDB
-    route breaks 21.
+    expressions it should refuse, the evaluator breaks 11 examples, and the ArangoDB
+    route breaks 24.
   - Action: change the evaluator where "Changes r2g?" says yes, and guard or
     translate the ArangoDB route for the rest.
   - Result: every recorded break is gone, and a field has the same value whichever

@@ -9,6 +9,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The control plane reads a project's mapping on its own behalf (PRD P14.14).** Under a
+  control plane, `GET /api/projects/{name}/graph-data` accepts the control plane's
+  short-lived service token for r2g, so it can join the project ontology to where the
+  project's data lives without a user's pass for r2g. No other route accepts it.
+
 - **Expression rules (PRD P5c.1.4).** `docs/EXPRESSION-RULES.md` decides how a field
   expression behaves wherever it runs: blanks in arithmetic and conditions, what may be
   a condition, `&&` and `||`, joining text, `+`, text that isn't a number, how numbers
@@ -16,12 +21,20 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty text, `COALESCE` and `??`, and time zones. Each rule was measured on r2g's
   evaluator, ArangoDB 3.12 and Postgres 16. Its worked examples now run against the
   mapping check and the evaluator, and in the integration job against AQL delegation.
-  Neither route follows every rule yet: the evaluator breaks 15 examples, AQL
-  delegation breaks 21, and the mapping check misses 7 refusals. Each break is
-  recorded, so a fix fails the build until its record is removed. No behaviour changes
-  in this release.
+  Neither route follows every rule yet: the evaluator breaks 11 examples, AQL
+  delegation breaks 24, and the mapping check misses 7 refusals. Each break is
+  recorded, so a fix fails the build until its record is removed. Of the rules, only
+  rule 8 changes behaviour in this release (below).
 
 ### Changed
+
+- **Numbers are written as text by the expression rules' rule 8.** A whole number
+  below 10^16 has no decimal point, and any other number is written with the fewest
+  digits that read back as the same number. A decimal column's value is written as the
+  number stored in the document. So `CONCAT(@tenant, "_", @id)` with `id` 42.0 or a
+  decimal `42.00` gives `"7_42"` (was `"7_42.0"` or `"7_42.00"`), and a decimal `1.50`
+  gives `"1.5"`. The local evaluator and AQL delegation now agree on these. A stored
+  field built this way changes on the next full reload; document keys do not change.
 
 - **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
   latest snapshot is the schema, read from the namespace the snapshot was taken from, as
@@ -37,6 +50,14 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting success. It now keeps the rows at or after the bound, comparing a timestamp
   column as a timestamp, a numeric column as a number and anything else as text, and a
   null never qualifies. A since column the file lacks is an error rather than a full reload.
+- **A streaming load never loads a document without a field calculated on ArangoDB
+  (PRD P5c.1.5).** Before anything is written, each expression the load would send to
+  ArangoDB is run once over no rows; one ArangoDB cannot evaluate, such as one using
+  `COALESCE` or `??`, stops the load with an error naming the collection and the field.
+  If the server step still fails for a batch, or answers with anything but one result
+  per row, that batch is not imported: each of its documents goes to the rejected-rows
+  log with the reason. Before, the batch was imported without those fields.
+
 - **Under a control plane, a table preview is refused (PRD P14.12).** The preview returns
   up to 1,000 of a source's rows, of any source in the tenant, and every read was served
   without the policy deciding, so anyone who could open r2g in one project could read the
