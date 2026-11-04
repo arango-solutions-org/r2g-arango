@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -238,6 +239,56 @@ class CsvConnector:
         return []
 
 
+def rows_since(frame: pl.DataFrame, column: str, value: str) -> pl.DataFrame:
+    """Keep the rows of ``frame`` whose ``column`` is at or after ``value``.
+
+    This is the CSV side of ``stream --since``: what the relational sessions
+    express as ``WHERE "<column>" >= %s``. The comparison follows the column's
+    read type -- a timestamp column against the ISO 8601 value, a numeric
+    column against the number, and any other column as text, where ISO 8601
+    strings in one format order correctly. A null never qualifies, as in SQL.
+    A column the file lacks is an error rather than a full reload: a
+    misspelled ``--since-column`` must not silently rewrite every row.
+    """
+    if column not in frame.columns:
+        raise RuntimeError(
+            f"--since-column '{column}' is not a column of this CSV table "
+            f"(columns: {', '.join(frame.columns)})"
+        )
+    dtype = frame.schema[column]
+    col = pl.col(column)
+    if dtype.is_temporal():
+        bound = _parse_since_timestamp(value)
+        tz = getattr(dtype, "time_zone", None)
+        if tz and bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        elif not tz and bound.tzinfo is not None:
+            bound = bound.astimezone(timezone.utc).replace(tzinfo=None)
+        target = pl.Datetime("us", tz) if tz else pl.Datetime("us")
+        return frame.filter(col.cast(target) >= pl.lit(bound).cast(target))
+    if dtype.is_numeric():
+        try:
+            number = float(value)
+        except ValueError as err:
+            raise RuntimeError(
+                f"--since value '{value}' is not a number, but column '{column}' is numeric"
+            ) from err
+        return frame.filter(col >= number)
+    return frame.filter(col.cast(pl.String) >= value)
+
+
+def _parse_since_timestamp(value: str) -> datetime:
+    text = value.strip()
+    if text.endswith(("Z", "z")):  # Python 3.10's fromisoformat has no "Z"
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError as err:
+        raise RuntimeError(
+            f"--since value '{value}' is not an ISO 8601 timestamp"
+        ) from err
+
+
 class CsvSession:
     """Bulk-read session over a CSV directory.
 
@@ -260,6 +311,18 @@ class CsvSession:
         self.delimiter = delimiter
         self.has_header = has_header
         self.directory = resolve_source_directory(connection_string)
+        # The pipeline counts a table and then streams it. With a bound both
+        # need the whole file in a frame, so the frame filtered for the count
+        # is kept for the stream that follows: one read per table, not two.
+        self._since_frame: tuple[tuple[str, str, str], pl.DataFrame] | None = None
+
+    def _frame_since(self, table: str, column: str, value: str) -> pl.DataFrame:
+        key = (table, column, value)
+        if self._since_frame is not None and self._since_frame[0] == key:
+            return self._since_frame[1]
+        frame = rows_since(self._reader(table).read_dataframe(), column, value)
+        self._since_frame = (key, frame)
+        return frame
 
     def _resolve(self, table: str) -> Path:
         path = resolve_csv_table_path(self.directory, table)
@@ -281,6 +344,8 @@ class CsvSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> int:
+        if since_column and since_value is not None:
+            return int(self._frame_since(table, since_column, since_value).height)
         return self._reader(table).row_count()
 
     def stream_rows(
@@ -291,6 +356,12 @@ class CsvSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
+        if since_column and since_value is not None:
+            frame = self._frame_since(table, since_column, since_value)
+            self._since_frame = None  # the stream is the last use of this frame
+            for row in frame.iter_rows(named=True):
+                yield dict(row)
+            return
         yield from self._reader(table).read_rows()
 
     def dump_table_to_csv(
