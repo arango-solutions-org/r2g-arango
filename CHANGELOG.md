@@ -7,6 +7,20 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Expression rules (PRD P5c.1.4).** `docs/EXPRESSION-RULES.md` decides how a field
+  expression behaves wherever it runs: blanks in arithmetic and conditions, what may be
+  a condition, `&&` and `||`, joining text, `+`, text that isn't a number, how numbers
+  are written as text, character positions, division, comparing text with numbers,
+  empty text, `COALESCE` and `??`, and time zones. Each rule was measured on r2g's
+  evaluator, ArangoDB 3.12 and Postgres 16. Its worked examples now run against the
+  mapping check and the evaluator, and in the integration job against AQL delegation.
+  Neither route follows every rule yet: the evaluator breaks 15 examples, AQL
+  delegation breaks 21, and the mapping check misses 7 refusals. Each break is
+  recorded, so a fix fails the build until its record is removed. No behaviour changes
+  in this release.
+
 ### Changed
 
 - **`r2g stream --source <name>` no longer needs `--schema`.** Without it, the source's
