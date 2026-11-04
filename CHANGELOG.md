@@ -9,6 +9,12 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Snowflake snapshots can include views (PRD P6.1).** `include_views=true` in a Snowflake
+  connection string lists the schema's views and materialized views beside its tables, so a
+  schema whose joinable objects are views can be snapshotted, mapped and loaded. Off by
+  default, as every r2g connector reads base tables only; dynamic tables were always
+  listed. A view declares no keys and is not asked for any: they come from a reviewed key
+  overlay or FK inference. The flag is consumed by r2g, never forwarded to the driver.
 - **The control plane reads a project's mapping on its own behalf (PRD P14.14).** Under a
   control plane, `GET /api/projects/{name}/graph-data` accepts the control plane's
   short-lived service token for r2g, so it can join the project ontology to where the

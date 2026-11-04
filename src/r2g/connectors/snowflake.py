@@ -40,6 +40,13 @@ connector arguments used by Contextual Data Fabric::
 - ``warehouse``, ``role``, ``authenticator``, ``application``,
   ``private_key_file`` and ``private_key_file_pwd`` are forwarded to
   ``snowflake.connector.connect`` after auth validation.
+- ``include_views=true`` lists the schema's views and materialized views
+  beside its tables, so a schema whose joinable objects are views (a
+  Customer 360 built from ``*_VW`` objects, say) can be snapshotted and
+  loaded. Off by default: every r2g connector reads base tables only, and
+  a view declares no keys, so its keys come from a reviewed overlay or FK
+  inference. Dynamic tables are base tables to ``INFORMATION_SCHEMA`` and
+  are always listed. The flag is consumed by r2g, never forwarded.
 - Password and key-pair authentication are mutually exclusive. Key-pair auth
   sets ``authenticator="SNOWFLAKE_JWT"`` and lets the Snowflake driver read the
   key file; r2g never reads or persists key bytes.
@@ -74,6 +81,16 @@ logger = get_logger(__name__)
 
 _SENSITIVE_CONNECT_FIELDS = ("password", "private_key_file", "private_key_file_pwd")
 
+#: Accepted spellings of the ``include_views`` URL flag. Blank means absent.
+_BOOL_WORDS = {
+    "": False, "true": True, "false": False, "1": True, "0": False, "yes": True, "no": False,
+}
+
+#: What a snapshot lists: base tables always (dynamic tables are base tables to
+#: ``INFORMATION_SCHEMA``), views and materialized views only when asked.
+_TABLE_TYPES = ("BASE TABLE",)
+_TABLE_AND_VIEW_TYPES = ("BASE TABLE", "VIEW", "MATERIALIZED VIEW")
+
 
 def _load_snowflake_connector() -> Any:
     """Import ``snowflake.connector`` lazily with a helpful error.
@@ -100,6 +117,7 @@ class SnowflakeConnector:
         self.schema_name = schema_name.upper() if schema_name else "PUBLIC"
         self._connect_params = _parse_snowflake_url(connection_string)
         url_schema = self._connect_params.pop("_url_schema", None)
+        self.include_views = bool(self._connect_params.pop("_include_views", False))
         if url_schema and (schema_name in (None, "", "public", "PUBLIC")):
             self.schema_name = url_schema.upper()
         self._database: str = self._connect_params.get("database", "")
@@ -152,33 +170,39 @@ class SnowflakeConnector:
 
     def _introspect(self, conn: Any) -> Schema:
         schema = Schema()
+        table_types = _TABLE_AND_VIEW_TYPES if self.include_views else _TABLE_TYPES
+        placeholders = ", ".join("%s" for _ in table_types)
         cur = conn.cursor()
         try:
             cur.execute(
                 f"""
-                SELECT TABLE_NAME
+                SELECT TABLE_NAME, TABLE_TYPE
                 FROM {self._database}.INFORMATION_SCHEMA.TABLES
                 WHERE TABLE_SCHEMA = %s
-                  AND TABLE_TYPE = 'BASE TABLE'
+                  AND TABLE_TYPE IN ({placeholders})
                 ORDER BY TABLE_NAME
                 """,
-                (self.schema_name,),
+                (self.schema_name, *table_types),
             )
             table_rows = cur.fetchall()
         finally:
             cur.close()
 
-        table_names = [row[0] for row in table_rows]
-
-        for table_name in table_names:
-            schema.tables[table_name] = self._process_table(conn, table_name)
+        for row in table_rows:
+            table_name, table_type = row[0], row[1]
+            schema.tables[table_name] = self._process_table(
+                conn, table_name, is_view=table_type != "BASE TABLE"
+            )
 
         return schema
 
-    def _process_table(self, conn: Any, table_name: str) -> Table:
+    def _process_table(self, conn: Any, table_name: str, *, is_view: bool = False) -> Table:
+        """Introspect one object. A view (plain or materialized) gets its
+        columns only: Snowflake allows no primary or foreign key constraint on
+        either, so ``SHOW PRIMARY KEYS`` / ``SHOW IMPORTED KEYS`` are not run."""
         columns = self._fetch_columns(conn, table_name)
-        pks = self._fetch_primary_key(conn, table_name)
-        fks = self._fetch_foreign_keys(conn, table_name)
+        pks = [] if is_view else self._fetch_primary_key(conn, table_name)
+        fks = [] if is_view else self._fetch_foreign_keys(conn, table_name)
 
         for col in columns:
             col.is_primary_key = col.name in pks
@@ -369,6 +393,14 @@ def _parse_snowflake_url(url: str) -> dict[str, Any]:
 
     query = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items() if v}
 
+    include_views_raw = query.get("include_views", "").strip().lower()
+    if include_views_raw not in _BOOL_WORDS:
+        raise ValueError(
+            "include_views must be true or false "
+            f"(got {query.get('include_views', '')!r})"
+        )
+    include_views = _BOOL_WORDS[include_views_raw]
+
     private_key_file = query.get("private_key_file", "")
     private_key_file_pwd = query.get("private_key_file_pwd", "")
     if password and private_key_file:
@@ -407,6 +439,8 @@ def _parse_snowflake_url(url: str) -> dict[str, Any]:
         kwargs["port"] = parsed.port
     if url_schema:
         kwargs["_url_schema"] = url_schema
+    if include_views:
+        kwargs["_include_views"] = True
     return kwargs
 
 
