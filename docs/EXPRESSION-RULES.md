@@ -305,9 +305,10 @@ added later. It would need to be defined here first.
 | both work | **both rejected.** ArangoDB calls it `NOT_NULL` | `COALESCE` works, `??` doesn't exist | **keep both** |
 
 Both give the first argument that isn't blank. Neither is ArangoDB syntax, so the
-ArangoDB route must translate them to `NOT_NULL`. Today an expression that uses
-either one fails if it is sent to the server, which happens when it also uses
-something r2g's evaluator can't read.
+ArangoDB route must translate them to `NOT_NULL`. Today ArangoDB rejects an
+expression that uses either one. Such an expression reaches the server only when it
+also uses something r2g's evaluator can't read, and a streaming load then refuses it
+before writing anything.
 
 ### 14. Times are in UTC
 

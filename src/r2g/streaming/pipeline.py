@@ -57,6 +57,10 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+class DelegationError(ValueError):
+    """ArangoDB cannot evaluate an expression the streaming path would delegate to it."""
+
+
 class StreamingPipeline:
     """Orchestrates streaming data from a relational source to ArangoDB.
 
@@ -275,33 +279,70 @@ class StreamingPipeline:
         docs: list[dict[str, Any]],
         raw_rows: list[dict[str, Any]],
         collection: str,
-    ) -> None:
+    ) -> bool:
         """Fill server-delegated expression fields for a batch in place.
 
         Runs the delegated-expression AQL query over the projected source
-        rows and merges each returned object into the matching document. On
-        failure the batch is imported without the delegated fields rather than
-        aborting the load.
+        rows and merges each returned object into the matching document.
+        Returns False when it fails: the batch's documents then go to the
+        dead-letter queue with the reason and are not imported, since a
+        document is never loaded without a field its mapping defines.
         """
         if not raw_rows:
-            return
+            return True
         try:
             results = writer.execute_aql(query, {"rows": raw_rows})
+            if len(results) != len(docs) or not all(isinstance(r, dict) for r in results):
+                raise ValueError(f"expected {len(docs)} objects, got {len(results)} results")
         except Exception as exc:  # noqa: BLE001
+            reason = f"AQL delegation failed, batch not loaded: {exc}"
             with self._lock:
                 errs = self.errors.setdefault(collection, [])
                 if len(errs) < 50:
-                    errs.append(f"AQL delegation failed: {exc}")
-            self._record_dlq(collection, [f"AQL delegation failed: {exc}"])
+                    errs.append(reason)
+            self._reject_batch(collection, docs, reason)
             logger.warning(
                 "aql_delegation_failed",
                 collection=collection,
+                rows=len(docs),
                 error=str(exc),
             )
-            return
+            return False
         for doc, computed in zip(docs, results):
-            if isinstance(computed, dict):
-                doc.update(computed)
+            doc.update(computed)
+        return True
+
+    def _reject_batch(self, collection: str, docs: list[dict[str, Any]], reason: str) -> None:
+        """Record each document of a batch that will not be imported in the DLQ."""
+        if self.dlq is None:
+            return
+        try:
+            for doc in docs:
+                self.dlq.record_failure(collection, doc, reason)
+        except Exception:  # noqa: BLE001
+            logger.warning("dlq_record_failed", collection=collection)
+
+    def _check_delegations(self) -> None:
+        """Refuse the load before anything is written if ArangoDB cannot evaluate an
+        expression the streaming path would delegate to it (an unknown function, or
+        syntax it rejects), naming the collection and the field. Each expression is
+        run once over no rows, which parses it without reading or writing data."""
+        for table_name, cm in self._iter_document_jobs():
+            transformer = NodeTransformer(
+                self.schema.tables[table_name],
+                collection_mapping=cm,
+                key_separator=self.config.key_separator,
+                type_overrides=self.config.type_overrides,
+                lpg=self._lpg,
+            )
+            for fx in transformer.delegated_expressions:
+                try:
+                    self.writer.execute_aql(transformer.build_delegation_query([fx]), {"rows": []})
+                except Exception as exc:  # noqa: BLE001
+                    raise DelegationError(
+                        f"Collection '{cm.target_collection}', field '{fx.target}': ArangoDB "
+                        f"cannot evaluate {fx.expression!r} ({exc}). Nothing was loaded."
+                    ) from exc
 
     def _notify(self, event: str, name: str, current: int, total: int | None) -> None:
         if self._on_progress is not None:
@@ -400,9 +441,9 @@ class StreamingPipeline:
                 raw_batch.append({c: _json_safe(row.get(c)) for c in ref_cols})
             if len(batch) >= self.batch_size:
                 if not self.dry_run:
-                    if delegate:
-                        self._apply_delegation(w, delegation_query, batch, raw_batch, target)
-                    self._flush_batch(w, write_to, batch)
+                    if not delegate or self._apply_delegation(
+                            w, delegation_query, batch, raw_batch, target):
+                        self._flush_batch(w, write_to, batch)
                 total += len(batch)
                 batch.clear()
                 raw_batch.clear()
@@ -411,9 +452,9 @@ class StreamingPipeline:
 
         if batch:
             if not self.dry_run:
-                if delegate:
-                    self._apply_delegation(w, delegation_query, batch, raw_batch, target)
-                self._flush_batch(w, write_to, batch)
+                if not delegate or self._apply_delegation(
+                        w, delegation_query, batch, raw_batch, target):
+                    self._flush_batch(w, write_to, batch)
             total += len(batch)
 
         if self.dry_run:
@@ -631,6 +672,8 @@ class StreamingPipeline:
         if not self.dry_run:
             self.writer.ensure_database()
         self.writer.connect()
+        if not self.dry_run:
+            self._check_delegations()
 
         # Drop the existing named graph before any collections: ArangoDB will
         # not drop a collection while it is part of a graph (ERR 1942). The

@@ -39,6 +39,14 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A streaming load never loads a document without a field calculated on ArangoDB
+  (PRD P5c.1.5).** Before anything is written, each expression the load would send to
+  ArangoDB is run once over no rows; one ArangoDB cannot evaluate, such as one using
+  `COALESCE` or `??`, stops the load with an error naming the collection and the field.
+  If the server step still fails for a batch, or answers with anything but one result
+  per row, that batch is not imported: each of its documents goes to the rejected-rows
+  log with the reason. Before, the batch was imported without those fields.
+
 - **Under a control plane, a table preview is refused (PRD P14.12).** The preview returns
   up to 1,000 of a source's rows, of any source in the tenant, and every read was served
   without the policy deciding, so anyone who could open r2g in one project could read the
