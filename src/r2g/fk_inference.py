@@ -351,9 +351,8 @@ class CsvValueSampler(_RsaCsvValueSampler):
         if frame is None or not frame.columns:
             return []
         name = frame.columns[0]
-        series = frame.get_column(name).filter(
-            pl.col(name).is_not_null() & (pl.col(name) != "")
-        )
+        frame = frame.filter(pl.col(name).is_not_null() & (pl.col(name) != ""))
+        series = frame.get_column(name)
         if series.len() == 0:
             return []
         return series.unique(maintain_order=True).head(max(1, int(limit))).to_list()

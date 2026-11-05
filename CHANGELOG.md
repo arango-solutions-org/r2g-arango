@@ -50,6 +50,8 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CSV value sampling returns distinct values again.** Filtering blank cells no longer
+  raises a Polars error when sampling CSV columns for suggestions.
 - **`stream --since` on a CSV source now filters (PRD P6.4).** The CSV session accepted the
   since column and value and ignored them, so an incremental run against a CSV directory
   re-read every row and, with `--on-duplicate replace`, rewrote the whole table while
