@@ -77,12 +77,12 @@ class TestLoadEndpoint:
         resp = client.post("/api/projects/nonexistent/load", json={})
         assert resp.status_code == 404
 
-    def test_load_no_snapshot_returns_400(self, client, catalog_dir):
+    def test_load_no_snapshot_returns_conflict(self, client, catalog_dir):
         mgr = CatalogManager(catalog_dir)
         mgr.add_source("src", "postgresql", "postgresql://localhost/db")
         mgr.create_project("proj", "src", "/fake/path.yaml")
         resp = client.post("/api/projects/proj/load", json={})
-        assert resp.status_code == 400
+        assert resp.status_code == 409
 
     @patch("r2g.ui.server.StreamingPipeline")
     @patch("r2g.ui.server.ArangoWriter")
@@ -293,7 +293,7 @@ class TestAutoMapEndpoint:
         ConfigManager.save_config(MappingConfig(), mapping_path)
         mgr.create_project("proj", "src", mapping_path)
         resp = client.post("/api/projects/proj/auto-map")
-        assert resp.status_code == 400
+        assert resp.status_code == 409
 
 
 class TestTargetEndpoints:

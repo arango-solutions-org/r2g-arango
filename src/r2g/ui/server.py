@@ -611,6 +611,7 @@ def create_app(
                 mapping_config_path=str(mapping_path),
                 arango_endpoint=target.endpoint,
                 arango_database=target.database,
+                arango_username=target.username,
                 mapping_name="Snowflake Customer 360",
                 mapping_description=(
                     "Synthetic account health graph with reviewed, non-enforced Snowflake keys."
@@ -634,6 +635,7 @@ def create_app(
             target_name=target.name,
             arango_endpoint=target.endpoint,
             arango_database=target.database,
+            arango_username=target.username,
         )
         try:
             existing = (
@@ -1466,6 +1468,23 @@ def create_app(
         fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
         if not fields:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
+        if "target_name" in fields:
+            target = catalog.get_target(fields["target_name"])
+            if target is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Target '{fields['target_name']}' not found",
+                )
+            if target.database.lower() == "_system":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Projects require a dedicated target database, not '_system'",
+                )
+            fields.update(
+                arango_endpoint=target.endpoint,
+                arango_database=target.database,
+                arango_username=target.username,
+            )
         details = governing.Item("project", (None,), tuple(sorted(fields)))
         g = await _govern(request, name, "transformation.update", [details]) \
             if governed else None

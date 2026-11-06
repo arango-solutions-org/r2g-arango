@@ -326,6 +326,12 @@ batch artifact; it does not execute the script or create its input files. The
 bundled live demo and role/setup instructions are in
 `examples/snowflake_customer_360/README.md`.
 
+For a governed handoff built from a curated OWL/Turtle physical mapping, follow
+the [curated ontology approval-bundle workflow](docs/CURATED-ONTOLOGY-BUNDLES.md).
+It pins one source snapshot and registered ArangoDB target, reconciles the
+ontology before project creation, and produces a secret-free package for IT to
+inspect and approve before extraction or import.
+
 ### 1. Extract schema from PostgreSQL
 
 ```bash

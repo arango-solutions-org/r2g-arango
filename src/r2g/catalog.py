@@ -232,6 +232,7 @@ class Project(BaseModel):
     mapping_config_path: str
     arango_endpoint: str = "http://localhost:8529"
     arango_database: str = "_system"
+    arango_username: str = "root"
     target_name: str | None = None
     ontology_id: str | None = None
     ontology_fingerprint: str | None = None
@@ -663,6 +664,7 @@ class CatalogManager:
         mapping_config_path: str,
         arango_endpoint: str = "http://localhost:8529",
         arango_database: str = "_system",
+        arango_username: str = "root",
         mapping_name: str = "",
         mapping_description: str = "",
         target_name: str | None = None,
@@ -698,6 +700,7 @@ class CatalogManager:
                 raise ValueError("Projects require a dedicated target database, not '_system'")
             arango_endpoint = target.endpoint
             arango_database = target.database
+            arango_username = target.username
         now = _now()
         project = Project(
             name=name,
@@ -706,6 +709,7 @@ class CatalogManager:
             mapping_config_path=mapping_config_path,
             arango_endpoint=arango_endpoint,
             arango_database=arango_database,
+            arango_username=arango_username,
             mapping_name=mapping_name,
             mapping_description=mapping_description,
             target_name=target_name,

@@ -298,6 +298,7 @@ class TestProjectCRUD:
         assert project.schema_snapshot_id == pinned.id
         assert project.arango_endpoint == "http://arango.internal:8529"
         assert project.arango_database == "customer360"
+        assert project.arango_username == "operator"
 
     def test_create_project_rejects_system_target(self, tmp_path):
         mgr = CatalogManager(catalog_dir=tmp_path)

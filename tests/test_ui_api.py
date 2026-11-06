@@ -726,6 +726,40 @@ class TestProjectEndpoints:
         assert body["mapping_name"] == "Renamed"
         assert body["mapping_description"] == "new desc"
 
+    def test_patch_project_target_copies_non_secret_identity(self, client, tmp_path):
+        self._add_source(client)
+        mapping_path = str(tmp_path / "mapping.yaml")
+        ConfigManager.save_config(MappingConfig(), mapping_path)
+        client.post(
+            "/api/projects",
+            json={
+                "name": "patch_target",
+                "source_name": "src",
+                "mapping_config_path": mapping_path,
+            },
+        )
+        assert client.post(
+            "/api/targets",
+            json={
+                "name": "approved",
+                "endpoint": "https://arango.example:8529",
+                "database": "customer360",
+                "username": "importer",
+            },
+        ).status_code == 201
+
+        response = client.patch(
+            "/api/projects/patch_target",
+            json={"target_name": "approved"},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["target_name"] == "approved"
+        assert body["arango_endpoint"] == "https://arango.example:8529"
+        assert body["arango_database"] == "customer360"
+        assert body["arango_username"] == "importer"
+
     def test_patch_project_not_found(self, client):
         resp = client.patch("/api/projects/nope", json={"mapping_name": "x"})
         assert resp.status_code == 404
@@ -807,6 +841,7 @@ class TestProjectEndpoints:
         assert body["target_name"] == "graph"
         assert body["schema_snapshot_id"] == snapshot.id
         assert body["arango_database"] == "customer360"
+        assert body["arango_username"] == "root"
 
     def test_rebase_is_explicit_and_preview_does_not_mutate(
         self, client, catalog_dir
