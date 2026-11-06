@@ -2674,6 +2674,9 @@ function _menuProject(name) {
     { label: 'View arangoimport script bundle', icon: '\u2328',
       onClick: () => window.openArangoImportViewer({ scope: 'all' }),
       hint: 'Inspect or download a secret-safe alternative batch import script. Studio Load continues to stream over HTTP.' },
+    { label: 'Rebase to latest source snapshot\u2026', icon: '\u21BB',
+      onClick: () => openProjectRebase(name),
+      hint: 'Preview reconciliation against the latest snapshot, then explicitly move the project and invalidate approval.' },
     { label: 'Edit name & description\u2026', icon: '\u270E', onClick: () => openEditProjectForm(name),
       hint: 'Rename the project or change its description, target endpoint, and database. Does not touch already-loaded data.' },
     '-',
@@ -2682,6 +2685,67 @@ function _menuProject(name) {
     { label: 'Delete project', icon: '\u2716', danger: true, onClick: () => confirmDeleteProject(name),
       hint: 'Remove the project and its mapping from the catalog. Data already loaded into ArangoDB is not deleted.' },
   ];
+}
+
+async function openProjectRebase(name) {
+  let preview;
+  try {
+    preview = await apiFetch(`/api/projects/${encodeURIComponent(name)}/rebase-snapshot`, {
+      method: 'POST',
+      body: JSON.stringify({ apply: false }),
+    });
+  } catch (e) {
+    toast('Snapshot rebase preview failed: ' + errorDetail(e), 'error');
+    return;
+  }
+  const current = preview.current_snapshot_id || '(none)';
+  const latest = preview.latest_snapshot_id || '(none)';
+  const unchanged = current === latest;
+  const issueText = JSON.stringify(preview.issues || [], null, 2);
+  const actions = [
+    { label: unchanged ? 'Close' : 'Cancel', onClick: () => closeFloatingCard('rebase-project') },
+  ];
+  if (!unchanged && preview.valid) {
+    actions.push({
+      label: 'Rebase and invalidate approval',
+      kind: 'primary',
+      onClick: async () => {
+        try {
+          await apiFetch(`/api/projects/${encodeURIComponent(name)}/rebase-snapshot`, {
+            method: 'POST',
+            body: JSON.stringify({ apply: true }),
+          });
+          closeFloatingCard('rebase-project');
+          await loadProjects();
+          if (currentProject === name) selectProject(name);
+          toast('Project rebased; previous bundle approval is no longer valid', 'success');
+        } catch (e) {
+          toast('Snapshot rebase failed: ' + errorDetail(e), 'error');
+        }
+      },
+    });
+  }
+  openFloatingCard({
+    id: 'rebase-project',
+    title: 'Rebase source snapshot',
+    status: {
+      label: unchanged ? 'Up to date' : (preview.valid ? 'Ready' : 'Blocked'),
+      kind: unchanged || preview.valid ? 'success' : 'error',
+    },
+    position: { right: 40, top: 80 },
+    body: `
+      <div class="fc-form">
+        <div><b>Current:</b> <code>${_htmlEscape(current)}</code></div>
+        <div><b>Latest:</b> <code>${_htmlEscape(latest)}</code></div>
+        <div class="hint">${unchanged
+          ? 'The project already uses the latest source snapshot.'
+          : (preview.valid
+            ? 'Reconciliation passed. Applying this change invalidates approval tied to the current snapshot.'
+            : 'Reconciliation failed. Resolve these issues before rebasing.')}</div>
+        ${unchanged ? '' : `<pre style="max-height:260px;overflow:auto;background:#f8f8f8;border:1px solid #e5e5e5;padding:8px;font:12px/1.45 Courier,monospace">${_htmlEscape(issueText)}</pre>`}
+      </div>`,
+    actions,
+  });
 }
 
 // Resolve a project to its ArangoDB target {endpoint, database}: an explicit

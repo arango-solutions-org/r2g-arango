@@ -15,6 +15,16 @@ def test_viewer_is_loaded_and_available_from_context_surfaces():
     assert "scope: 'edge'" in index
 
 
+def test_project_context_menu_exposes_explicit_snapshot_rebase():
+    index = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    assert "Rebase to latest source snapshot" in index
+    assert "/rebase-snapshot" in index
+    assert "Rebase and invalidate approval" in index
+    assert "apply: false" in index
+    assert "apply: true" in index
+
+
 def test_viewer_supports_modes_views_copy_and_client_download():
     source = (STATIC_DIR / "arangoimport-viewer.js").read_text(encoding="utf-8")
     for expected in (
