@@ -34,6 +34,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cryptography` may be 49 or 50 (`<51.0`, was `<49.0`).** pyOpenSSL 26.3 and later
+  require `cryptography>=49`, so the old cap held any project that installs r2g to
+  pyOpenSSL 26.2 or older, and a project that installed r2g in a second step (after the
+  Snowflake connector had brought in pyOpenSSL 26.4) was left with `cryptography` 48 under
+  a pyOpenSSL that requires 49. r2g uses only `cryptography.fernet` (catalog credentials at
+  rest); the suite passes unchanged on 49.0.0 and 50.0.2.
+
 - **Numbers are written as text by the expression rules' rule 8.** A whole number
   below 10^16 has no decimal point, and any other number is written with the fewest
   digits that read back as the same number. A decimal column's value is written as the
