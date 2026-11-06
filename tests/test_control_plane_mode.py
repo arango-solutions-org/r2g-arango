@@ -387,6 +387,14 @@ def test_the_page_uses_no_root_absolute_addresses():
     assert offenders == []
 
 
+def test_the_page_renews_its_context_for_r2g():
+    """A context is issued for one tool: the renewal asks for r2g's again, by its own id."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    renewal = html[html.index("fetch('/api/context'"):]
+    renewal = renewal[: renewal.index("});")]
+    assert f"tool: '{control_plane.TOOL_ID}'" in renewal and "project: claims.ctx.project" in renewal
+
+
 def test_api_fetch_keeps_the_auth_header_when_a_caller_passes_headers():
     """Spreading opts after headers used to let a caller's headers drop the token."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")

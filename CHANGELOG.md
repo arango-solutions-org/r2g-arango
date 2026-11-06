@@ -57,6 +57,12 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under a control plane, the page renews its context for r2g (PRD P14.5).** The renewal
+  asked the control plane for a new context without naming the tool. A control plane that
+  issues each context for one tool would refuse it, and the page would keep its old context
+  until that expired. The renewal now names r2g. A control plane that does not take a tool
+  ignores the field.
+
 - **CSV value sampling returns distinct values again.** Filtering blank cells no longer
   raises a Polars error when sampling CSV columns for suggestions.
 - **`stream --since` on a CSV source now filters (PRD P6.4).** The CSV session accepted the
