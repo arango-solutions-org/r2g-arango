@@ -164,10 +164,12 @@ def test_every_change_route_is_governed_read_or_refused_as_the_prd_lists(cp, tmp
             kind, why = governed.classify(method, path)
             kinds[kind].append(f"{method} {route.path}")
             assert (why is not None) == (kind == "refused")
-    assert [len(kinds[k]) for k in ("governed", "read", "refused")] == [5, 14, 11], kinds
+    assert [len(kinds[k]) for k in ("governed", "read", "refused")] == [6, 15, 15], kinds
     assert sorted(kinds["governed"]) == [
         "PATCH /api/projects/{name}", "POST /api/projects", "POST /api/projects/{name}/load",
-        "POST /api/projects/{name}/migrate", "PUT /api/projects/{name}/mapping"]
+        "POST /api/projects/{name}/migrate",
+        "POST /api/projects/{name}/rebase-snapshot",
+        "PUT /api/projects/{name}/mapping"]
 
 
 def test_the_only_read_refused_is_the_one_returning_a_sources_rows(cp, tmp_path):

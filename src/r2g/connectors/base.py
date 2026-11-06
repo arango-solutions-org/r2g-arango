@@ -106,7 +106,9 @@ def create_source_connector(
 
     ``source_params`` carries type-specific configuration (e.g. CSV
     ``delimiter`` / ``has_header`` / ``null_values``, Kafka ``schema_registry_url`` /
-    ``topic``). PostgreSQL and Snowflake ignore it.
+    ``topic``). Snowflake accepts ``include_views`` so curated mappings can
+    reconcile view-backed entities without hiding the setting in a URL.
+    PostgreSQL ignores it.
     """
 
     key = normalize_source_type(source_type)
@@ -129,7 +131,14 @@ def create_source_connector(
     if key == "snowflake":
         from r2g.connectors.snowflake import SnowflakeConnector
 
-        return SnowflakeConnector(connection_string, schema_name=schema_name)
+        include_views = params.get("include_views")
+        return SnowflakeConnector(
+            connection_string,
+            schema_name=schema_name,
+            include_views=(
+                bool(include_views) if include_views is not None else None
+            ),
+        )
     if key == "clickhouse":
         from r2g.connectors.clickhouse import ClickHouseConnector
 

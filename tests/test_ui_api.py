@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -93,6 +94,22 @@ class TestSourceEndpoints:
         assert body["source_type"] == "snowflake"
         # connection string should be redacted
         assert "svc:x@" not in body["connection_string"]
+
+    def test_snowflake_include_views_is_persisted_as_explicit_source_setting(
+        self, client
+    ):
+        response = client.post(
+            "/api/sources",
+            json={
+                "name": "views_sf",
+                "source_type": "snowflake",
+                "connection_string": "snowflake://svc:x@account/ANALYTICS/CORE",
+                "source_params": {"include_views": True},
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["source_params"]["include_views"] is True
 
     def test_snowflake_key_path_and_passphrase_are_redacted(self, client):
         response = client.post(
@@ -744,6 +761,251 @@ class TestProjectEndpoints:
     def test_delete_project_not_found(self, client):
         resp = client.delete("/api/projects/nope")
         assert resp.status_code == 404
+
+    def test_create_project_binds_registered_target(self, client, catalog_dir):
+        self._add_source(client)
+        manager = CatalogManager(catalog_dir)
+        snapshot = manager.create_snapshot(
+            "src",
+            Schema(
+                tables={
+                    "users": Table(
+                        name="users",
+                        columns=[
+                            Column(
+                                name="id",
+                                data_type="integer",
+                                is_primary_key=True,
+                            )
+                        ],
+                        primary_key=["id"],
+                    )
+                }
+            ),
+        )
+        assert client.post(
+            "/api/targets",
+            json={
+                "name": "graph",
+                "endpoint": "http://arango:8529",
+                "database": "customer360",
+            },
+        ).status_code == 201
+
+        response = client.post(
+            "/api/projects",
+            json={
+                "name": "bound",
+                "source_name": "src",
+                "target_name": "graph",
+                "schema_snapshot_id": snapshot.id,
+            },
+        )
+
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["target_name"] == "graph"
+        assert body["schema_snapshot_id"] == snapshot.id
+        assert body["arango_database"] == "customer360"
+
+    def test_rebase_is_explicit_and_preview_does_not_mutate(
+        self, client, catalog_dir
+    ):
+        self._add_source(client)
+        manager = CatalogManager(catalog_dir)
+        schema = Schema(
+            tables={
+                "users": Table(
+                    name="users",
+                    columns=[
+                        Column(name="id", data_type="integer", is_primary_key=True)
+                    ],
+                    primary_key=["id"],
+                )
+            }
+        )
+        first = manager.create_snapshot("src", schema)
+        client.post(
+            "/api/projects",
+            json={
+                "name": "pinned",
+                "source_name": "src",
+                "schema_snapshot_id": first.id,
+            },
+        )
+        latest = manager.create_snapshot("src", schema)
+
+        preview = client.post(
+            "/api/projects/pinned/rebase-snapshot", json={"apply": False}
+        )
+        assert preview.status_code == 200
+        assert preview.json()["latest_snapshot_id"] == latest.id
+        assert client.get("/api/projects/pinned").json()["schema_snapshot_id"] == first.id
+
+        applied = client.post(
+            "/api/projects/pinned/rebase-snapshot", json={"apply": True}
+        )
+        assert applied.status_code == 200
+        assert applied.json()["approval_invalidated"] is True
+        assert client.get("/api/projects/pinned").json()["schema_snapshot_id"] == latest.id
+
+
+class TestCuratedOntologyEndpoints:
+    @staticmethod
+    def _bundle() -> dict:
+        return {
+            "conceptualSchema": {
+                "entities": [
+                    {
+                        "name": "Users",
+                        "term": "https://example.test/Users",
+                        "properties": [
+                            {
+                                "name": "userId",
+                                "term": "https://example.test/userId",
+                            }
+                        ],
+                    }
+                ],
+                "relationships": [],
+            },
+            "physicalMapping": {
+                "entities": {
+                    "Users": {
+                        "style": "TABLE",
+                        "tableName": "users",
+                        "primaryKey": ["id"],
+                        "properties": {
+                            "userId": {"columnName": "id"},
+                        },
+                    }
+                },
+                "relationships": {},
+            },
+            "metadata": {"analyzerVersion": "test"},
+        }
+
+    def _import(self, client, monkeypatch):
+        bundle = self._bundle()
+
+        def fake_import(root, imports):
+            return bundle, {
+                "canonicalGraphDigest": "sha256:" + "a" * 64,
+                "rootOntologyIri": "https://example.test/specific",
+                "profileVersion": "1",
+            }
+
+        monkeypatch.setattr("r2g.ontology_import._rsa_import", fake_import)
+        return client.post(
+            "/api/ontologies/import",
+            data={"name": "Users ontology"},
+            files=[
+                ("root", ("specific.ttl", b"root", "text/turtle")),
+                ("imports", ("upper.ttl", b"upper", "text/turtle")),
+            ],
+        )
+
+    def test_import_reconcile_and_create_project(
+        self, client, catalog_dir, monkeypatch
+    ):
+        imported = self._import(client, monkeypatch)
+        assert imported.status_code == 201, imported.text
+        ontology_id = imported.json()["id"]
+        assert client.get("/api/ontologies").json()[0]["id"] == ontology_id
+
+        client.post(
+            "/api/sources",
+            json={
+                "name": "src",
+                "source_type": "postgresql",
+                "connection_string": "postgresql://localhost/test",
+            },
+        )
+        manager = CatalogManager(catalog_dir)
+        snapshot = manager.create_snapshot(
+            "src",
+            Schema(
+                tables={
+                    "users": Table(
+                        name="users",
+                        columns=[
+                            Column(
+                                name="id",
+                                data_type="integer",
+                                is_primary_key=True,
+                            )
+                        ],
+                        primary_key=["id"],
+                    )
+                }
+            ),
+        )
+        reconcile = client.post(
+            f"/api/ontologies/{ontology_id}/reconcile",
+            json={"source_name": "src", "snapshot_id": snapshot.id},
+        )
+        assert reconcile.status_code == 200, reconcile.text
+        assert reconcile.json()["executable"] is True
+
+        client.post(
+            "/api/targets",
+            json={
+                "name": "graph",
+                "endpoint": "http://localhost:8529",
+                "database": "customer360",
+            },
+        )
+        created = client.post(
+            "/api/projects",
+            json={
+                "name": "ontology_project",
+                "source_name": "src",
+                "target_name": "graph",
+                "ontology_id": ontology_id,
+                "schema_snapshot_id": snapshot.id,
+            },
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["ontology_id"] == ontology_id
+        mapping = client.get("/api/projects/ontology_project/mapping").json()
+        assert mapping["collections"]["users"]["term"] == "https://example.test/Users"
+
+    def test_ontology_removal_is_blocked_while_project_uses_it(
+        self, client, catalog_dir, monkeypatch
+    ):
+        ontology_id = self._import(client, monkeypatch).json()["id"]
+        manager = CatalogManager(catalog_dir)
+        manager.add_source("src", "postgresql", "conn")
+        snapshot = manager.create_snapshot(
+            "src",
+            Schema(
+                tables={
+                    "users": Table(
+                        name="users",
+                        columns=[
+                            Column(
+                                name="id",
+                                data_type="integer",
+                                is_primary_key=True,
+                            )
+                        ],
+                        primary_key=["id"],
+                    )
+                }
+            ),
+        )
+        manager.add_target("graph", database="customer360")
+        manager.create_project(
+            "project",
+            "src",
+            str(Path(catalog_dir) / "mapping.yaml"),
+            target_name="graph",
+            ontology_id=ontology_id,
+            schema_snapshot_id=snapshot.id,
+        )
+
+        response = client.delete(f"/api/ontologies/{ontology_id}")
+        assert response.status_code == 409
 
 
 class TestApiAuth:

@@ -24,11 +24,12 @@ _PROJECT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*")
 #: Persisted shape of ``SchemaSnapshot.schema_data``. Format 1 (no marker on
 #: disk) cannot hold UNIQUE keys -- they were dropped on save -- so its empty
 #: ``unique_constraints`` says nothing. Format 2 keeps whatever UNIQUE keys the
-#: capture produced. It versions the *storage*, not the introspection: r2g's own
+#: capture produced. Format 3 also preserves whether an object is a view. It
+#: versions the *storage*, not the introspection: r2g's own
 #: connectors do not read declared UNIQUE constraints yet (Plan B), so an empty
 #: list at format 2 can still mean "not looked for" -- only an overlay or an
 #: RSA-backed capture puts UNIQUE keys there today.
-CURRENT_SCHEMA_FORMAT = 2
+CURRENT_SCHEMA_FORMAT = 3
 
 
 def validate_project_name(value: str) -> str:
@@ -58,6 +59,18 @@ class DependencyError(Exception):
         super().__init__(
             f"Cannot remove source '{source_name}': {len(projects)} projects, "
             f"{len(snapshots)} snapshots, {load_records} load records depend on it"
+        )
+
+
+class OntologyDependencyError(Exception):
+    """Raised when an ontology bundle is still referenced by projects."""
+
+    def __init__(self, ontology_id: str, projects: list[str]) -> None:
+        self.ontology_id = ontology_id
+        self.projects = projects
+        super().__init__(
+            f"Cannot remove ontology '{ontology_id}': "
+            f"{len(projects)} project(s) depend on it"
         )
 
 
@@ -118,6 +131,34 @@ class CatalogProviderConfig(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     description: str = ""
     created_at: datetime
+    updated_at: datetime
+
+
+class OntologyArtifact(BaseModel):
+    """One server-owned source document in an imported ontology closure."""
+
+    filename: str
+    ontology_iri: str
+    serialization: str
+    sha256: str
+    size_bytes: int
+
+
+class OntologyBundle(BaseModel):
+    """Auditable metadata for a curated, locally stored ontology bundle."""
+
+    id: str
+    name: str
+    root_ontology_iri: str
+    version: str = ""
+    canonical_graph_digest: str
+    mapping_digest: str
+    profile_version: str = "1"
+    rsa_version: str = ""
+    artifacts: list[OntologyArtifact] = Field(default_factory=list)
+    equivalent_serializations: bool | None = None
+    validation_status: str = "valid"
+    imported_at: datetime
     updated_at: datetime
 
 
@@ -192,6 +233,8 @@ class Project(BaseModel):
     arango_endpoint: str = "http://localhost:8529"
     arango_database: str = "_system"
     target_name: str | None = None
+    ontology_id: str | None = None
+    ontology_fingerprint: str | None = None
     mapping_name: str = ""
     mapping_description: str = ""
     # Snapshot of the mapping config as of the last successful load, used to
@@ -244,6 +287,7 @@ class Catalog(BaseModel):
     load_history: list[LoadRecord] = Field(default_factory=list)
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     catalog_providers: dict[str, CatalogProviderConfig] = Field(default_factory=dict)
+    ontologies: dict[str, OntologyBundle] = Field(default_factory=dict)
 
 
 def _now() -> datetime:
@@ -598,6 +642,10 @@ class CatalogManager:
             )
         return latest
 
+    def get_snapshot(self, snapshot_id: str) -> SchemaSnapshot | None:
+        """Return one exact snapshot by ID."""
+        return self._load().snapshots.get(snapshot_id)
+
     def list_snapshots(self, source_name: str) -> list[SchemaSnapshot]:
         catalog = self._load()
         return sorted(
@@ -617,13 +665,39 @@ class CatalogManager:
         arango_database: str = "_system",
         mapping_name: str = "",
         mapping_description: str = "",
+        target_name: str | None = None,
+        ontology_id: str | None = None,
+        schema_snapshot_id: str | None = None,
     ) -> Project:
         validate_project_name(name)
         catalog = self._load()
         if source_name not in catalog.sources:
             raise ValueError(f"Source '{source_name}' not found")
         latest = self.get_latest_snapshot(source_name)
-        snapshot_id = latest.id if latest else ""
+        snapshot_id = schema_snapshot_id if schema_snapshot_id is not None else (
+            latest.id if latest else ""
+        )
+        if snapshot_id:
+            snapshot = catalog.snapshots.get(snapshot_id)
+            if snapshot is None:
+                raise ValueError(f"Snapshot '{snapshot_id}' not found")
+            if snapshot.source_name != source_name:
+                raise ValueError(
+                    f"Snapshot '{snapshot_id}' does not belong to source '{source_name}'"
+                )
+        ontology = None
+        if ontology_id is not None:
+            ontology = catalog.ontologies.get(ontology_id)
+            if ontology is None:
+                raise ValueError(f"Ontology '{ontology_id}' not found")
+        if target_name is not None:
+            target = catalog.targets.get(target_name)
+            if target is None:
+                raise ValueError(f"Target '{target_name}' not found")
+            if target.database.lower() == "_system":
+                raise ValueError("Projects require a dedicated target database, not '_system'")
+            arango_endpoint = target.endpoint
+            arango_database = target.database
         now = _now()
         project = Project(
             name=name,
@@ -634,12 +708,81 @@ class CatalogManager:
             arango_database=arango_database,
             mapping_name=mapping_name,
             mapping_description=mapping_description,
+            target_name=target_name,
+            ontology_id=ontology_id,
+            ontology_fingerprint=(
+                ontology.canonical_graph_digest if ontology is not None else None
+            ),
             created_at=now,
             updated_at=now,
         )
         catalog.projects[name] = project
         self._save(catalog)
         return project
+
+    # ── Curated ontology bundles ─────────────────────────────────────
+
+    def add_ontology(
+        self,
+        *,
+        name: str,
+        root_ontology_iri: str,
+        canonical_graph_digest: str,
+        mapping_digest: str,
+        artifacts: list[OntologyArtifact],
+        version: str = "",
+        profile_version: str = "1",
+        rsa_version: str = "",
+        equivalent_serializations: bool | None = None,
+        validation_status: str = "valid",
+        ontology_id: str | None = None,
+    ) -> OntologyBundle:
+        catalog = self._load()
+        oid = ontology_id or str(uuid4())
+        if oid in catalog.ontologies:
+            raise ValueError(f"Ontology '{oid}' already exists")
+        now = _now()
+        record = OntologyBundle(
+            id=oid,
+            name=name,
+            root_ontology_iri=root_ontology_iri,
+            version=version,
+            canonical_graph_digest=canonical_graph_digest,
+            mapping_digest=mapping_digest,
+            profile_version=profile_version,
+            rsa_version=rsa_version,
+            artifacts=artifacts,
+            equivalent_serializations=equivalent_serializations,
+            validation_status=validation_status,
+            imported_at=now,
+            updated_at=now,
+        )
+        catalog.ontologies[oid] = record
+        self._save(catalog)
+        logger.info("ontology_added", ontology_id=oid, name=name)
+        return record
+
+    def list_ontologies(self) -> list[OntologyBundle]:
+        return list(self._load().ontologies.values())
+
+    def get_ontology(self, ontology_id: str) -> OntologyBundle | None:
+        return self._load().ontologies.get(ontology_id)
+
+    def remove_ontology(self, ontology_id: str) -> bool:
+        catalog = self._load()
+        if ontology_id not in catalog.ontologies:
+            return False
+        projects = [
+            project.name
+            for project in catalog.projects.values()
+            if project.ontology_id == ontology_id
+        ]
+        if projects:
+            raise OntologyDependencyError(ontology_id, projects)
+        del catalog.ontologies[ontology_id]
+        self._save(catalog)
+        logger.info("ontology_removed", ontology_id=ontology_id)
+        return True
 
     def list_projects(self) -> list[Project]:
         return list(self._load().projects.values())

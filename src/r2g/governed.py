@@ -48,6 +48,7 @@ GOVERNED: tuple[tuple[str, str], ...] = (
     ("PUT", f"{_PROJECT}/mapping"),
     ("POST", f"{_PROJECT}/load"),
     ("POST", f"{_PROJECT}/migrate"),
+    ("POST", f"{_PROJECT}/rebase-snapshot"),
     ("PATCH", _PROJECT),
     ("POST", r"/api/projects"),  # only the one the control-plane project names
 )
@@ -70,6 +71,7 @@ READS: tuple[tuple[str, str], ...] = tuple(("POST", p) for p in (
     f"{_PROJECT}/apply-ontology",
     f"{_PROJECT}/auto-map",
     f"{_PROJECT}/apply-naming",
+    r"/api/ontologies/[^/]+/reconcile",
     r"/api/targets/[^/]+/introspect",
 ))
 
@@ -81,11 +83,15 @@ REFUSED: tuple[tuple[str, str, str], ...] = (
     ("POST", r"/api/sources", _SHARED.format("Sources")),
     ("DELETE", r"/api/sources/[^/]+", _SHARED.format("Sources")),
     ("POST", r"/api/sources/[^/]+/snapshot", _SHARED.format("Sources and their snapshots")),
+    ("PUT", r"/api/sources/[^/]+/key-overlay", _SHARED.format("Sources")),
+    ("POST", r"/api/sources/[^/]+/key-overlay-file", _SHARED.format("Sources")),
     ("POST", r"/api/targets", _SHARED.format("Targets")),
     ("DELETE", r"/api/targets/[^/]+", _SHARED.format("Targets")),
     ("POST", r"/api/catalogs", _SHARED.format("Catalogs")),
     ("DELETE", r"/api/catalogs/[^/]+", _SHARED.format("Catalogs")),
     ("POST", r"/api/catalogs/[^/]+/import-source", _SHARED.format("Sources")),
+    ("POST", r"/api/ontologies/import", _SHARED.format("Ontologies")),
+    ("DELETE", r"/api/ontologies/[^/]+", _SHARED.format("Ontologies")),
     ("DELETE", _PROJECT,
      "the control-plane project names this transformation project, so it is not deleted "
      "from here"),

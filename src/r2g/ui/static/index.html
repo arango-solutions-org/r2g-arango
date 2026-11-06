@@ -1109,6 +1109,15 @@
         <div class="empty-state">Loading catalogs&hellip;</div>
       </div>
     </div>
+    <div class="explorer-section collapsed" id="exp-ontologies">
+      <div class="explorer-section-header" onclick="toggleExplorerSection('exp-ontologies')">
+        <span class="tree-caret">&#9662;</span><span class="sec-title">Ontologies</span>
+        <button class="panel-add-btn" id="btn-import-ontology" aria-label="Import a curated ontology" data-hint="Import a local upper + specific Turtle or RDF/XML ontology bundle. Remote imports are never fetched." onclick="event.stopPropagation();openImportOntologyForm()">+</button>
+      </div>
+      <div class="explorer-section-body" id="ontologies-panel">
+        <div class="empty-state">Loading ontologies&hellip;</div>
+      </div>
+    </div>
     <div class="explorer-section collapsed" id="exp-sources">
       <div class="explorer-section-header" onclick="toggleExplorerSection('exp-sources')">
         <span class="tree-caret">&#9662;</span><span class="sec-title">Sources</span>
@@ -1469,15 +1478,16 @@ function setEdgeTerm(idx, value) {
   markDirty();
 }
 
-function _authHeaders(extra) {
-  const h = { 'Content-Type': 'application/json', ...(extra || {}) };
+function _authHeaders(extra, includeJson = true) {
+  const h = { ...(includeJson ? { 'Content-Type': 'application/json' } : {}), ...(extra || {}) };
   const tok = _apiToken();
   if (tok) h['Authorization'] = 'Bearer ' + tok;
   return h;
 }
 
 async function apiFetch(path, opts = {}) {
-  let res = await fetch(API + path, { ...opts, headers: _authHeaders(opts.headers) });
+  const includeJson = !(opts.body instanceof FormData);
+  let res = await fetch(API + path, { ...opts, headers: _authHeaders(opts.headers, includeJson) });
   if (res.status === 401 && CP.on) {
     _cpSessionEnded();
     throw new Error('Your session ended');
@@ -1487,7 +1497,7 @@ async function apiFetch(path, opts = {}) {
     const entered = prompt('This R2G API requires an access token. Paste the token shown in the server console:');
     if (entered) {
       try { localStorage.setItem('r2g.apiToken', entered.trim()); } catch (e) {}
-      res = await fetch(API + path, { ...opts, headers: _authHeaders(opts.headers) });
+      res = await fetch(API + path, { ...opts, headers: _authHeaders(opts.headers, includeJson) });
     }
   }
   if (!res.ok) {
@@ -1596,6 +1606,180 @@ function _htmlEscape(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+async function loadOntologies() {
+  const panel = document.getElementById('ontologies-panel');
+  try {
+    const ontologies = await apiFetch('/api/ontologies');
+    window._ontologiesCache = ontologies;
+    if (!ontologies.length) {
+      panel.innerHTML = '<div class="empty-state-cta">No curated ontologies yet.<br><button type="button" onclick="openImportOntologyForm()">+ Import ontology</button><br><span style="font-size:11px">Turtle or RDF/XML; local imports only</span></div>';
+      return;
+    }
+    panel.innerHTML = ontologies.map(o => `
+      <div class="ontology-item source-item" data-ontology="${_htmlEscape(o.id)}">
+        <div>
+          <div class="source-name">${_htmlEscape(o.name)}</div>
+          <div class="source-type">${_htmlEscape(o.version || 'version not declared')} · ${_htmlEscape((o.canonical_graph_digest || '').slice(0, 18))}…</div>
+        </div>
+        <span class="status-badge ${o.validation_status === 'valid' ? 'success' : 'warning'}">${_htmlEscape(o.validation_status || 'unknown')}</span>
+      </div>
+    `).join('');
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state">Could not load ontologies</div>';
+  }
+}
+
+function openImportOntologyForm() {
+  const html = `
+    <div class="fc-form">
+      <label>Bundle name
+        <input id="oi-name" placeholder="Customer 360 ontology" autocomplete="off" />
+      </label>
+      <label>Root / specific ontology
+        <input id="oi-root" type="file" accept=".ttl,.owl,.rdf,.xml" />
+        <span class="hint">The mapped ontology that imports the upper ontology.</span>
+      </label>
+      <label>Local imports / upper ontology
+        <input id="oi-imports" type="file" accept=".ttl,.owl,.rdf,.xml" multiple />
+        <span class="hint">Every <code>owl:imports</code> target must be supplied here. Network resolution is disabled.</span>
+      </label>
+      <label>Equivalent root serialization <span class="hint">optional</span>
+        <input id="oi-equivalent-root" type="file" accept=".ttl,.owl,.rdf,.xml" />
+      </label>
+      <label>Equivalent local imports <span class="hint">optional</span>
+        <input id="oi-equivalent-imports" type="file" accept=".ttl,.owl,.rdf,.xml" multiple />
+        <span class="hint">When supplied, Turtle and RDF/XML must be graph-equivalent.</span>
+      </label>
+      <div class="err" id="oi-err" style="display:none"></div>
+    </div>`;
+  openFloatingCard({
+    id: 'import-ontology',
+    title: 'Import curated ontology',
+    body: html,
+    position: { right: 40, top: 80 },
+    actions: [
+      { label: 'Cancel', onClick: () => closeFloatingCard('import-ontology') },
+      { label: 'Import & validate', kind: 'primary', onClick: importOntologyFiles },
+    ],
+  });
+}
+
+async function importOntologyFiles() {
+  const name = document.getElementById('oi-name').value.trim();
+  const root = document.getElementById('oi-root').files[0];
+  const err = document.getElementById('oi-err');
+  err.style.display = 'none';
+  if (!name || !root) {
+    err.textContent = 'Bundle name and root ontology are required.';
+    err.style.display = '';
+    return;
+  }
+  const form = new FormData();
+  form.append('name', name);
+  form.append('root', root);
+  for (const file of document.getElementById('oi-imports').files) form.append('imports', file);
+  const equivalentRoot = document.getElementById('oi-equivalent-root').files[0];
+  if (equivalentRoot) form.append('equivalent_root', equivalentRoot);
+  for (const file of document.getElementById('oi-equivalent-imports').files) {
+    form.append('equivalent_imports', file);
+  }
+  try {
+    const result = await apiFetch('/api/ontologies/import', { method: 'POST', body: form });
+    closeFloatingCard('import-ontology');
+    toast(`Imported ${result.name}`, 'success');
+    await loadOntologies();
+  } catch (e) {
+    err.textContent = 'Import failed: ' + errorDetail(e);
+    err.style.display = '';
+  }
+}
+
+function showOntologyProvenance(id) {
+  const ontology = (window._ontologiesCache || []).find(o => o.id === id);
+  if (!ontology) return;
+  const files = (ontology.artifacts || []).map(a =>
+    `<div class="prop-row"><span class="prop-label">${_htmlEscape(a.filename)}</span><span class="prop-value">${_htmlEscape(a.serialization)} · ${_htmlEscape(a.sha256.slice(0, 16))}…</span></div>`
+  ).join('');
+  openFloatingCard({
+    id: 'ontology-provenance',
+    title: ontology.name,
+    status: { label: ontology.validation_status || 'unknown', kind: ontology.validation_status === 'valid' ? 'success' : 'error' },
+    body: `<div class="fc-form">
+      <div class="prop-row"><span class="prop-label">Root IRI</span><span class="prop-value">${_htmlEscape(ontology.root_ontology_iri)}</span></div>
+      <div class="prop-row"><span class="prop-label">Graph digest</span><span class="prop-value"><code>${_htmlEscape(ontology.canonical_graph_digest)}</code></span></div>
+      <div class="prop-row"><span class="prop-label">Mapping digest</span><span class="prop-value"><code>${_htmlEscape(ontology.mapping_digest)}</code></span></div>
+      <div class="prop-row"><span class="prop-label">Equivalent serializations</span><span class="prop-value">${ontology.equivalent_serializations === null ? 'not supplied' : ontology.equivalent_serializations ? 'verified' : 'failed'}</span></div>
+      ${files}
+    </div>`,
+    actions: [{ label: 'Close', onClick: () => closeFloatingCard('ontology-provenance') }],
+  });
+}
+
+async function removeOntology(id) {
+  try {
+    await apiFetch(`/api/ontologies/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast('Ontology removed', 'success');
+    await loadOntologies();
+  } catch (e) {
+    toast('Remove failed: ' + errorDetail(e), 'error');
+  }
+}
+
+function reconcileOntologyWithSource(id) {
+  const sources = window._sourcesCache || [];
+  if (!sources.length) {
+    toast('Add and snapshot a source first', 'error');
+    return;
+  }
+  const options = sources.map(source =>
+    `<option value="${_htmlEscape(source.name)}">${_htmlEscape(source.name)}</option>`
+  ).join('');
+  openFloatingCard({
+    id: 'reconcile-ontology',
+    title: 'Validate ontology against source',
+    body: `<div class="fc-form">
+      <label>Source<select id="or-source">${options}</select></label>
+      <div class="hint">Validation uses the latest snapshot for this preview. A created project pins that exact snapshot.</div>
+      <div class="err" id="or-err" style="display:none"></div>
+    </div>`,
+    actions: [
+      { label: 'Cancel', onClick: () => closeFloatingCard('reconcile-ontology') },
+      { label: 'Validate', kind: 'primary', onClick: async () => {
+        const sourceName = document.getElementById('or-source').value;
+        const err = document.getElementById('or-err');
+        try {
+          const result = await apiFetch(`/api/ontologies/${encodeURIComponent(id)}/reconcile`, {
+            method: 'POST',
+            body: JSON.stringify({ source_name: sourceName }),
+          });
+          const issues = result.report.issues || [];
+          const rows = issues.length ? issues.map(issue =>
+            `<div class="prop-row"><span class="prop-label">${_htmlEscape(issue.code)}</span><span class="prop-value">${_htmlEscape(issue.message)}</span></div>`
+          ).join('') : '<div class="hint">All physical mappings reconcile with this snapshot.</div>';
+          openFloatingCard({
+            id: 'reconcile-ontology',
+            title: 'Ontology reconciliation',
+            status: { label: result.executable ? 'Ready' : 'Blocked', kind: result.executable ? 'success' : 'error' },
+            body: `<div class="fc-form">
+              <div class="prop-row"><span class="prop-label">Entities</span><span class="prop-value">${result.report.matched_entities}</span></div>
+              <div class="prop-row"><span class="prop-label">Properties</span><span class="prop-value">${result.report.matched_properties}</span></div>
+              <div class="prop-row"><span class="prop-label">Relationships</span><span class="prop-value">${result.report.matched_relationships}</span></div>
+              ${rows}
+            </div>`,
+            actions: [
+              ...(result.executable ? [{ label: 'Create project', kind: 'primary', onClick: () => { closeFloatingCard('reconcile-ontology'); openNewProjectForm(id, sourceName); } }] : []),
+              { label: 'Close', onClick: () => closeFloatingCard('reconcile-ontology') },
+            ],
+          });
+        } catch (e) {
+          err.textContent = 'Validation failed: ' + errorDetail(e);
+          err.style.display = '';
+        }
+      }},
+    ],
+  });
+}
+
 async function loadSources() {
   try {
     const sources = await apiFetch('/api/sources');
@@ -1618,6 +1802,52 @@ async function loadSources() {
     document.getElementById('sources-panel').innerHTML =
       '<div class="empty-state">Could not load sources</div>';
   }
+}
+
+function openKeyOverlayForm(sourceName) {
+  openFloatingCard({
+    id: 'key-overlay',
+    title: 'Attach reviewed keys',
+    body: `<div class="fc-form">
+      <label>RSA key overlay (JSON or YAML)
+        <input id="ko-file" type="file" accept=".json,.yaml,.yml,application/json" />
+      </label>
+      <label class="fc-checkbox">
+        <input id="ko-reviewed" type="checkbox" />
+        I reviewed and accept a file still marked DRAFT
+      </label>
+      <span class="hint">No candidate is applied implicitly. After attaching the reviewed overlay, snapshot the source again.</span>
+      <div class="err" id="ko-err" style="display:none"></div>
+    </div>`,
+    actions: [
+      { label: 'Cancel', onClick: () => closeFloatingCard('key-overlay') },
+      { label: 'Attach', kind: 'primary', onClick: async () => {
+        const file = document.getElementById('ko-file').files[0];
+        const err = document.getElementById('ko-err');
+        if (!file) {
+          err.textContent = 'Choose a key overlay file.';
+          err.style.display = '';
+          return;
+        }
+        const form = new FormData();
+        form.append('overlay_file', file);
+        form.append('reviewed', document.getElementById('ko-reviewed').checked ? 'true' : 'false');
+        try {
+          const result = await apiFetch(`/api/sources/${encodeURIComponent(sourceName)}/key-overlay-file`, {
+            method: 'POST',
+            body: form,
+          });
+          closeFloatingCard('key-overlay');
+          toast(`Reviewed keys attached to ${sourceName}; snapshotting\u2026`, 'success');
+          await snapshotSource(sourceName);
+          return result;
+        } catch (e) {
+          err.textContent = 'Attach failed: ' + errorDetail(e);
+          err.style.display = '';
+        }
+      }},
+    ],
+  });
 }
 
 // Normalize an Arango endpoint so targets on the same cluster group together
@@ -1776,6 +2006,8 @@ function nsTypeChanged() {
   document.getElementById('ns-conn-hint').innerHTML = meta.hint;
   document.getElementById('ns-csv-params').style.display = type === 'csv' ? '' : 'none';
   document.getElementById('ns-kafka-params').style.display = type === 'kafka' ? '' : 'none';
+  document.getElementById('ns-snowflake-params').style.display =
+    type === 'snowflake' ? '' : 'none';
 }
 
 function openNewSourceForm() {
@@ -1825,6 +2057,13 @@ function openNewSourceForm() {
           <span class="hint">The value subject defaults to <code>&lt;topic&gt;-value</code>.</span>
         </label>
       </div>
+      <div id="ns-snowflake-params" style="display:none">
+        <label class="fc-checkbox">
+          <input type="checkbox" id="ns-snowflake-views" />
+          Include views and materialized views
+        </label>
+        <span class="hint">Required when a curated ontology maps Snowflake views.</span>
+      </div>
       <label>Description (optional)
         <input id="ns-desc" placeholder="Production database" autocomplete="off" />
       </label>
@@ -1865,6 +2104,9 @@ function openNewSourceForm() {
           }
           sourceParams.schema_registry_url = registry;
           sourceParams.topic = topic;
+        } else if (type === 'snowflake') {
+          sourceParams.include_views =
+            document.getElementById('ns-snowflake-views').checked;
         }
         try {
           await apiFetch('/api/sources', {
@@ -2253,16 +2495,33 @@ function openNewTargetForm(prefill) {
   setTimeout(() => document.getElementById('nt-name')?.focus(), 50);
 }
 
-function openNewProjectForm() {
+function openNewProjectForm(initialOntologyId = '', initialSourceName = '') {
   const sources = (window._sourcesCache || []);
   if (!sources.length) {
     toast('Add a source first', 'error');
     openNewSourceForm();
     return;
   }
+  const targets = (window._targetsCache || []).filter(
+    target => String(target.database || '').toLowerCase() !== '_system'
+  );
+  if (!targets.length) {
+    toast('Add an ArangoDB target with a dedicated database first', 'error');
+    openNewTargetForm();
+    return;
+  }
   const sourceOptions = sources.map(s =>
-    `<option value="${_htmlEscape(s.name)}">${_htmlEscape(s.name)}</option>`
+    `<option value="${_htmlEscape(s.name)}"${s.name === initialSourceName ? ' selected' : ''}>${_htmlEscape(s.name)}</option>`
   ).join('');
+  const targetOptions = targets.map(target =>
+    `<option value="${_htmlEscape(target.name)}">${_htmlEscape(target.name)} \u2014 ${_htmlEscape(target.database)}</option>`
+  ).join('');
+  const ontologyOptions = [
+    '<option value="">None \u2014 start with an empty mapping</option>',
+    ...(window._ontologiesCache || []).map(ontology =>
+      `<option value="${_htmlEscape(ontology.id)}"${ontology.id === initialOntologyId ? ' selected' : ''}>${_htmlEscape(ontology.name)}</option>`
+    ),
+  ].join('');
   const defaultMappingPath = '~/.r2g/projects/<name>/mapping.yaml';
   const html = `
     <div class="fc-form">
@@ -2272,12 +2531,13 @@ function openNewProjectForm() {
       <label>Source
         <select id="np-source">${sourceOptions}</select>
       </label>
-      <label>Arango endpoint
-        <input id="np-endpoint" value="http://localhost:8529" autocomplete="off" />
+      <label>ArangoDB target
+        <select id="np-target">${targetOptions}</select>
+        <span class="hint">The project is bound to this registered target and never to <code>_system</code>.</span>
       </label>
-      <label>Arango database
-        <input id="np-database" value="" placeholder="my_graph" autocomplete="off" />
-        <span class="hint">A dedicated graph database \u2014 created on load if needed. Never use <code>_system</code>.</span>
+      <label>Curated ontology
+        <select id="np-ontology">${ontologyOptions}</select>
+        <span class="hint">When selected, physical mappings are reconciled against the source snapshot before creation.</span>
       </label>
       <label>Mapping config path
         <input id="np-mapping-path" placeholder="${defaultMappingPath}" autocomplete="off" />
@@ -2299,24 +2559,14 @@ function openNewProjectForm() {
       { label: 'Create', kind: 'primary', onClick: async () => {
         const name = document.getElementById('np-name').value.trim();
         const source_name = document.getElementById('np-source').value;
-        const arango_endpoint = document.getElementById('np-endpoint').value.trim();
-        const arango_database = document.getElementById('np-database').value.trim();
+        const target_name = document.getElementById('np-target').value;
+        const ontology_id = document.getElementById('np-ontology').value || null;
         let mapping_config_path = document.getElementById('np-mapping-path').value.trim();
         const mapping_description = document.getElementById('np-mapping-desc').value.trim();
         const errEl = document.getElementById('np-err');
         errEl.style.display = 'none';
-        if (!name || !source_name) {
-          errEl.textContent = 'Name and source are required.';
-          errEl.style.display = '';
-          return;
-        }
-        if (!arango_database) {
-          errEl.textContent = 'Arango database is required (e.g. my_graph).';
-          errEl.style.display = '';
-          return;
-        }
-        if (arango_database.toLowerCase() === '_system') {
-          errEl.textContent = 'Refusing to target "_system". Use a dedicated graph database (e.g. my_graph).';
+        if (!name || !source_name || !target_name) {
+          errEl.textContent = 'Name, source, and target are required.';
           errEl.style.display = '';
           return;
         }
@@ -2329,8 +2579,8 @@ function openNewProjectForm() {
             body: JSON.stringify({
               name, source_name,
               mapping_config_path,
-              arango_endpoint: arango_endpoint || 'http://localhost:8529',
-              arango_database,
+              target_name,
+              ontology_id,
               mapping_description,
             }),
           });
@@ -2525,7 +2775,7 @@ function openActionsMenu(ev) {
   openContextMenu(items, x, y, { header: 'Actions' });
 }
 
-// ── Left explorer (Projects / Sources / Targets), P5g.3 + P5g.6 ─────
+// ── Left explorer (Projects / Catalogs / Ontologies / Sources / Targets) ──
 function setExplorerOpen(open) {
   const main = document.querySelector('.main');
   if (!main) return;
@@ -2554,7 +2804,7 @@ function initExplorer() {
   try {
     const open = localStorage.getItem('r2g.explorerOpen');
     setExplorerOpen(open === null ? true : open === '1');
-    ['exp-projects', 'exp-sources', 'exp-targets'].forEach(id => {
+    ['exp-projects', 'exp-catalogs', 'exp-ontologies', 'exp-sources', 'exp-targets'].forEach(id => {
       const v = localStorage.getItem('r2g.exp.' + id);
       if (v !== null) {
         const sec = document.getElementById(id);
@@ -6551,6 +6801,8 @@ function _menuSourcesItem(name, type) {
   return [
     { label: 'Re-introspect', icon: '\u21BA', onClick: () => snapshotSource(name),
       hint: 'Reconnect and re-read this source\u2019s schema, capturing a fresh snapshot of its tables, columns, and keys.' },
+    { label: 'Attach reviewed keys\u2026', icon: '\u2713', onClick: () => openKeyOverlayForm(name),
+      hint: 'Attach a reviewed RSA JSON/YAML PK/UNIQUE/FK overlay, then snapshot again. Draft overlays require an explicit review confirmation.' },
     { label: 'Set as project source (manual)', icon: '\u2192', onClick: () => toast('Open the relevant project in the picker to switch source.', 'info'),
       hint: 'Sources are bound to a project at creation; open the project in the picker to change its source.' },
     '-',
@@ -6558,6 +6810,31 @@ function _menuSourcesItem(name, type) {
     '-',
     { label: 'Remove source\u2026', icon: '\u2716', danger: true, onClick: () => confirmRemoveSource(name),
       hint: 'Delete this source. You will be warned about dependent projects, snapshots, and loads before a cascade delete.' },
+  ];
+}
+
+function _menuOntologyItem(id) {
+  const ontology = (window._ontologiesCache || []).find(o => o.id === id);
+  return [
+    { label: 'Create project from ontology\u2026', icon: '\u002B', onClick: () => openNewProjectForm(id),
+      hint: 'Choose a Snowflake source and registered ArangoDB target, reconcile the physical mappings, and create an editable project.' },
+    { label: 'Validate against source\u2026', icon: '\u2713', onClick: () => reconcileOntologyWithSource(id),
+      hint: 'Check every mapped table/view, column, ordered relationship, and approved key against an exact source snapshot.' },
+    { label: 'Inspect provenance', icon: '\u2139', onClick: () => showOntologyProvenance(id),
+      hint: 'Show ontology IRIs, source-file hashes, canonical graph digest, and serialization-equivalence evidence.' },
+    '-',
+    menuCopy('Copy ontology ID', id, 'Copy the catalog ontology ID.'),
+    menuCopy('Copy graph digest', ontology?.canonical_graph_digest || '', 'Copy the canonical ontology graph digest.'),
+    '-',
+    { label: 'Remove ontology\u2026', icon: '\u2716', danger: true, onClick: () => removeOntology(id),
+      hint: 'Remove this catalog bundle. Removal is refused while a project references it.' },
+  ];
+}
+
+function _menuOntologiesPanel() {
+  return [
+    { label: 'Import curated ontology\u2026', icon: '\u002B', onClick: openImportOntologyForm,
+      hint: 'Upload a local upper + specific Turtle or RDF/XML bundle. Remote imports are never fetched.' },
   ];
 }
 
@@ -6660,6 +6937,10 @@ document.addEventListener('contextmenu', e => {
       const name = el.dataset.target;
       if (name) openContextMenu(_menuTargetsItem(name), e.clientX, e.clientY, { header: 'Target: ' + name });
     }],
+    ['.ontology-item', el => {
+      const id = el.dataset.ontology;
+      if (id) openContextMenu(_menuOntologyItem(id), e.clientX, e.clientY, { header: 'Ontology' });
+    }],
     ['.source-item', el => {
       const name = el.dataset.source || el.querySelector('.source-name')?.textContent;
       const type = el.querySelector('.source-type')?.textContent;
@@ -6667,6 +6948,9 @@ document.addEventListener('contextmenu', e => {
     }],
     ['#sources-panel', () => {
       openContextMenu(_menuSourcesPanel(), e.clientX, e.clientY, { header: 'Sources' });
+    }],
+    ['#ontologies-panel', () => {
+      openContextMenu(_menuOntologiesPanel(), e.clientX, e.clientY, { header: 'Ontologies' });
     }],
     ['#targets-panel', () => {
       openContextMenu(_menuTargetsPanel(), e.clientX, e.clientY, { header: 'Targets' });
@@ -8077,6 +8361,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initExplorer();
   initMappingHighlight();
   loadCatalogs();
+  loadOntologies();
   loadSources();
   loadTargets();
   const projectsLoaded = loadProjects();

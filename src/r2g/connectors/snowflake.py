@@ -130,12 +130,21 @@ def _column_type(data_type: Any, precision: Any, scale: Any) -> str:
 class SnowflakeConnector:
     """Snowflake source connector (introspection only)."""
 
-    def __init__(self, connection_string: str, schema_name: str = "PUBLIC") -> None:
+    def __init__(
+        self,
+        connection_string: str,
+        schema_name: str = "PUBLIC",
+        *,
+        include_views: bool | None = None,
+    ) -> None:
         self.connection_string = connection_string
         self.schema_name = schema_name.upper() if schema_name else "PUBLIC"
         self._connect_params = _parse_snowflake_url(connection_string)
         url_schema = self._connect_params.pop("_url_schema", None)
-        self.include_views = bool(self._connect_params.pop("_include_views", False))
+        url_include_views = bool(self._connect_params.pop("_include_views", False))
+        self.include_views = (
+            url_include_views if include_views is None else bool(include_views)
+        )
         if url_schema and (schema_name in (None, "", "public", "PUBLIC")):
             self.schema_name = url_schema.upper()
         self._database: str = self._connect_params.get("database", "")
@@ -230,6 +239,7 @@ class SnowflakeConnector:
             columns=columns,
             primary_key=pks,
             foreign_keys=fks,
+            is_view=is_view,
         )
 
     def _fetch_columns(self, conn: Any, table_name: str) -> list[Column]:
