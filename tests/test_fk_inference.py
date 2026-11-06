@@ -486,6 +486,15 @@ class TestCsvValueSampler:
             (tmp_path / name).write_text(content)
         return CsvValueSampler(str(tmp_path), limit=1000)
 
+    def test_sample_values_skips_blank_cells_and_preserves_first_seen_order(self, tmp_path):
+        sampler = self._make_dir(
+            tmp_path,
+            {"authors.csv": 'row,id\n1,003\n2,\n3,""\n4,001\n5,003\n6,002\n'},
+        )
+
+        assert sampler.sample_values("authors", "id") == ["003", "001", "002"]
+        assert sampler.sample_values("authors", "id", limit=2) == ["003", "001"]
+
     def test_full_overlap_returns_one(self, tmp_path):
         sampler = self._make_dir(
             tmp_path,
