@@ -1358,7 +1358,8 @@ function _cpScheduleRenewal() {
       const res = await fetch('/api/context', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'X-Control-Plane': '1' },
-        body: JSON.stringify({ project: claims.ctx.project }),
+        // A context is issued for one tool: ask for r2g's again.
+        body: JSON.stringify({ project: claims.ctx.project, tool: 'r2g' }),
       });
       if (!res.ok) return;
       const body = await res.json();
