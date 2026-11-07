@@ -141,6 +141,13 @@ class ControlPlane(Protocol):
         the token can no longer attribute it, :class:`ContextUnavailable` to retry later."""
         ...
 
+    def project_ontology(self, identity: Identity) -> dict[str, Any] | None:
+        """The project ontology's classes and properties as the control plane serves them,
+        read with r2g's own context: ``{classes, properties}``, each term ``{uri, label}``;
+        ``None`` when the project names none. Raises :class:`ContextRejected`, or
+        :class:`ContextUnavailable` when it cannot be read now."""
+        ...
+
 
 def mode() -> bool:
     """Whether r2g runs under a control plane."""
@@ -217,6 +224,18 @@ class _Sdk:
             self._projects[key] = (now, project)
         return project
 
+    def project_ontology(self, identity: Identity) -> dict[str, Any] | None:
+        if not hasattr(self.client, "project_ontology"):
+            raise ContextUnavailable("this control plane SDK cannot read the project ontology")
+        from control_plane_sdk import ControlPlaneError, TokenRejected
+
+        try:
+            return self.client.project_ontology(identity.verified)
+        except TokenRejected as exc:
+            raise ContextRejected(str(exc)) from exc
+        except ControlPlaneError as exc:
+            raise ContextUnavailable(str(exc)) from exc
+
     def decide(self, identity: Identity, action: str, term: str | None) -> Decision:
         d = self.client.decide(identity.verified, action, term)
         return Decision(d.outcome, d.reason, d.policy_version)
@@ -276,56 +295,25 @@ def set_instance(instance: ControlPlane | None) -> None:
         _instance = instance
 
 
-#: AOE pages its class list; a bound on how many pages r2g follows.
-_MAX_PAGES = 100
-
-
-def ontology_terms(identity: Identity, *, http: Any = None) -> dict[str, Any]:
-    """The project ontology's classes and properties, read from AOE (``AOE_URL``) with the
-    user's own context, so AOE applies the same project scope it applies to the user. Every
-    page of classes is read: a term missing from a partial list would be refused when a
-    mapping names it (P14.8). Never raises: a failure is reported with what went wrong."""
+def ontology_terms(identity: Identity) -> dict[str, Any]:
+    """The project ontology's classes and properties, as the control plane serves them to
+    r2g with r2g's own context: it reads them from the ontology service (AOE), which refuses
+    a context issued for another tool. Never raises: a failure is reported with what went
+    wrong, and no partial list is given (a term missing from a partial list would be refused
+    when a mapping names it, P14.8)."""
     if identity.ontology is None:
         return {"ontology_id": None, "classes": [], "properties": [],
                 "problem": "the project names no ontology"}
     ontology_id, version = identity.ontology
     empty = {"ontology_id": ontology_id, "version": version, "classes": [], "properties": []}
-    base = os.environ.get("AOE_URL", "").rstrip("/")
-    if not base:
-        return {**empty, "problem": "AOE_URL is not set, so the ontology cannot be read"}
-    import httpx
-
-    client = http or httpx.Client(timeout=10.0)
-    headers = {"Authorization": f"Bearer {identity.token}"}
-    url = f"{base}/api/v1/ontology/{ontology_id}"
     try:
-        class_rows: list[dict[str, Any]] = []
-        cursor: str | None = None
-        for _ in range(_MAX_PAGES):
-            params: dict[str, Any] = {"limit": 500}
-            if cursor:
-                params["cursor"] = cursor
-            r = client.get(f"{url}/classes", params=params, headers=headers)
-            if r.status_code != 200:
-                return {**empty, "problem": f"AOE answered {r.status_code}"}
-            body = r.json()
-            class_rows.extend(body.get("data", []))
-            cursor = body.get("next_cursor")
-            if not cursor:
-                break
-        else:
-            return {**empty, "problem": f"the ontology has more than {_MAX_PAGES} pages of classes"}
-        r = client.get(f"{url}/properties", headers=headers)
-        if r.status_code != 200:
-            return {**empty, "problem": f"AOE answered {r.status_code} for the properties"}
-        property_rows = r.json().get("data", [])
-    except Exception as exc:  # the panel is informative; r2g works without it
-        return {**empty, "problem": f"cannot reach AOE: {exc}"}
-    finally:
-        if http is None:
-            client.close()
-    return {**empty, "classes": _terms(class_rows), "properties": _terms(property_rows),
-            "problem": None}
+        found = get().project_ontology(identity)
+    except (ContextRejected, ContextUnavailable) as exc:
+        return {**empty, "problem": f"cannot read the project ontology: {exc}"}
+    if found is None:
+        return {**empty, "problem": "the control plane serves no ontology for this project"}
+    return {**empty, "classes": _terms(found.get("classes") or []),
+            "properties": _terms(found.get("properties") or []), "problem": None}
 
 
 def _terms(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

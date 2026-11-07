@@ -77,57 +77,6 @@ class TestTheMappingFile:
         assert coll.term == BOOK and coll.field_terms == {"title": TITLE}
 
 
-class TestTheOntologyFromAoe:
-    IDENTITY = control_plane.Identity("pj@example.com", ("analyst",), "local", "library",
-                                      ("lending", "working"), token=TOKEN)
-
-    @staticmethod
-    def answer(status: int, body: dict[str, Any]) -> MagicMock:
-        response = MagicMock()
-        response.status_code = status
-        response.json.return_value = body
-        return response
-
-    def test_every_page_of_classes_and_the_properties_are_read(self, monkeypatch):
-        monkeypatch.setenv("AOE_URL", "http://aoe:8000/aoe/")
-        http = MagicMock()
-        http.get.side_effect = [
-            self.answer(200, {"data": [{"uri": BOOK, "label": "Book"}], "next_cursor": "c2"}),
-            self.answer(200, {"data": [{"uri": AUTHOR, "label": "Author"}, {"label": "no uri"}],
-                              "next_cursor": None}),
-            self.answer(200, {"data": [{"uri": TITLE, "label": "title"}]}),
-        ]
-        out = control_plane.ontology_terms(self.IDENTITY, http=http)
-        assert out["problem"] is None
-        assert [c["uri"] for c in out["classes"]] == [AUTHOR, BOOK]
-        assert [p["uri"] for p in out["properties"]] == [TITLE]
-        urls = [call.args[0] for call in http.get.call_args_list]
-        assert urls == ["http://aoe:8000/aoe/api/v1/ontology/lending/classes"] * 2 + [
-            "http://aoe:8000/aoe/api/v1/ontology/lending/properties"]
-        assert http.get.call_args_list[1].kwargs["params"]["cursor"] == "c2"
-        assert all(call.kwargs["headers"] == {"Authorization": f"Bearer {TOKEN}"}
-                   for call in http.get.call_args_list)
-
-    def test_an_endless_class_list_is_reported_with_no_partial_list(self, monkeypatch):
-        monkeypatch.setenv("AOE_URL", "http://aoe:8000/aoe")
-        monkeypatch.setattr(control_plane, "_MAX_PAGES", 3)
-        http = MagicMock()
-        http.get.return_value = self.answer(200, {"data": [{"uri": BOOK}], "next_cursor": "again"})
-        out = control_plane.ontology_terms(self.IDENTITY, http=http)
-        assert out["classes"] == [] and out["properties"] == []
-        assert "more than 3 pages" in out["problem"]
-        assert http.get.call_count == 3
-
-    def test_a_refused_property_read_is_reported_with_no_partial_list(self, monkeypatch):
-        monkeypatch.setenv("AOE_URL", "http://aoe:8000/aoe")
-        http = MagicMock()
-        http.get.side_effect = [self.answer(200, {"data": [{"uri": BOOK}]}),
-                                self.answer(403, {})]
-        out = control_plane.ontology_terms(self.IDENTITY, http=http)
-        assert out["classes"] == [] and out["properties"] == []
-        assert "403" in out["problem"]
-
-
 class TestWhichTermsAreChecked:
     def test_only_a_term_that_is_new_or_changed_where_it_is_named(self):
         saved = MappingConfig.model_validate(mapping(term="https://ex.org/gone#Book"))
