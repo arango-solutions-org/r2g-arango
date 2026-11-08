@@ -1150,7 +1150,7 @@ shared pair is dropped once per run rather than once per table.
 
 ---
 
-### Phase 14: Running under a context-and-governance control plane -- P14.1–P14.13 done, shipped in 0.9.0 (2026-10-31); P14.14 done
+### Phase 14: Running under a context-and-governance control plane -- P14.1–P14.13 done, shipped in 0.9.0 (2026-10-31); P14.14 done, shipped in 0.10.0 (2026-11-07)
 
 A context-and-governance control plane can serve several tools behind one web
 address, sign the user in once, and hand each tool a short-lived **signed
