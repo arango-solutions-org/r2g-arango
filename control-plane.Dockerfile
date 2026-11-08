@@ -10,8 +10,8 @@
 #     --build-context control_plane_sdk=<control plane repo>/sdk/python .
 #
 # Runtime: CONTROL_PLANE_URL (the control plane's API), R2G_TENANT and
-# R2G_CATALOG_DIR (storage per tenant), and optionally AOE_URL (where the
-# project ontology is read from). r2g's own API token is not used in this mode.
+# R2G_CATALOG_DIR (storage per tenant). The project ontology is read from the
+# control plane. r2g's own API token is not used in this mode.
 # ============================================================================
 
 # Replaced by --build-context control_plane_sdk=...; empty if not given, and the
