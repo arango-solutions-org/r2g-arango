@@ -7,6 +7,8 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-07
+
 ### Added
 
 - **Snowflake snapshots can include views (PRD P6.1).** `include_views=true` in a Snowflake
@@ -1086,7 +1088,8 @@ Initial phased implementation (not yet published to PyPI):
   pipeline, `r2g source dump` CLI, pure-Python FK inference with
   optional value-overlap sampler.
 
-[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.0...v0.8.1
