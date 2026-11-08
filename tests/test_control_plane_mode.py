@@ -15,6 +15,7 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -75,6 +76,11 @@ class FakeControlPlane:
 
     def record(self, token, entry):
         pass
+
+    def project_ontology(self, identity: control_plane.Identity) -> dict | None:
+        return {"ontology_id": "fibo-equity", "version": "working",
+                "classes": [{"uri": "https://ex.org/Equity", "label": "Equity", "imported": False}],
+                "properties": []}
 
 
 @pytest.fixture
@@ -336,34 +342,58 @@ class TestTheContextItself:
         assert ctx["project"] == {"id": "equity", "name": "Equity research"}
         assert ctx["opens"] == "customer-360"
         assert ctx["ontology"]["ontology_id"] == "fibo-equity"
-        assert "AOE_URL" in ctx["ontology"]["problem"]          # says why there is no list
+        assert ctx["ontology"]["problem"] is None               # read from the control plane
+        assert [c["label"] for c in ctx["ontology"]["classes"]] == ["Equity"]
 
 
-class TestTheOntologyFromAoe:
+class TestTheOntologyFromTheControlPlane:
+    """The project ontology comes from the control plane, read with r2g's own context: AOE
+    refuses a context issued for another tool, so r2g does not read AOE itself."""
+
     IDENTITY = control_plane.Identity("pj@example.com", ("analyst",), "local", "equity",
                                       ("fibo-equity", "working"), token=TOKEN)
 
-    def test_classes_are_read_with_the_users_own_context(self, monkeypatch):
-        monkeypatch.setenv("AOE_URL", "http://aoe:8000/aoe/")
-        http = MagicMock()
-        http.get.return_value.status_code = 200
-        http.get.return_value.json.return_value = {"data": [
-            {"uri": "https://ex.org/Income", "label": "Income"},
-            {"uri": "https://ex.org/Equity", "label": "equity"},
-            {"label": "no uri, skipped"}]}
-        out = control_plane.ontology_terms(self.IDENTITY, http=http)
-        assert [c["label"] for c in out["classes"]] == ["equity", "Income"]
-        assert out["problem"] is None
-        url = http.get.call_args_list[0].args[0]
-        assert url == "http://aoe:8000/aoe/api/v1/ontology/fibo-equity/classes"
-        assert http.get.call_args.kwargs["headers"] == {"Authorization": f"Bearer {TOKEN}"}
+    class Serving(FakeControlPlane):
+        def __init__(self, answer: Any) -> None:
+            self.answer, self.asked = answer, []
 
-    def test_a_refusal_is_reported_not_raised(self, monkeypatch):
-        monkeypatch.setenv("AOE_URL", "http://aoe:8000/aoe")
-        http = MagicMock()
-        http.get.return_value.status_code = 404
-        out = control_plane.ontology_terms(self.IDENTITY, http=http)
-        assert out["classes"] == [] and "404" in out["problem"]
+        def project_ontology(self, identity):
+            self.asked.append(identity)
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+    def test_classes_and_properties_are_read_with_r2gs_own_context(self):
+        cp = self.Serving({"classes": [{"uri": "https://ex.org/Income", "label": "Income"},
+                                       {"uri": "https://ex.org/Equity", "label": "equity"}],
+                           "properties": [{"uri": "https://ex.org/amount", "label": "amount"}]})
+        control_plane.set_instance(cp)
+        try:
+            out = control_plane.ontology_terms(self.IDENTITY)
+        finally:
+            control_plane.set_instance(None)
+        assert [c["label"] for c in out["classes"]] == ["equity", "Income"]
+        assert [p["uri"] for p in out["properties"]] == ["https://ex.org/amount"]
+        assert out["problem"] is None and cp.asked == [self.IDENTITY]
+
+    @pytest.mark.parametrize("answer, says", [
+        (control_plane.ContextUnavailable("control plane answered 503"), "503"),
+        (control_plane.ContextRejected("refused"), "refused"),
+        (None, "serves no ontology"),
+    ])
+    def test_a_failure_is_reported_not_raised_with_no_partial_list(self, answer, says):
+        control_plane.set_instance(self.Serving(answer))
+        try:
+            out = control_plane.ontology_terms(self.IDENTITY)
+        finally:
+            control_plane.set_instance(None)
+        assert out["classes"] == [] and out["properties"] == [] and says in out["problem"]
+
+    def test_an_sdk_that_cannot_read_it_says_so(self, monkeypatch):
+        adapter = control_plane._Sdk.__new__(control_plane._Sdk)
+        adapter.client = object()  # an SDK from before the control plane served the ontology
+        with pytest.raises(control_plane.ContextUnavailable, match="cannot read the project"):
+            adapter.project_ontology(self.IDENTITY)
 
 
 def test_the_catalog_directory_follows_r2g_catalog_dir(tmp_path, monkeypatch):

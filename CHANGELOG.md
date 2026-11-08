@@ -7,6 +7,17 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Under a control plane, the project ontology is read from the control plane (PRD P14.4,
+  P14.8).** A context is issued for one tool, so the ontology service (AOE) refuses r2g's,
+  and the ontology panel and the check that refuses a mapping naming an unknown term could no
+  longer read it. They now read the project ontology's classes and properties from the control
+  plane (the SDK's `project_ontology`) with r2g's own context; the control plane reads AOE with
+  its own credential. As before, there is no partial list, and a failure says why. `AOE_URL` is
+  no longer read. It needs a control plane that serves the project ontology to its tools:
+  upgrade the control plane first.
+
 ## [0.10.0] — 2026-11-07
 
 ### Added
