@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 from r2g.connectors.csv_source import CsvConnector
@@ -352,6 +353,21 @@ class TestCsvNullMarker:
         rows = list(DumpReader(str(out)).read_rows())
         assert rows[1]["amount"] is None and rows[2]["code"] is None
         assert rows[1]["note"] == ""
+
+    def test_the_dump_streams_instead_of_reading_the_whole_file(self, tmp_path, monkeypatch):
+        # A whole-file read would hold a file larger than memory in one frame.
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("dump_table_to_csv read the whole file with pl.read_csv")
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "orders.csv").write_text("1,\\N\n2,9\n", encoding="utf-8")
+        out = tmp_path / "dump" / "orders.csv"
+        monkeypatch.setattr(pl, "read_csv", refuse)
+        with CsvConnector(str(src), has_header=False).open_session() as sess:
+            assert sess.dump_table_to_csv("orders", out) == 2
+        # Without a header, none is written, and the marker still becomes empty.
+        assert out.read_text(encoding="utf-8") == "1,\n2,9\n"
 
     def test_the_dump_is_a_copy_without_markers(self, tmp_path):
         src = tmp_path / "src"

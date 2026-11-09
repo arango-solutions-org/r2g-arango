@@ -414,16 +414,18 @@ class CsvSession:
         # A dump is read back with no null markers, so write each one as an
         # unquoted empty field: the NULL every other source's dump writes, and
         # what Polars reads as null. Every column is read as text, so the other
-        # values (leading zeros, trailing decimal zeros, quoting) are kept.
-        frame = pl.read_csv(
+        # values (leading zeros, trailing decimal zeros, quoting) are kept. The
+        # file is scanned and sunk, never held whole, as the byte copy above
+        # never was, so a file larger than memory can still be dumped.
+        lazy = pl.scan_csv(
             str(src),
             separator=self.delimiter,
             has_header=self.has_header,
             infer_schema_length=0,
             null_values=list(self.null_values),
         )
-        frame.write_csv(str(out_path), separator=self.delimiter, include_header=self.has_header)
-        return int(frame.height)
+        lazy.sink_csv(str(out_path), separator=self.delimiter, include_header=self.has_header)
+        return int(lazy.select(pl.len()).collect().item())
 
     def close(self) -> None:
         return None
