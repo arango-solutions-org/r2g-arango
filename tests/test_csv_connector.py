@@ -284,3 +284,93 @@ class TestCsvSince:
             again = sess.count_rows("events", since_column="last_modified_date", since_value="2026-11-03")
         assert n == len(rows) == 2 and again == 1
         assert len(reads) == 2
+
+
+class TestCsvNullMarker:
+    """``\\N`` reads as NULL (#73): how PostgreSQL's text ``COPY`` and Snowflake's
+    unload write it. Inference, streaming, ``--since`` and the dump all agree."""
+
+    @staticmethod
+    def _dirs(tmp_path: Path) -> tuple[Path, Path]:
+        dirs = []
+        for label, missing in (("marker", "\\N"), ("empty", "")):
+            d = tmp_path / label
+            d.mkdir()
+            (d / "orders.csv").write_text(
+                f"ORDER_ID,AMOUNT\n1,10.50\n2,{missing}\n", encoding="utf-8"
+            )
+            dirs.append(d)
+        return dirs[0], dirs[1]
+
+    @staticmethod
+    def _read(directory: Path, **kwargs) -> tuple[dict, list]:
+        conn = CsvConnector(str(directory), **kwargs)
+        types = {c.name: c.data_type for c in conn.get_schema().tables["orders"].columns}
+        with conn.open_session() as sess:
+            return types, list(sess.stream_rows("orders"))
+
+    def test_the_marker_reads_as_an_empty_field_does(self, tmp_path):
+        marker, empty = self._dirs(tmp_path)
+        assert self._read(marker) == self._read(empty)
+        types, rows = self._read(marker)
+        assert types == {"ORDER_ID": "integer", "AMOUNT": "double precision"}
+        assert rows[1] == {"ORDER_ID": 2, "AMOUNT": None}
+
+    def test_an_empty_list_keeps_the_marker_as_text(self, tmp_path):
+        marker, _ = self._dirs(tmp_path)
+        types, rows = self._read(marker, null_values=[])
+        assert types["AMOUNT"] == "text"
+        assert rows[1]["AMOUNT"] == "\\N"
+
+    def test_a_quoted_empty_string_stays_an_empty_string(self, tmp_path):
+        (tmp_path / "notes.csv").write_text('id,note\n1,""\n2,\n3,\\N\n', encoding="utf-8")
+        with CsvConnector(str(tmp_path)).open_session() as sess:
+            assert [r["note"] for r in sess.stream_rows("notes")] == ["", None, None]
+
+    def test_since_never_selects_a_marker(self, tmp_path):
+        (tmp_path / "events.csv").write_text("id,score\n1,10\n2,\\N\n3,30\n", encoding="utf-8")
+        with CsvConnector(str(tmp_path)).open_session() as sess:
+            rows = list(sess.stream_rows("events", since_column="score", since_value="5"))
+            assert [r["id"] for r in rows] == [1, 3]
+
+    def test_the_dump_writes_the_marker_as_an_empty_field(self, tmp_path):
+        from r2g.input.dump_reader import DumpReader
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "orders.csv").write_text(
+            'id,amount,code,note\n1,10.50,003,"a, b"\n2,\\N,001,""\n3,7,\\N,\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "dump" / "orders.csv"
+        with CsvConnector(str(src)).open_session() as sess:
+            assert sess.dump_table_to_csv("orders", out) == 3
+        # Only the markers change: leading zeros, decimal zeros and quoting are kept.
+        assert out.read_text(encoding="utf-8") == (
+            'id,amount,code,note\n1,10.50,003,"a, b"\n2,,001,""\n3,7,,\n'
+        )
+        rows = list(DumpReader(str(out)).read_rows())
+        assert rows[1]["amount"] is None and rows[2]["code"] is None
+        assert rows[1]["note"] == ""
+
+    def test_the_dump_is_a_copy_without_markers(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        body = "id,amount\n1,\\N\n"
+        (src / "orders.csv").write_text(body, encoding="utf-8")
+        out = tmp_path / "dump" / "orders.csv"
+        with CsvConnector(str(src), null_values=[]).open_session() as sess:
+            sess.dump_table_to_csv("orders", out)
+        assert out.read_text(encoding="utf-8") == body
+
+    def test_the_source_param_reaches_the_connector(self, tmp_path):
+        from r2g.connectors.base import create_source_connector
+
+        conn = create_source_connector("csv", str(tmp_path))
+        assert conn.null_values == ("\\N",)
+        conn = create_source_connector("csv", str(tmp_path), source_params={"null_values": "NULL"})
+        assert conn.null_values == ("NULL",)
+        conn = create_source_connector("csv", str(tmp_path), source_params={"null_values": []})
+        assert conn.null_values == ()
+        with pytest.raises(ValueError, match="null_values"):
+            create_source_connector("csv", str(tmp_path), source_params={"null_values": 0})

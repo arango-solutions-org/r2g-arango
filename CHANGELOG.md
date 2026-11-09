@@ -9,6 +9,14 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSV source reads `\N` as NULL (#73, PRD P6.4).** `\N` is how PostgreSQL's
+  text-format `COPY` and Snowflake's default unload write NULL. A single one made a numeric
+  column text, and the missing values loaded as the two-character string `\N`, with no
+  warning. Type inference, streaming (with or without `--since`), value sampling and
+  `r2g source dump` now read it as NULL; the dump writes it as an empty field. A quoted
+  `""` is still an empty string. A real value `\N` now reads as NULL too, quoted or not:
+  a source that holds one sets `null_values` to `[]` in its source params, which keeps the
+  old reading.
 - **Under a control plane, the project ontology is read from the control plane (PRD P14.4,
   P14.8).** A context is issued for one tool, so the ontology service (AOE) refuses r2g's,
   and the ontology panel and the check that refuses a mapping naming an unknown term could no

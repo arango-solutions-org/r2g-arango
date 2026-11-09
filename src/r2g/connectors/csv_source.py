@@ -30,7 +30,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Sequence
 
 import polars as pl
 
@@ -95,6 +95,31 @@ _POLARS_TYPE_MAP: dict[str, str] = {
 
 CSV_EXTENSIONS = (".csv", ".tsv", ".txt")
 
+#: Text a CSV source reads as NULL, besides an unquoted empty field (which Polars
+#: always reads as null). ``\N`` is how PostgreSQL's text-format ``COPY`` and
+#: Snowflake's default ``NULL_IF`` write NULL. It applies quoted or not, so a real
+#: value ``\N`` reads as null too; a source that holds one sets ``null_values`` to
+#: ``[]`` in its source params. ``""`` is deliberately not a default: it would also
+#: null a quoted ``""``, which PostgreSQL's CSV format writes for an empty string.
+DEFAULT_NULL_VALUES: tuple[str, ...] = ("\\N",)
+
+
+def null_values_param(params: dict[str, Any] | None) -> tuple[str, ...]:
+    """A CSV source's ``null_values`` param as a tuple of markers, or the default.
+
+    One string is one marker. Anything else that is not a list of strings is
+    refused, rather than guessed at: a wrong marker silently changes data.
+    """
+    value = (params or {}).get("null_values", DEFAULT_NULL_VALUES)
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        return tuple(value)
+    raise ValueError(
+        "CSV source param 'null_values' must be a string or a list of strings, "
+        f"not {value!r}"
+    )
+
 
 def resolve_csv_table_path(directory: Path, table: str) -> Path | None:
     """Return ``<directory>/<table><ext>`` for the first matching CSV extension,
@@ -129,12 +154,14 @@ class CsvConnector:
         delimiter: str = ",",
         has_header: bool = True,
         sample_rows: int = 1000,
+        null_values: Sequence[str] = DEFAULT_NULL_VALUES,
     ) -> None:
         self.connection_string = connection_string
         self.schema_name = schema_name
         self.delimiter = delimiter
         self.has_header = has_header
         self.sample_rows = sample_rows
+        self.null_values = tuple(null_values)
         self.directory = resolve_source_directory(connection_string)
 
     def _table_files(self) -> dict[str, Path]:
@@ -163,6 +190,7 @@ class CsvConnector:
             schema_name=self.schema_name,
             delimiter=self.delimiter,
             has_header=self.has_header,
+            null_values=self.null_values,
         )
 
     def _process_file(self, table_name: str, path: Path) -> Table:
@@ -173,6 +201,9 @@ class CsvConnector:
                 has_header=self.has_header,
                 n_rows=self.sample_rows,
                 infer_schema_length=self.sample_rows,
+                # The same markers the session reads as null, so a column's
+                # inferred type matches the values it streams.
+                null_values=list(self.null_values) or None,
             )
         except Exception as e:  # noqa: BLE001
             logger.error("csv_introspect_failed", path=str(path), error=str(e))
@@ -305,11 +336,13 @@ class CsvSession:
         schema_name: str = "public",
         delimiter: str = ",",
         has_header: bool = True,
+        null_values: Sequence[str] = DEFAULT_NULL_VALUES,
     ) -> None:
         self.connection_string = connection_string
         self.schema_name = schema_name
         self.delimiter = delimiter
         self.has_header = has_header
+        self.null_values = tuple(null_values)
         self.directory = resolve_source_directory(connection_string)
         # The pipeline counts a table and then streams it. With a bound both
         # need the whole file in a frame, so the frame filtered for the count
@@ -335,6 +368,7 @@ class CsvSession:
             str(self._resolve(table)),
             delimiter=self.delimiter,
             has_header=self.has_header,
+            null_values=self.null_values,
         )
 
     def count_rows(
@@ -374,8 +408,22 @@ class CsvSession:
         src = self._resolve(table)
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, out_path)
-        return self._reader(table).row_count()
+        if not self.null_values:
+            shutil.copyfile(src, out_path)
+            return self._reader(table).row_count()
+        # A dump is read back with no null markers, so write each one as an
+        # unquoted empty field: the NULL every other source's dump writes, and
+        # what Polars reads as null. Every column is read as text, so the other
+        # values (leading zeros, trailing decimal zeros, quoting) are kept.
+        frame = pl.read_csv(
+            str(src),
+            separator=self.delimiter,
+            has_header=self.has_header,
+            infer_schema_length=0,
+            null_values=list(self.null_values),
+        )
+        frame.write_csv(str(out_path), separator=self.delimiter, include_header=self.has_header)
+        return int(frame.height)
 
     def close(self) -> None:
         return None
@@ -387,4 +435,4 @@ class CsvSession:
         self.close()
 
 
-__all__ = ["CsvConnector", "CsvSession"]
+__all__ = ["DEFAULT_NULL_VALUES", "CsvConnector", "CsvSession", "null_values_param"]
