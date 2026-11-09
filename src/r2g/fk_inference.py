@@ -33,7 +33,7 @@ accepted suggestions use the existing ``EdgeDefinition`` model (see
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 # The heuristic engine, options, the InferredForeignKey model, and the concrete
 # value samplers are shared with ``relational-schema-analyzer`` (RSA extracted them
@@ -341,7 +341,19 @@ class SQLServerValueSampler(_RsaSQLServerValueSampler):
 
 
 class CsvValueSampler(_RsaCsvValueSampler):
-    """RSA's CSV FK/denorm sampler plus r2g's ``sample_values`` probe."""
+    """RSA's CSV FK/denorm sampler plus r2g's ``sample_values`` probe.
+
+    ``sample_values`` leaves out the source's null markers (``\\N`` by default),
+    as the CSV source reads them. RSA's own overlap and denormalisation probes
+    still read them as values, so a column of ``\\N`` can veto a valid key:
+    arango-solutions-org/relational-schema-analyzer#47.
+    """
+
+    def __init__(self, *args: Any, null_values: Optional[Sequence[str]] = None, **kwargs: Any):
+        from r2g.connectors.csv_source import DEFAULT_NULL_VALUES
+
+        super().__init__(*args, **kwargs)
+        self.null_values = tuple(DEFAULT_NULL_VALUES if null_values is None else null_values)
 
     def sample_values(self, table: str, column: str, limit: int = 5) -> list:
         """Return up to ``limit`` distinct non-null values from a column (or [])."""
@@ -351,7 +363,11 @@ class CsvValueSampler(_RsaCsvValueSampler):
         if frame is None or not frame.columns:
             return []
         name = frame.columns[0]
-        frame = frame.filter(pl.col(name).is_not_null() & (pl.col(name) != ""))
+        frame = frame.filter(
+            pl.col(name).is_not_null()
+            & (pl.col(name) != "")
+            & ~pl.col(name).is_in(list(self.null_values))
+        )
         series = frame.get_column(name)
         if series.len() == 0:
             return []
@@ -393,10 +409,13 @@ def create_value_sampler(
     if is_sqlserver(source_type):
         return SQLServerValueSampler(connection_string, schema_name=pg_schema, limit=limit)
     if normalize_source_type(source_type) == "csv":
+        from r2g.connectors.csv_source import null_values_param
+
         return CsvValueSampler(
             connection_string,
             delimiter=params.get("delimiter", ","),
             has_header=bool(params.get("has_header", True)),
             limit=limit,
+            null_values=null_values_param(params),
         )
     return None

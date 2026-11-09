@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterator
+from typing import Any, Dict, Generator, Iterator, Optional, Sequence
 
 import polars as pl
 
@@ -11,16 +11,28 @@ logger = get_logger(__name__)
 
 
 class DumpReader:
-    def __init__(self, file_path: str, delimiter: str = ",", has_header: bool = True):
+    def __init__(
+        self,
+        file_path: str,
+        delimiter: str = ",",
+        has_header: bool = True,
+        null_values: Optional[Sequence[str]] = None,
+    ):
         self.file_path = Path(file_path)
         self.delimiter = delimiter
         self.has_header = has_header
+        # Text that reads as null besides an unquoted empty field, which Polars
+        # already reads as null. None or empty adds nothing.
+        self.null_values = tuple(null_values or ())
 
     def _csv_path(self) -> str:
         return str(self.file_path)
 
     def _polars_csv_kwargs(self) -> dict[str, Any]:
-        return {"separator": self.delimiter, "has_header": self.has_header}
+        kwargs: dict[str, Any] = {"separator": self.delimiter, "has_header": self.has_header}
+        if self.null_values:
+            kwargs["null_values"] = list(self.null_values)
+        return kwargs
 
     def read_dataframe(self) -> pl.DataFrame:
         if not self.file_path.exists():

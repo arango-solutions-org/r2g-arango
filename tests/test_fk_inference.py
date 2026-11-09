@@ -495,6 +495,13 @@ class TestCsvValueSampler:
         assert sampler.sample_values("authors", "id") == ["003", "001", "002"]
         assert sampler.sample_values("authors", "id", limit=2) == ["003", "001"]
 
+    def test_sample_values_leaves_out_the_null_marker(self, tmp_path):
+        """The CSV source reads ``\\N`` as NULL (#73), so it is never a sample value."""
+        sampler = self._make_dir(tmp_path, {"authors.csv": "row,id\n1,\\N\n2,001\n"})
+        assert sampler.sample_values("authors", "id") == ["001"]
+        kept = create_value_sampler("csv", str(tmp_path), source_params={"null_values": []})
+        assert kept.sample_values("authors", "id") == ["\\N", "001"]
+
     def test_full_overlap_returns_one(self, tmp_path):
         sampler = self._make_dir(
             tmp_path,

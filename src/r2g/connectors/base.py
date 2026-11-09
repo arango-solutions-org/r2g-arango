@@ -105,7 +105,7 @@ def create_source_connector(
     raise :class:`ImportError` with a pip-install hint.
 
     ``source_params`` carries type-specific configuration (e.g. CSV
-    ``delimiter`` / ``has_header``, Kafka ``schema_registry_url`` /
+    ``delimiter`` / ``has_header`` / ``null_values``, Kafka ``schema_registry_url`` /
     ``topic``). PostgreSQL and Snowflake ignore it.
     """
 
@@ -135,13 +135,14 @@ def create_source_connector(
 
         return ClickHouseConnector(connection_string, schema_name=schema_name)
     if key == "csv":
-        from r2g.connectors.csv_source import CsvConnector
+        from r2g.connectors.csv_source import CsvConnector, null_values_param
 
         return CsvConnector(
             connection_string,
             schema_name=schema_name,
             delimiter=params.get("delimiter", ","),
             has_header=bool(params.get("has_header", True)),
+            null_values=null_values_param(params),
         )
     if key == "kafka":
         from r2g.connectors.kafka_source import KafkaConnector
