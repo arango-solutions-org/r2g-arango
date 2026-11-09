@@ -16,7 +16,9 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `r2g source dump` now read it as NULL; the dump writes it as an empty field. A quoted
   `""` is still an empty string. A real value `\N` now reads as NULL too, quoted or not:
   a source that holds one sets `null_values` to `[]` in its source params, which keeps the
-  old reading.
+  old reading. The analyzer's own foreign-key overlap probe still reads `\N` as a value, so a
+  column holding only `\N` can veto a valid key; that is filed as
+  arango-solutions-org/relational-schema-analyzer#47.
 - **Under a control plane, the project ontology is read from the control plane (PRD P14.4,
   P14.8).** A context is issued for one tool, so the ontology service (AOE) refuses r2g's,
   and the ontology panel and the check that refuses a mapping naming an unknown term could no

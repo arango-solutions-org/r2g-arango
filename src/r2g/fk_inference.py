@@ -344,7 +344,9 @@ class CsvValueSampler(_RsaCsvValueSampler):
     """RSA's CSV FK/denorm sampler plus r2g's ``sample_values`` probe.
 
     ``sample_values`` leaves out the source's null markers (``\\N`` by default),
-    as the CSV source reads them. RSA's own probes read them as values.
+    as the CSV source reads them. RSA's own overlap and denormalisation probes
+    still read them as values, so a column of ``\\N`` can veto a valid key:
+    arango-solutions-org/relational-schema-analyzer#47.
     """
 
     def __init__(self, *args: Any, null_values: Optional[Sequence[str]] = None, **kwargs: Any):
