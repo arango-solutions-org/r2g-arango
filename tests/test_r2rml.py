@@ -232,6 +232,9 @@ XSD = "http://www.w3.org/2001/XMLSchema#"
         ("tinyint", "xsd:integer"),
         ("mediumint", "xsd:integer"),
         ("tinyint(1)", "xsd:integer"),
+        ("int", "xsd:integer"),
+        ("int unsigned", "xsd:integer"),
+        ("Int256", "xsd:integer"),
         # Other classified types are unchanged.
         ("real", "xsd:double"),
         ("boolean", "xsd:boolean"),
@@ -247,6 +250,10 @@ XSD = "http://www.w3.org/2001/XMLSchema#"
         ("Array(Int32)", None),
         ("variant", None),
         ("USER-DEFINED", None),
+        # Start with "int" but are not integers.
+        ("interval", None),
+        ("int4range", None),
+        ("int8range", None),
     ],
 )
 def test_xsd_datatype_classifies_each_sql_type(sql_type, expected):

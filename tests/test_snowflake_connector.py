@@ -201,12 +201,12 @@ class TestIntrospection:
             ),
             # columns for any table
             "INFORMATION_SCHEMA.COLUMNS": (
-                ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE"],
+                ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "NUMERIC_PRECISION", "NUMERIC_SCALE"],
                 [
-                    ("ID", "NUMBER", "NO"),
-                    ("NAME", "TEXT", "YES"),
-                    ("METADATA", "VARIANT", "YES"),
-                    ("CREATED_AT", "TIMESTAMP_NTZ", "YES"),
+                    ("ID", "NUMBER", "NO", 38, 0),
+                    ("NAME", "TEXT", "YES", None, None),
+                    ("METADATA", "VARIANT", "YES", None, None),
+                    ("CREATED_AT", "TIMESTAMP_NTZ", "YES", None, None),
                 ],
             ),
             # SHOW PRIMARY KEYS
@@ -364,6 +364,95 @@ class TestIntrospection:
         assert pg_type_to_json_type(created_at.data_type) == "string"
         id_col = next(c for c in users.columns if c.name == "ID")
         assert pg_type_to_json_type(id_col.data_type) == "float"
+
+
+class TestNumericScale:
+    """r2g-arango#24: Snowflake reports every integer column as bare ``NUMBER``;
+    the scale from ``NUMERIC_SCALE`` is what tells an integer from a decimal."""
+
+    def _schema_with_columns(self, monkeypatch, rows: list[tuple]):
+        scripted = TestIntrospection()._scripted_schema()
+        scripted["INFORMATION_SCHEMA.TABLES"] = (["TABLE_NAME", "TABLE_TYPE"], [("USERS", "BASE TABLE")])
+        scripted["INFORMATION_SCHEMA.COLUMNS"] = (
+            ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "NUMERIC_PRECISION", "NUMERIC_SCALE"],
+            rows,
+        )
+        _install_fake_snowflake(monkeypatch, lambda **kwargs: _FakeConnection(scripted))
+        return SnowflakeConnector("snowflake://svc:x@xy12345/ANALYTICS/CORE").get_schema()
+
+    def test_columns_query_selects_precision_and_scale(self, monkeypatch):
+        seen: list[str] = []
+
+        class _Cursor(_FakeCursor):
+            def execute(self, sql: str, params=None) -> None:
+                seen.append(" ".join(sql.upper().split()))
+                super().execute(sql, params)
+
+        scripted = TestIntrospection()._scripted_schema()
+
+        class _Conn(_FakeConnection):
+            def cursor(self) -> _FakeCursor:
+                return _Cursor(scripted)
+
+        _install_fake_snowflake(monkeypatch, lambda **kwargs: _Conn(scripted))
+        SnowflakeConnector("snowflake://svc:x@xy12345/ANALYTICS/CORE").get_schema()
+        columns_sql = next(s for s in seen if "INFORMATION_SCHEMA.COLUMNS" in s)
+        assert "NUMERIC_PRECISION, NUMERIC_SCALE" in columns_sql
+
+    @pytest.mark.parametrize(
+        ("data_type", "precision", "scale", "recorded", "xsd"),
+        [
+            ("NUMBER", 38, 0, "number(38,0)", "xsd:integer"),
+            ("NUMBER", 10, 2, "number(10,2)", "xsd:decimal"),
+            ("DECIMAL", 18, 0, "decimal(18,0)", "xsd:integer"),
+            ("TEXT", None, None, "text", "xsd:string"),
+            ("VARCHAR", None, None, "varchar", "xsd:string"),
+            # Not reported: the bare name, which stays a decimal.
+            ("NUMBER", None, None, "number", "xsd:decimal"),
+            # FLOAT reports a precision but is not fixed-point.
+            ("FLOAT", 53, None, "float", "xsd:double"),
+        ],
+    )
+    def test_fixed_point_columns_record_their_scale(
+        self, monkeypatch, data_type, precision, scale, recorded, xsd
+    ):
+        from r2g.r2rml import _xsd_datatype
+
+        schema = self._schema_with_columns(
+            monkeypatch, [("ID", "NUMBER", "NO", 38, 0), ("VALUE", data_type, "YES", precision, scale)]
+        )
+        column = next(c for c in schema.tables["USERS"].columns if c.name == "VALUE")
+        assert column.data_type == recorded
+        assert _xsd_datatype(column.data_type) == xsd
+
+    def test_scaled_number_keeps_its_json_type(self, monkeypatch):
+        """Everything that reads the JSON type strips the parameters, so recording
+        the scale changes nothing outside the R2RML datatype."""
+        from r2g.config import pg_type_to_json_type
+
+        schema = self._schema_with_columns(monkeypatch, [("ID", "NUMBER", "NO", 38, 0)])
+        assert pg_type_to_json_type(schema.tables["USERS"].columns[0].data_type) == "float"
+
+
+def test_emulated_snowflake_types_integer_columns_by_scale():
+    """End to end through fakesnow's INFORMATION_SCHEMA: INT is reported as
+    NUMBER with scale 0, so it reaches the R2RML as xsd:integer (r2g-arango#24)."""
+    fakesnow = pytest.importorskip("fakesnow")
+    sc = pytest.importorskip("snowflake.connector")
+    from r2g.r2rml import _xsd_datatype
+
+    with fakesnow.patch():
+        conn = sc.connect(database="DB1", schema="PUBLIC")
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE T (A INT, B NUMBER(10,2), C VARCHAR, D FLOAT)")
+        cur.close()
+        conn.close()
+        schema = SnowflakeConnector("snowflake://u:p@acct/DB1/PUBLIC").get_schema()
+    types_ = {c.name: c.data_type for c in schema.tables["T"].columns}
+    assert types_ == {"A": "number(38,0)", "B": "number(10,2)", "C": "text", "D": "float"}
+    assert {n: _xsd_datatype(t) for n, t in types_.items()} == {
+        "A": "xsd:integer", "B": "xsd:decimal", "C": "xsd:string", "D": "xsd:double",
+    }
 
 
 class _RecordingConnection(_FakeConnection):

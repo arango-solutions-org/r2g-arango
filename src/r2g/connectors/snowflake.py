@@ -109,6 +109,24 @@ def _load_snowflake_connector() -> Any:
     return _sf
 
 
+#: Snowflake ``DATA_TYPE`` names whose scale lives in ``NUMERIC_SCALE``. Every
+#: Snowflake integer type (INT, BIGINT, …) is ``NUMBER(38,0)`` and is reported
+#: as bare ``NUMBER``.
+_FIXED_POINT_DATA_TYPES = frozenset({"number", "decimal", "numeric"})
+
+
+def _column_type(data_type: Any, precision: Any, scale: Any) -> str:
+    """The recorded column type: lower-cased ``DATA_TYPE``, with
+    ``(precision,scale)`` for a fixed-point column so the R2RML emitter can tell
+    an integer (scale 0) from a decimal (r2g-arango#24). A fixed-point column
+    whose precision or scale is not reported keeps its bare name, which the
+    emitter types as a decimal."""
+    base = (data_type or "").lower()
+    if base in _FIXED_POINT_DATA_TYPES and precision is not None and scale is not None:
+        return f"{base}({int(precision)},{int(scale)})"
+    return base
+
+
 class SnowflakeConnector:
     """Snowflake source connector (introspection only)."""
 
@@ -219,7 +237,8 @@ class SnowflakeConnector:
         try:
             cur.execute(
                 f"""
-                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE,
+                       NUMERIC_PRECISION, NUMERIC_SCALE
                 FROM {self._database}.INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
                 ORDER BY ORDINAL_POSITION
@@ -230,11 +249,11 @@ class SnowflakeConnector:
         finally:
             cur.close()
         columns: list[Column] = []
-        for name, data_type, is_nullable in rows:
+        for name, data_type, is_nullable, precision, scale in rows:
             columns.append(
                 Column(
                     name=name,
-                    data_type=(data_type or "").lower(),
+                    data_type=_column_type(data_type, precision, scale),
                     is_nullable=(is_nullable == "YES"),
                     is_primary_key=False,
                 )

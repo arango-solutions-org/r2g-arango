@@ -88,6 +88,9 @@ _STRING_TYPES = frozenset(
 # (precision[, scale]); scale defaults to 0 when only precision is given.
 _FIXED_POINT_TYPES = frozenset({"number", "numeric", "decimal"})
 
+# An integer type name: int, int4, Int32, UInt64, "int unsigned".
+_INT_NAME_RE = re.compile(r"^u?int\d*(?:\s|$)")
+
 # ClickHouse DecimalN(S): the one parameter is the scale.
 _CH_SCALED_DECIMAL_RE = re.compile(r"^decimal(?:32|64|128|256)$")
 
@@ -143,7 +146,9 @@ def _xsd_datatype(sql_type: str) -> Optional[str]:
     if (
         base in {"int", "int2", "int4", "int8", "tinyint", "mediumint"}
         or any(k in t for k in ("bigint", "smallint", "integer", "serial"))
-        or t.startswith(("int", "uint"))  # ClickHouse Int8/…/256, UInt8/…
+        # ClickHouse Int8/…/256, UInt8/…, MySQL "int unsigned"; not "interval"
+        # or a range type such as "int4range", which only start with "int".
+        or _INT_NAME_RE.match(base)
     ):
         return "xsd:integer"
     if any(k in t for k in ("numeric", "decimal", "money")):

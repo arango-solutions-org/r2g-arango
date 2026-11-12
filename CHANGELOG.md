@@ -64,10 +64,19 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Some integer columns were left untyped and now carry `xsd:integer`: ClickHouse
   `Nullable(…)` and `LowCardinality(…)` are unwrapped before classifying, `NUMBER`/`DECIMAL`/
   `NUMERIC` with scale 0 (`NUMBER(38,0)`) is an integer, as are MySQL `tinyint` and
-  `mediumint`. A `NUMBER` whose type string carries no scale, as Snowflake's
-  `INFORMATION_SCHEMA` reports it, may hold fractions and is `xsd:decimal` (it was untyped).
-  `uuid`, `json`/`jsonb`, `bytea`, arrays and other unclassified types still have no
-  `rr:datatype`. Regenerate committed R2RML to pick this up: every text column gains a
+  `mediumint`. A `NUMBER` whose type string carries no scale may hold fractions and is
+  `xsd:decimal` (it was untyped). `uuid`, `json`/`jsonb`, `bytea`, arrays and other
+  unclassified types still have no `rr:datatype`; so do `interval` and range types such as
+  `int4range`, which were wrongly `xsd:integer` because their names start with `int`.
+- **The Snowflake connector records a number column's precision and scale (#24).**
+  Snowflake's `INFORMATION_SCHEMA` reports every integer column (`INT`, `BIGINT`, …) as bare
+  `NUMBER`, so without the scale none of them could be typed as an integer. A snapshot now
+  records `number(38,0)` or `number(10,2)` from `NUMERIC_PRECISION` and `NUMERIC_SCALE`.
+  The JSON type is unchanged (still `float`), and `--compare-last`, `diff-schema` and the
+  MCP diff treat a snapshot's older bare `number` as the same type, so re-snapshotting
+  reports no change. A `schema.json` written by hand or by an older r2g keeps its bare
+  `number`, which the R2RML types as `xsd:decimal`: re-snapshot it, or write `number(38,0)`
+  for its integer columns. Regenerate committed R2RML to pick this up: every text column gains a
   datatype, which Ontop reads the same as the natural mapping.
 - **A CSV source reads `\N` as NULL (#73, PRD P6.4).** `\N` is how PostgreSQL's
   text-format `COPY` and Snowflake's default unload write NULL. A single one made a numeric
