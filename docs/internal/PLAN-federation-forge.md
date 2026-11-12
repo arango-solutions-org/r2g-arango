@@ -1,7 +1,9 @@
 # PLAN — Federation Forge: the reverse generator
 
 **Status:** S1 walking skeleton shipped (Postgres, r2g #1); **S2 dialects shipped**
-(snowflake / clickhouse / arango behind the same seam — see "S2 dialects" below)
+(snowflake / clickhouse / arango behind the same seam — see "S2 dialects" below);
+**volume** (self-links, scale knobs, streaming and bulk output — F-9 to F-11)
+for CDF's S5
 **Commissioned by:** contextual-data-fabric ADR-0006 (accepted 2026-09-08),
 which assigns r2g the generator core (its D-4): r2g owns the ontology→schema
 mapping machinery in both directions, so the *reverse* direction — generate a
@@ -196,6 +198,105 @@ and child keys differ (`TestForeignKeyReferencesTheParent`), or a subclass that
 folds (`test_ddl_routes_every_name_through_the_seam`). Both bugs survived review
 and a green suite precisely because the first tests written for them could not
 have failed.
+
+
+### F-9 · A class may be linked to itself; its rows form a forest
+
+Commissioned by CDF's S5 "Forge at volume" (ADR-0011 D9 names the gap: "it
+links no class to itself, so there is no reachability or shortest-path
+workload"). A relationship whose `fromEntity` equals its `toEntity`
+(`Employee -> Employee`, type `employeesToEmployees`) is accepted:
+
+- It is **not** a cycle for the topological order — that order is between
+  tables, and a self-link's ordering lives inside its one table. A cycle
+  between two different classes is still refused.
+- The FK column follows F-4 (`employee_id` on `employees`, referencing
+  `employees(id)`), so Auto-Map re-derives `employees_to_employees` and the CSI
+  names it back `employeesToEmployees`; the unit test runs that derivation in
+  memory. The column is **nullable** (`ColumnPlan.optional`): row 1 is always a
+  root, so no NOT NULL column could hold it.
+- **Each row points at an earlier row** of the same table, never at itself and
+  never forward. The links therefore form a forest with no cycle, a loader that
+  inserts in id order never names a row that is not there yet, and declared
+  constraints hold throughout. Under the default draw a row's parent is uniform
+  over the rows before it — a random recursive tree, mean depth about `ln(n)`
+  (≈14 at 10^6 rows), which is deep enough for a reachability workload.
+- In ArangoDB a NULL foreign key has no edge (`project_documents`, the loader
+  script's copy of it, and the bulk projector all skip it).
+
+### F-10 · Volume knobs: row counts, fan-out skew, NULL rates
+
+ADR-0006's descriptor has carried `scale: {rowsPerEntity}` since S1, with "S5
+turns this knob". F-5's synthesis gave every class the same row count and
+drew every FK uniformly, so a hop had about one neighbour on average.
+`ForgeScale` (`src/r2g/forge/scale.py`) is the knob set, as a document:
+
+```json
+{
+  "rows": {"Account": 1000, "Contact": 1000000},
+  "relationships": {
+    "contactsToAccounts": {"distribution": "zipf", "exponent": 1.1, "nullRate": 0.05},
+    "employeesToEmployees": {"distribution": "uniform"}
+  }
+}
+```
+
+- `rows` — per class, overriding `rows_per_entity`. A relationship's mean
+  fan-out is the child's rows over the parent's.
+- `distribution` — `uniform` (F-5's draw) or `zipf` with `exponent` `s > 0`:
+  the parent of rank `k` is picked with probability `k^-s / H(n, s)`, rank `k`
+  being parent `id` `k` (parent 1 is the busiest). Sampled by
+  rejection-inversion (Hörmann & Derflinger 1996) in O(1) memory; an
+  inverse-CDF table would hold a float per parent, 800 MB at 10^8. On a
+  self-link the ranks are the earlier rows, so skew makes the forest bushier
+  and shallower.
+- `nullRate` — the share of children with a NULL FK. A positive rate makes the
+  FK column nullable, so the scale is an input to `plan_schema`, not only to
+  synthesis.
+
+**Refused by name, never ignored:** a knob naming no class or relationship of
+the ontology, `zipf` without an exponent, an exponent on `uniform`, a rate
+outside `[0, 1)`, a row count below one. A knob that silently did nothing
+would make a benchmark measure a shape nobody asked for.
+
+**The skeleton's draws do not move.** With no knob set, every draw is the one
+F-5 made, in the same order: `rng.choice(range(1, n + 1))` consumes the
+generator exactly as `rng.choice([1, …, n])` did, and a knob only adds draws
+where it is set (a `nullRate` coin, a Zipf variate). `tests/test_forge_scale.py`
+keeps 0.10.0's synthesizer verbatim and compares against it, and pins a digest
+of its output, so a suite CDF committed from an earlier release stays
+byte-identical.
+
+### F-11 · Synthesis streams; volume output is chunked files
+
+At 10^8 edges neither the rows nor their `INSERT` text fit in memory. Synthesis
+is now `stream_rows(plan, seed, rows_per_entity, scale)`, a generator of
+`(table, row)` in plan order. It holds no rows: an FK needs only its parent's
+row **count**, because a parent's ids are `1..count` by construction (an FK
+onto anything but the parent's primary key is refused by name). Arguments are
+checked when it is called, not on the first `next()`. `synthesize_rows` is
+that stream collected, for small shapes.
+
+`generate_bulk` / `BulkWriter` (`src/r2g/forge/bulk.py`, CLI
+`r2g forge generate --bulk [--chunk-rows N]`) write the stream as it arrives:
+
+| File | What |
+|---|---|
+| `forge.sql` / `forge.collections.json` | the dialect's schema, unchanged |
+| `data/<target>.<nnnnn>.csv` (SQL) / `.jsonl` (arango) | at most `chunk_rows` records each; CSV has no header, `\N` (unquoted) for NULL, every string quoted |
+| `forge.bulk.sql` / `forge.bulk.py` | Postgres `\copy … WITH (FORMAT csv, NULL '\N')`; ClickHouse `INSERT … FROM INFILE … FORMAT CSV`; Snowflake `PUT` + `COPY INTO … PURGE`; ArangoDB `import_bulk` in batches |
+| `forge.bulk.json` | every target, its columns and row count, each file with its rows and SHA-256, and the seed and scale |
+
+Memory is one open file per target. Files are written in plan order (parents
+first, a self-link's rows after the rows they name), so loading them in order
+never inserts a dangling key. A writer that fails mid-stream writes no
+manifest, so a half-written directory never looks complete. The two
+`forge.rows.json`-shaped outputs are not written in bulk mode — they *are* the
+N rows.
+
+What is not exercised here: no bulk loader has been run against a live engine
+in this repository's unit tests; the Snowflake one (`PUT 'file://…'` with a
+relative path) has not been run anywhere yet.
 
 
 ## S2 dialects — the other three launch-set targets behind one seam

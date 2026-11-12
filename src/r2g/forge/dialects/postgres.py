@@ -12,9 +12,9 @@ against skeleton-era artifacts needs regenerating.
 
 from __future__ import annotations
 
-from typing import ClassVar, Dict
+from typing import ClassVar, Dict, List
 
-from .base import SqlDialect
+from .base import CSV_NULL, SqlDialect
 
 #: The one canonical Postgres spelling per JSON type (PLAN F-3): the generated
 #: DDL type must introspect back through ``config.pg_type_to_json_type`` to the
@@ -31,6 +31,17 @@ class PostgresDialect(SqlDialect):
     name: ClassVar[str] = "postgres"
     type_for_json: ClassVar[Dict[str, str]] = PG_TYPE_FOR_JSON_TYPE
     multi_row_insert: ClassVar[bool] = False
+
+    def bulk_header(self) -> List[str]:
+        return [
+            "-- psql meta-commands (\\copy reads each file client-side). Run from this",
+            "-- directory, after the DDL:",
+            "--   psql -v ON_ERROR_STOP=1 -f forge.sql -f forge.bulk.sql",
+            "-- Files load parents before children, so declared foreign keys hold throughout.",
+        ]
+
+    def bulk_load_statement(self, physical: str, columns: str, path: str) -> str:
+        return f"\\copy {physical} ({columns}) FROM '{path}' WITH (FORMAT csv, NULL '{CSV_NULL}')"
 
 
 __all__ = ["PG_TYPE_FOR_JSON_TYPE", "PostgresDialect"]

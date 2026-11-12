@@ -195,3 +195,85 @@ def test_help_lists_the_dialects(ontology_file):
     assert result.exit_code == 0
     for dialect in ("postgres", "snowflake", "clickhouse", "arango"):
         assert dialect in result.output
+
+
+# ── volume: --scale, --bulk (PLAN F-10/F-11) ─────────────────────────────────
+
+
+@pytest.fixture
+def scale_file(tmp_path):
+    path = tmp_path / "scale.json"
+    path.write_text(
+        json.dumps(
+            {
+                "rows": {"Account": 3, "Contact": 40},
+                "relationships": {"contactsToAccounts": {"distribution": "zipf", "exponent": 1.5}},
+            }
+        )
+    )
+    return path
+
+
+def test_scale_sets_row_counts(ontology_file, scale_file, tmp_path):
+    out_dir = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        ["forge", "generate", "-O", str(ontology_file), "--scale", str(scale_file), "-o", str(out_dir)],
+    )
+    assert result.exit_code == 0, result.output
+    rows = json.loads((out_dir / "forge.rows.json").read_text())
+    assert (len(rows["accounts"]), len(rows["contacts"])) == (3, 40)
+
+
+@pytest.mark.parametrize(
+    "content, reason",
+    [
+        ("{not json", "not valid JSON"),
+        ('{"rows": {"Acount": 3}}', "does not declare"),
+        ('{"relationships": {"contactsToAccounts": {"distribution": "zipf"}}}', "exponent"),
+    ],
+)
+def test_refused_scale_exits_2_with_reason(ontology_file, tmp_path, content, reason):
+    path = tmp_path / "scale.json"
+    path.write_text(content)
+    result = runner.invoke(
+        app, ["forge", "generate", "-O", str(ontology_file), "--scale", str(path), "-o", str(tmp_path / "o")]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Forge refused" in result.output and reason in result.output
+
+
+def test_missing_scale_file_is_a_refusal(ontology_file, tmp_path):
+    result = runner.invoke(
+        app, ["forge", "generate", "-O", str(ontology_file), "--scale", str(tmp_path / "absent.json")]
+    )
+    assert result.exit_code == 2
+    assert "cannot read scale file" in result.output
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "arango"])
+def test_bulk_writes_chunks_loader_and_manifest(ontology_file, scale_file, tmp_path, dialect):
+    out_dir = tmp_path / dialect
+    result = runner.invoke(
+        app,
+        [
+            "forge", "generate", "-O", str(ontology_file), "--scale", str(scale_file),
+            "--dialect", dialect, "--bulk", "--chunk-rows", "16", "-o", str(out_dir),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Forged" in result.output and "forge.bulk.json" in result.output
+    manifest = json.loads((out_dir / "forge.bulk.json").read_text())
+    contacts = next(t for t in manifest["targets"] if t["name"] == "contacts")
+    assert contacts["rows"] == 40 and [f["rows"] for f in contacts["files"]] == [16, 16, 8]
+    assert not (out_dir / "forge.rows.json").exists()
+    loader = "forge.bulk.py" if dialect == "arango" else "forge.bulk.sql"
+    assert (out_dir / loader).exists()
+
+
+def test_bad_chunk_rows_exits_2(ontology_file):
+    result = runner.invoke(
+        app, ["forge", "generate", "-O", str(ontology_file), "--bulk", "--chunk-rows", "0"]
+    )
+    assert result.exit_code == 2
+    assert "chunk-rows" in result.output

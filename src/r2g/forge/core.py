@@ -24,9 +24,8 @@ otherwise — the forge fails loudly at generate time, never at compare time.
 from __future__ import annotations
 
 import json
-import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +33,9 @@ from r2g.naming import edge_collection_name as _edge_name
 
 from ..csi import owl_entity_name, owl_property_name
 from ..naming import convert_identifier, pluralize
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; scale imports this module
+    from .scale import ForgeScale
 
 #: Conceptual JSON types the forge synthesizes (PLAN F-1/F-3). Every dialect
 #: must declare one roundtrip-stable physical type per entry; the forward
@@ -395,7 +397,9 @@ class ColumnPlan:
     which is why rendering ``table.primary_key`` here looked right and was not;
     ``prop`` is the conceptual lowerCamel property for a property column.
     Key columns are NOT NULL, property columns nullable — the same across
-    every dialect so the introspected nullability agrees.
+    every dialect so the introspected nullability agrees. The one exception is
+    an ``optional`` foreign key (PLAN F-9/F-10): a self-link, whose roots have
+    no parent, or a relationship the scale gives a ``nullRate``.
     """
 
     name: str
@@ -404,10 +408,11 @@ class ColumnPlan:
     references: Optional[str] = None
     references_column: Optional[str] = None
     prop: Optional[str] = None
+    optional: bool = False
 
     @property
     def nullable(self) -> bool:
-        return self.role == ROLE_PROPERTY
+        return self.role == ROLE_PROPERTY or self.optional
 
 
 @dataclass(frozen=True)
@@ -448,6 +453,14 @@ class EdgePlan:
     #: The column ``fk_column`` points at in ``to_table``. Carried rather than
     #: assumed so a non-uniform primary key cannot silently mis-render an FK.
     to_key: str = SURROGATE_KEY
+    #: Whether ``fk_column`` may be NULL (a self-link's roots, or a scale
+    #: ``nullRate``); mirrors the FK ColumnPlan's ``optional``.
+    optional: bool = False
+
+    @property
+    def self_link(self) -> bool:
+        """A class linked to itself (employee -> manager), PLAN F-9."""
+        return self.from_table == self.to_table
 
 
 @dataclass(frozen=True)
@@ -469,11 +482,16 @@ class SchemaPlan:
 
 def _topological_entity_order(ontology: ForgeOntology) -> List[str]:
     """Parents before children (FK targets first), deterministic tie-break by
-    name. Cycles are refused — the forge generates trees/DAGs only."""
+    name. Cycles are refused — the forge generates trees/DAGs only.
+
+    A self-link (``Employee -> Employee``, PLAN F-9) is not a cycle between
+    tables: its rows are ordered inside the one table instead, each pointing
+    at an earlier row, so it adds no dependency here."""
     names = sorted(e.name for e in ontology.entities)
     depends_on: Dict[str, set[str]] = {n: set() for n in names}
     for r in ontology.relationships:
-        depends_on[r.from_entity].add(r.to_entity)
+        if r.from_entity != r.to_entity:
+            depends_on[r.from_entity].add(r.to_entity)
 
     ordered: List[str] = []
     placed: set[str] = set()
@@ -491,13 +509,18 @@ def _topological_entity_order(ontology: ForgeOntology) -> List[str]:
     return ordered
 
 
-def plan_schema(ontology: ForgeOntology) -> SchemaPlan:
+def plan_schema(ontology: ForgeOntology, scale: Optional["ForgeScale"] = None) -> SchemaPlan:
     """Lay out the canonical physical schema for ``ontology`` (F-2/F-4).
 
     Refuses cyclic relationship graphs (via :func:`_topological_entity_order`)
     and re-runs :meth:`ForgeOntology.validate_for_forge` so a hand-built
     ontology object gets the same guarantees as one from
     :meth:`ForgeOntology.from_conceptual`.
+
+    ``scale`` (PLAN F-10) matters to the schema in one way only: a relationship
+    it gives a ``nullRate`` gets a nullable foreign-key column. A self-link's
+    column is nullable regardless (its roots have no parent, F-9). With no
+    scale, or one without a rate, the plan is exactly the skeleton's.
     """
     ontology.validate_for_forge()
     order = _topological_entity_order(ontology)
@@ -505,12 +528,14 @@ def plan_schema(ontology: ForgeOntology) -> SchemaPlan:
     fk_by_entity: Dict[str, List[ColumnPlan]] = {e.name: [] for e in ontology.entities}
     edges: List[EdgePlan] = []
     for r in ontology.relationships:
+        null_rate = scale.relationship(r.type).null_rate if scale is not None else 0.0
         fk_column = ColumnPlan(
             name=foreign_key_column(r.to_entity),
             json_type="integer",
             role=ROLE_FOREIGN_KEY,
             references=table_name(r.to_entity),
             references_column=SURROGATE_KEY,
+            optional=r.from_entity == r.to_entity or null_rate > 0,
         )
         fk_by_entity[r.from_entity].append(fk_column)
         edges.append(
@@ -527,6 +552,7 @@ def plan_schema(ontology: ForgeOntology) -> SchemaPlan:
                 # `accounts(id)` in its own header.
                 to_key=fk_column.references_column or SURROGATE_KEY,
                 edge_collection=edge_collection_name(r.from_entity, r.to_entity),
+                optional=fk_column.optional,
             )
         )
 
@@ -546,59 +572,40 @@ def plan_schema(ontology: ForgeOntology) -> SchemaPlan:
     # Edges in the same deterministic order as the tables they hang off.
     table_rank = {t.table: i for i, t in enumerate(tables)}
     edges.sort(key=lambda e: (table_rank[e.from_table], e.fk_column))
-    return SchemaPlan(tables=tuple(tables), edges=tuple(edges))
+    plan = SchemaPlan(tables=tuple(tables), edges=tuple(edges))
+    if scale is not None:
+        scale.check_against(plan)
+    return plan
 
 
 # ── Seeded synthesis: once, dialect-independent (F-5, ADR-0006 D-2/D-5) ──
+#
+# The synthesizer itself lives in :mod:`.synthesis` (it streams, F-11); this
+# wrapper keeps the skeleton's materializing entry point where callers import it.
 
 
-def _synthesize_value(rng: random.Random, json_type: str, prop: str) -> Any:
-    if json_type == "integer":
-        return rng.randrange(0, 100_000)
-    if json_type == "float":
-        return round(rng.uniform(0, 100_000), 6)
-    if json_type == "boolean":
-        return rng.random() < 0.5
-    return f"{prop}-{rng.randrange(0, 100_000):05d}"
-
-
-def synthesize_rows(plan: SchemaPlan, seed: int, rows_per_entity: int) -> Rows:
-    """Fill ``plan`` with ``random.Random(seed)`` end to end.
+def synthesize_rows(
+    plan: SchemaPlan,
+    seed: int,
+    rows_per_entity: int,
+    scale: Optional["ForgeScale"] = None,
+) -> Rows:
+    """Fill ``plan`` with ``random.Random(seed)`` end to end, held in memory.
 
     Rows are produced per table in plan (topological) order, every FK value
-    drawn from the already-synthesized parent ids — join-spine agreement by
-    construction. Keys are the canonical snake_case names from the plan, so
-    the result is byte-identical across dialects for the same
-    ``(ontology, seed, rows_per_entity)``; dialects only *project* it.
+    drawn from the parent's ids — join-spine agreement by construction. Keys
+    are the canonical snake_case names from the plan, so the result is
+    byte-identical across dialects for the same
+    ``(ontology, seed, rows_per_entity, scale)``; dialects only *project* it.
+
+    This collects :func:`r2g.forge.synthesis.stream_rows`, so it holds every
+    row; at volume, consume the stream instead (PLAN F-11).
     """
-    if rows_per_entity < 1:
-        raise ForgeError("rows_per_entity must be >= 1")
-    rng = random.Random(seed)
-    rows: Rows = {}
-    for table in plan.tables:
-        table_rows: List[Dict[str, Any]] = []
-        # The key a row is stamped with, and the parent key each FK draws from,
-        # come from the plan — not the SURROGATE_KEY literal. Hardcoding it made
-        # every dialect's DDL unpopulatable by its own loader for any plan whose
-        # primary key was not named `id`, which is precisely the asymmetry the
-        # parent-key regression test constructs.
-        key_column = table.primary_key.name
-        # Hoisted: this list is invariant across rows, and rebuilding it per row
-        # made synthesis O(k * rows^2) — invisible at 13 rows, fatal at S4's 10^6.
-        fk_parents = [
-            (fk, [r[fk.references_column or SURROGATE_KEY] for r in rows[fk.references]])
-            for fk in table.foreign_keys
-            if fk.references is not None
-        ]
-        for i in range(1, rows_per_entity + 1):
-            row: Dict[str, Any] = {key_column: i}
-            for fk, parent_ids in fk_parents:
-                row[fk.name] = rng.choice(parent_ids)
-            for col in table.properties:
-                assert col.prop is not None
-                row[col.name] = _synthesize_value(rng, col.json_type, col.prop)
-            table_rows.append(row)
-        rows[table.table] = table_rows
+    from .synthesis import stream_rows
+
+    rows: Rows = {t.table: [] for t in plan.tables}
+    for table, row in stream_rows(plan, seed, rows_per_entity, scale):
+        rows[table].append(row)
     return rows
 
 
