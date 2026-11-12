@@ -18,6 +18,7 @@ forward-CSI emitter in :mod:`r2g.csi`.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Tuple
 
 from .types import MappingConfig, Schema, Table
@@ -51,12 +52,96 @@ def _ttl_string(value: str) -> str:
     return f'"{escaped}"'
 
 
+# ClickHouse wrappers that say nothing about the value's type. r2g's ClickHouse
+# connector strips them, but a schema.json written by hand or another tool may
+# not have. Matched after lower-casing.
+_TYPE_WRAPPER_RE = re.compile(r"^(?:nullable|lowcardinality)\((.*)\)$")
+
+# Base type names (lower-cased, parameters removed) whose values are text:
+# PostgreSQL (information_schema and udt names), MySQL, SQL Server, Snowflake
+# (VARCHAR/TEXT/STRING and their synonyms) and ClickHouse (String/FixedString).
+# Emitted as an explicit xsd:string so a missing rr:datatype keeps one meaning,
+# "r2g did not classify this column" (r2g-arango#24).
+_STRING_TYPES = frozenset(
+    {
+        "char",
+        "character",
+        "varchar",
+        "character varying",
+        "bpchar",
+        "text",
+        "string",
+        "fixedstring",
+        "nchar",
+        "nvarchar",
+        "ntext",
+        "tinytext",
+        "mediumtext",
+        "longtext",
+        "national character",
+        "national character varying",
+        "char varying",
+    }
+)
+
+# Fixed-point types whose scale decides integer vs decimal. Their parameters are
+# (precision[, scale]); scale defaults to 0 when only precision is given.
+_FIXED_POINT_TYPES = frozenset({"number", "numeric", "decimal"})
+
+# ClickHouse DecimalN(S): the one parameter is the scale.
+_CH_SCALED_DECIMAL_RE = re.compile(r"^decimal(?:32|64|128|256)$")
+
+
+def _unwrap_type(t: str) -> str:
+    """Strip ``nullable(…)`` / ``lowcardinality(…)``, however nested."""
+    while True:
+        m = _TYPE_WRAPPER_RE.match(t)
+        if not m:
+            return t
+        t = m.group(1).strip()
+
+
+def _split_type(t: str) -> Tuple[str, List[str]]:
+    """``"number(38,0)"`` -> ``("number", ["38", "0"])``; no parameters -> ``[]``."""
+    if "(" not in t or not t.endswith(")"):
+        return t, []
+    base, _, rest = t.partition("(")
+    return base.strip(), [p.strip() for p in rest[:-1].split(",")]
+
+
+def _fixed_point_datatype(scale: Optional[str]) -> str:
+    """``xsd:integer`` at scale 0, ``xsd:decimal`` otherwise or when unknown."""
+    if scale is not None and scale.isdigit() and int(scale) == 0:
+        return "xsd:integer"
+    return "xsd:decimal"
+
+
 def _xsd_datatype(sql_type: str) -> Optional[str]:
-    """Map a SQL type name to an XSD datatype IRI, or None for string-like
-    types (R2RML's natural default is fine there)."""
-    t = sql_type.strip().lower()
+    """Map a SQL type name to an XSD datatype IRI.
+
+    ``None`` means only "r2g does not classify this type" (``uuid``, ``json``,
+    ``bytea``, arrays, …): the emitter then writes no ``rr:datatype``, and a
+    consumer that needs a known type can refuse on its absence. Text columns get
+    an explicit ``xsd:string`` rather than relying on R2RML's natural mapping,
+    so the two cases stay distinguishable (r2g-arango#24).
+    """
+    t = _unwrap_type(sql_type.strip().lower())
+    if t.endswith("[]") or t.startswith("array"):
+        return None
+    base, params = _split_type(t)
+    if base in _STRING_TYPES:
+        return "xsd:string"
+    if base in _FIXED_POINT_TYPES:
+        # NUMBER(p,s) / DECIMAL(p,s): integer only when the type proves scale 0.
+        # A bare NUMBER (Snowflake's DATA_TYPE carries no scale) may hold
+        # fractions, so it is a decimal.
+        if not params:
+            return "xsd:decimal"
+        return _fixed_point_datatype(params[1] if len(params) > 1 else "0")
+    if _CH_SCALED_DECIMAL_RE.match(base):
+        return _fixed_point_datatype(params[0] if params else None)
     if (
-        t in {"int", "int2", "int4", "int8"}
+        base in {"int", "int2", "int4", "int8", "tinyint", "mediumint"}
         or any(k in t for k in ("bigint", "smallint", "integer", "serial"))
         or t.startswith(("int", "uint"))  # ClickHouse Int8/…/256, UInt8/…
     ):
