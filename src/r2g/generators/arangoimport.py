@@ -694,6 +694,7 @@ _PG_TO_ARANGO_DATATYPE = {
     "integer": "number",
     "float": "number",
     "boolean": "boolean",
+    "string": "string",
 }
 
 
@@ -744,6 +745,16 @@ class CsvImportGenerator:
         Nullable columns are also skipped for number/boolean because
         arangoimport cannot coerce an empty CSV value to those types.
 
+        Text columns are typed ``string`` only when NOT NULL. Without a type,
+        arangoimport converts any value that looks like a number, boolean or
+        ``null`` (its ``--convert`` default), so ``00789`` is stored as ``789``.
+        With ``string``, an empty field becomes ``""`` instead of a missing
+        value, so a NULL in a nullable text column would load as empty text.
+        ``--convert`` is one switch for the whole file, and turning it off
+        would load every untyped number column as text. Measured on 3.12.11.
+        No arangoimport setting gets a nullable text column right, so those
+        are left untyped and named by :meth:`nullable_text_columns` instead.
+
         .. warning::
 
            That nullable skip is a partial guard against a silent data-loss
@@ -782,9 +793,46 @@ class CsvImportGenerator:
                 continue
             json_type = pg_type_to_json_type(col.data_type)
             arango_dt = _PG_TO_ARANGO_DATATYPE.get(json_type)
-            if arango_dt and not (col.is_nullable and arango_dt in ("number", "boolean")):
+            if arango_dt and not col.is_nullable:
                 flags.extend(["--datatype", shlex.quote(f"{col.name}={arango_dt}")])
         return flags
+
+    def nullable_text_columns(self) -> tuple[str, ...]:
+        """``table.column`` for every mapped nullable text column.
+
+        arangoimport converts number-, boolean- and ``null``-looking values in
+        these columns (``00789`` becomes ``789``, ``true`` a boolean), and no
+        setting avoids that without turning a NULL into ``""``; see
+        :meth:`_datatype_flags`. Primary-key columns are excluded, since they
+        become ``_key`` and are always typed ``string``.
+        """
+        found: list[str] = []
+        for mapping in self.config.collections.values():
+            if mapping.collection_type != "document":
+                continue
+            table = self.schema.tables.get(mapping.source_table)
+            if table is None:
+                continue
+            for col in table.columns:
+                if (
+                    col.is_nullable
+                    and col.name not in table.primary_key
+                    and pg_type_to_json_type(col.data_type) == "string"
+                ):
+                    found.append(f"{table.name}.{col.name}")
+        return tuple(found)
+
+    def _text_conversion_warnings(self) -> tuple[str, ...]:
+        columns = self.nullable_text_columns()
+        if not columns:
+            return ()
+        return (
+            "arangoimport converts number-, boolean- and null-looking values in "
+            "these nullable text columns (00789 is stored as 789, true as a "
+            "boolean): "
+            + ", ".join(columns)
+            + ". Use JSONL mode where those values must stay exact text.",
+        )
 
     def _fk_is_nullable(self, table_name: str, fk_cols: tuple[str, ...]) -> bool:
         """Whether a NULL is legal in any of an edge's FK columns.
@@ -1108,6 +1156,8 @@ class CsvImportGenerator:
             ),
             "",
         ]
+        for warning in self._text_conversion_warnings():
+            lines.append(f"# WARNING: {warning}")
         lines.extend(["", "# === Document collections ===", ""])
         for spec in documents:
             msg = (
@@ -1181,6 +1231,7 @@ class CsvImportGenerator:
                 password=self.password,
                 secret_safe=secret_safe,
             ),
+            warnings=self._text_conversion_warnings(),
         )
 
     def generate_csv_script(

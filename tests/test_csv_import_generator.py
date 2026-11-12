@@ -413,8 +413,13 @@ class TestGenerateCsvScript:
         path = str(tmp_path / "import.sh")
         content = generator.generate_csv_script(path)
         assert "--type csv" in content
-        cleaned = content.lower().replace("# no intermediate jsonl", "").replace("no jsonl transformation", "")
-        assert "jsonl" not in cleaned
+        # Comments may name JSONL mode (the nullable-text warning points to
+        # it); no command line may use it.
+        commands = "\n".join(
+            line for line in content.lower().splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "jsonl" not in commands
 
 
 class TestSilentRowLossGuard:
@@ -697,7 +702,9 @@ class TestStructuredCsvPreview:
         plan = CsvImportGenerator(
             ecommerce_config, ecommerce_schema
         ).build_plan()
-        assert plan.warnings == ()
+        # The only warning is the nullable-text one, which the fixture's
+        # customers.email and orders.notes always produce.
+        assert all("nullable text columns" in w for w in plan.warnings)
         command = plan.documents[0].command.replace(" \\\n    ", " ")
         assert "--translate name=display_name" in command
 
@@ -804,7 +811,9 @@ class TestCsvDirectRefusesUnfaithfulMappings:
             FieldExpression(target="email"),
         ]
         plan = CsvImportGenerator(ecommerce_config, ecommerce_schema).build_plan()
-        assert plan.warnings == ()
+        # The only warning is the nullable-text one, which the fixture's
+        # customers.email and orders.notes always produce.
+        assert all("nullable text columns" in w for w in plan.warnings)
 
     def test_identity_rename_expression_is_refused(
         self, ecommerce_config, ecommerce_schema
@@ -816,3 +825,48 @@ class TestCsvDirectRefusesUnfaithfulMappings:
         ]
         msg = self._refusal(ecommerce_config, ecommerce_schema)
         assert "customers: field expressions (display_name)" in msg
+
+
+class TestTextColumns:
+    """Text columns: typed when NOT NULL, named when nullable.
+
+    Measured on arangoimport 3.12.11. Untyped, a text value that looks like a
+    number is converted (00789 is stored as 789). Typed ``string``, an empty
+    field becomes "" rather than a missing value, which is right only when the
+    column cannot hold NULL.
+    """
+
+    def test_required_text_columns_are_typed_string(self, generator):
+        # Flatten the backslash-continued commands to one line each.
+        commands = {
+            spec.source_table: " ".join(spec.command.replace("\\\n", " ").split())
+            for spec in generator.build_document_specs()
+        }
+
+        assert "--datatype name=string" in commands["customers"]
+        assert "--datatype name=string" in commands["products"]
+        # Nullable text stays untyped: typed, a NULL would load as "".
+        assert "email=string" not in commands["customers"]
+        assert "notes=string" not in commands["orders"]
+        # The primary key is still typed once, as itself.
+        assert commands["customers"].count("--datatype id=string") == 1
+
+    def test_nullable_text_columns_are_named_in_script_and_plan(self, generator):
+        assert generator.nullable_text_columns() == ("customers.email", "orders.notes")
+
+        plan = generator.build_plan()
+        (warning,) = plan.warnings
+        assert "customers.email, orders.notes" in warning
+        assert "00789 is stored as 789" in warning
+        assert f"# WARNING: {warning}" in plan.script
+
+    def test_no_warning_when_every_text_column_is_required(self, ecommerce_config, ecommerce_schema):
+        for table in ecommerce_schema.tables.values():
+            for col in table.columns:
+                if col.data_type == "text":
+                    col.is_nullable = False
+
+        plan = CsvImportGenerator(ecommerce_config, ecommerce_schema).build_plan()
+
+        assert plan.warnings == ()
+        assert "# WARNING" not in plan.script
