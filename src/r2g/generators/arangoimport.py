@@ -114,9 +114,16 @@ def _guarded(command: str, label: str, *, null_fk_ok: bool = False) -> str:
 
 
 def _bash_env_default(var_name: str, value: str) -> str:
+    """A line that sets ``var_name`` to ``value`` unless the caller set it.
+
+    The default is a plain assignment, where ``shlex.quote`` means what it
+    says. Inside ``"${VAR:-...}"`` bash keeps single quotes as part of the
+    value and still expands ``$``, so a default containing a space, ``!`` or
+    ``$`` used to arrive quoted, or abort the script under ``set -u``.
+    """
     if value == "":
         return f'{var_name}="${{{var_name}:-}}"'
-    return f'{var_name}="${{{var_name}:-{shlex.quote(value)}}}"'
+    return f'[ -n "${{{var_name}:-}}" ] || {var_name}={shlex.quote(value)}'
 
 
 def _collection_mapping_for_ref(
@@ -158,9 +165,8 @@ def _script_environment(
         # client tool resolves from its own environment. A plain assignment is
         # a shell variable only: a password baked into the script would never
         # reach arangoimport, and the import would fail with HTTP 401.
-        "export " + _bash_env_default(
-            "ARANGO_PASSWORD", "" if secret_safe else password
-        ),
+        _bash_env_default("ARANGO_PASSWORD", "" if secret_safe else password),
+        "export ARANGO_PASSWORD",
     ]
 
 
