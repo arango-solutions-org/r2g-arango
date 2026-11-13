@@ -9,6 +9,17 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSV source proposes a primary key only when the column is unique in the whole file (PRD
+  P5b.1.2).** The check read the first 1,000 rows. A value repeated once is only seen there when
+  both copies fall inside those rows, and a missing value only when it does, so a column that was
+  not a key was proposed as one for almost any longer file: one repeated value in a 60,000-row
+  file was caught 0.03% of the time. Every row is now read. **What changes for an existing
+  source:** a table whose `id`-like column repeats or is empty further down has no proposed key on
+  the next snapshot. A file that cannot be read to its end (invalid UTF-8 or an unclosed quote past
+  the first 1,000 rows) now fails the snapshot, naming the table, where it used to pass the
+  snapshot and fail the load. The check adds no time: it replaces the sample read, and the snapshot
+  of a 325 MB file took 1.2 s against 1.5 s before. `CsvConnector` no longer takes `sample_rows`.
+  The error for an unreadable file now says "Failed to read CSV file", not "CSV header".
 - **A CSV source types each column from the whole file, at snapshot and at load (#80, PRD
   P5b.1.2, P6.4).** The snapshot guessed types from the first 1,000 rows of each file and the load
   from the first 100. A value further down that did not fit the guess, such as text in a column of
@@ -22,7 +33,6 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to load as text and is now typed by the values below, so `00789` there loads as `789`, as it
   always has in a column with values in its first rows. Typing takes one pass over the file,
   measured at about 220 MB per second (1.5 s for a 325 MB file), at each snapshot and each load.
-  The primary-key check still reads only the first 1,000 rows.
 - **CSV-direct import scripts keep text columns as text where `arangoimport` allows it
   (PRD P1.7).** Text columns had no `--datatype`, so `arangoimport` converted any value that
   looked like a number or boolean: a ZIP code `00789` was stored as the number `789`, with no

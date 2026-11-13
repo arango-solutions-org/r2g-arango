@@ -424,23 +424,6 @@ class TestCsvTypesComeFromTheWholeFile:
         table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
         assert {c.name: c.data_type for c in table.columns}["CODE"] == "double precision"
 
-    def test_a_small_sample_still_types_from_the_whole_file(self, tmp_path):
-        _late_text_file(tmp_path, 40, total=50)
-        table = CsvConnector(str(tmp_path), sample_rows=10).get_schema().tables["events"]
-        assert {c.name: c.data_type for c in table.columns}["CODE"] == "text"
-        assert table.primary_key == ["ID"]
-
-    def test_the_key_check_reads_the_sample_only(self, tmp_path):
-        # ID repeats at row 30, outside a 10-row sample: still proposed as the key.
-        lines = ["ID,CODE"] + [f"{1 if i == 30 else i},{i}" for i in range(1, 51)]
-        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        assert CsvConnector(str(tmp_path), sample_rows=10).get_schema().tables[
-            "events"
-        ].primary_key == ["ID"]
-        assert CsvConnector(str(tmp_path), sample_rows=40).get_schema().tables[
-            "events"
-        ].primary_key == []
-
     @pytest.mark.parametrize("text_row", [150, 1200, 2900])
     def test_the_load_reads_every_row_whatever_the_first_rows_look_like(
         self, tmp_path, text_row
@@ -506,3 +489,64 @@ class TestCsvTypesComeFromTheWholeFile:
             ("column_2", "text"),
             ("column_3", "double precision"),
         ]
+
+
+def _keyed_file(directory: Path, bad_row: int | None, bad_id: str, total: int = 3000) -> None:
+    """``events.csv`` whose ID column is 1..total, except ``bad_id`` at ``bad_row``."""
+    lines = ["ID,CODE"]
+    for i in range(1, total + 1):
+        lines.append(f"{bad_id if i == bad_row else i},{i % 97}")
+    (directory / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestCsvKeyCheckReadsTheWholeFile:
+    """A column is proposed as the key only when it is unique and non-null in every row.
+
+    The check used to read the first 1,000 rows. A value repeated once is seen in
+    a sample only when both copies fall inside it, so a non-unique column was
+    proposed as the key for almost any file longer than the sample.
+    """
+
+    def test_a_unique_column_is_the_key(self, tmp_path):
+        _keyed_file(tmp_path, None, "")
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert table.primary_key == ["ID"]
+        assert [c.is_primary_key for c in table.columns] == [True, False]
+        assert [c.is_nullable for c in table.columns] == [False, True]
+
+    @pytest.mark.parametrize("bad_row", [2, 999, 1001, 1500, 3000])
+    def test_one_repeated_value_anywhere_means_no_key(self, tmp_path, bad_row):
+        _keyed_file(tmp_path, bad_row, "1")
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert table.primary_key == []
+        assert not any(c.is_primary_key for c in table.columns)
+
+    @pytest.mark.parametrize("bad_row", [2, 1001, 3000])
+    def test_one_missing_value_anywhere_means_no_key(self, tmp_path, bad_row):
+        _keyed_file(tmp_path, bad_row, "")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == []
+
+    def test_a_null_marker_counts_as_missing(self, tmp_path):
+        _keyed_file(tmp_path, 2500, "\\N")
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert table.primary_key == []
+        assert {c.name: c.data_type for c in table.columns}["ID"] == "integer"
+
+    def test_the_next_candidate_is_tried_when_the_first_repeats(self, tmp_path):
+        lines = ["id,event_id"] + [f"{1 if i == 2000 else i},{i}" for i in range(1, 3001)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == ["event_id"]
+
+    def test_a_headerless_file_has_no_named_key(self, tmp_path):
+        (tmp_path / "events.csv").write_text("1,a\n2,b\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path), has_header=False).get_schema().tables[
+            "events"
+        ].primary_key == []
+
+    def test_a_file_that_cannot_be_read_to_the_end_is_an_error(self, tmp_path):
+        body = b"ID,NAME\n" + b"".join(
+            b"%d,caf\xe9\n" % i if i == 2000 else b"%d,n\n" % i for i in range(1, 3001)
+        )
+        (tmp_path / "events.csv").write_bytes(body)
+        with pytest.raises(RuntimeError, match="Failed to read CSV file for 'events'"):
+            CsvConnector(str(tmp_path)).get_schema()

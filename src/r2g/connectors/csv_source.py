@@ -13,8 +13,7 @@ CSV has no notion of primary or foreign keys. We apply a small,
 documented heuristic so auto-mapping produces a usable ``_key``: the
 first of ``id`` / ``{table}_id`` / ``{singular(table)}_id`` /
 ``{table}id`` / ``{singular(table)}id`` (case-insensitive) that exists
-and is **unique and non-null in the read sample** (the first
-``sample_rows`` rows) is treated as the
+and is **unique and non-null across the whole file** is treated as the
 primary key (e.g. ``customers.csv`` keyed on ``customer_id``). When the
 file has no data rows we fall back to a name-only match so introspection
 still proposes a key. Relationships can be recovered afterwards with FK
@@ -155,14 +154,12 @@ class CsvConnector:
         schema_name: str = "public",
         delimiter: str = ",",
         has_header: bool = True,
-        sample_rows: int = 1000,
         null_values: Sequence[str] = DEFAULT_NULL_VALUES,
     ) -> None:
         self.connection_string = connection_string
         self.schema_name = schema_name
         self.delimiter = delimiter
         self.has_header = has_header
-        self.sample_rows = sample_rows
         self.null_values = tuple(null_values)
         self.directory = resolve_source_directory(connection_string)
 
@@ -212,25 +209,15 @@ class CsvConnector:
             file_schema = pl.scan_csv(
                 str(path), infer_schema_length=None, **read_options
             ).collect_schema()
-            # The key check still reads a bounded sample. It is read with the
-            # file's types: Polars parses a little past ``n_rows``, and types
-            # guessed from the sample alone fail on a later value that does
-            # not fit them.
-            frame = pl.read_csv(
-                str(path),
-                n_rows=self.sample_rows,
-                schema_overrides=dict(file_schema),
-                **read_options,
-            )
+            pk = self._detect_primary_key(table_name, path, file_schema, read_options)
         except Exception as e:  # noqa: BLE001
             logger.error("csv_introspect_failed", path=str(path), error=str(e))
-            raise RuntimeError(f"Failed to read CSV header for '{table_name}': {e}")
+            raise RuntimeError(f"Failed to read CSV file for '{table_name}': {e}")
 
-        pk = self._detect_primary_key(table_name, frame)
         pk_set = set(pk)
 
         columns: list[Column] = []
-        for col_name, dtype in zip(frame.columns, frame.dtypes):
+        for col_name, dtype in zip(file_schema.names(), file_schema.dtypes()):
             is_pk = col_name in pk_set
             columns.append(
                 Column(
@@ -244,45 +231,61 @@ class CsvConnector:
         return Table(name=table_name, columns=columns, primary_key=pk, foreign_keys=[])
 
     @staticmethod
-    def _is_unique_key(frame: "pl.DataFrame", col: str) -> bool:
-        """True when ``col`` is non-null and fully distinct in the sample."""
-        series = frame.get_column(col)
-        n = series.len()
-        if n == 0:
-            return False
-        return series.null_count() == 0 and series.n_unique() == n
-
-    def _detect_primary_key(self, table_name: str, frame: "pl.DataFrame") -> list[str]:
-        """Pick a single-column primary key by name + sample uniqueness.
-
-        Candidate names are tried in priority order; the first that maps
-        to a real column wins. With data rows present the winner must be
-        unique and non-null in the sample, so we never invent a key from
-        a non-unique column. With no data rows we accept the first
-        name match (legacy behaviour) so a fresh / empty export still
-        gets a proposed key.
-        """
+    def _key_candidates(table_name: str, columns: Sequence[str]) -> list[str]:
+        """Columns whose name marks them as the table's key, in priority order."""
         by_lower: dict[str, str] = {}
-        for c in frame.columns:
+        for c in columns:
             by_lower.setdefault(c.lower(), c)
 
         t = table_name.lower()
         singular = singularize(t)
-        candidate_names: list[str] = []
+        candidates: list[str] = []
         for cand in ("id", f"{t}_id", f"{singular}_id", f"{t}id", f"{singular}id"):
             real = by_lower.get(cand)
-            if real and real not in candidate_names:
-                candidate_names.append(real)
+            if real and real not in candidates:
+                candidates.append(real)
+        return candidates
 
-        if not candidate_names:
+    def _detect_primary_key(
+        self,
+        table_name: str,
+        path: Path,
+        file_schema: "pl.Schema",
+        read_options: dict[str, Any],
+    ) -> list[str]:
+        """Pick a single-column primary key by name + uniqueness in the file.
+
+        Candidate names are tried in priority order; the first that maps
+        to a real column wins. With data rows present the winner must be
+        unique and non-null across every row of the file, so we never
+        invent a key from a non-unique column. The first rows alone cannot
+        show that: a value repeated once is seen only when both copies
+        fall inside the sample. With no data rows we accept the first
+        name match (legacy behaviour) so a fresh / empty export still
+        gets a proposed key.
+        """
+        candidates = self._key_candidates(table_name, file_schema.names())
+        if not candidates:
             return []
 
-        has_rows = frame.height > 0
-        if not has_rows:
-            return [candidate_names[0]]
+        # One pass over the file, parsing only the candidate columns.
+        measures = [pl.len().alias("rows")]
+        for i, col in enumerate(candidates):
+            measures.append(pl.col(col).null_count().alias(f"nulls_{i}"))
+            measures.append(pl.col(col).n_unique().alias(f"distinct_{i}"))
+        stats = (
+            pl.scan_csv(str(path), schema=file_schema, **read_options)
+            .select(measures)
+            .collect()
+            .row(0, named=True)
+        )
 
-        for col in candidate_names:
-            if self._is_unique_key(frame, col):
+        rows = stats["rows"]
+        if rows == 0:
+            return [candidates[0]]
+
+        for i, col in enumerate(candidates):
+            if stats[f"nulls_{i}"] == 0 and stats[f"distinct_{i}"] == rows:
                 return [col]
         return []
 
