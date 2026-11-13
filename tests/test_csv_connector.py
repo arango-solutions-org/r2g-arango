@@ -390,3 +390,119 @@ class TestCsvNullMarker:
         assert conn.null_values == ()
         with pytest.raises(ValueError, match="null_values"):
             create_source_connector("csv", str(tmp_path), source_params={"null_values": 0})
+
+
+def _late_text_file(directory: Path, text_row: int, value: str = "ABC", total: int = 3000) -> None:
+    """A table whose CODE column holds whole numbers except one value at ``text_row``."""
+    lines = ["ID,CODE,NAME"]
+    for i in range(1, total + 1):
+        lines.append(f"{i},{value if i == text_row else i % 97},name{i}")
+    (directory / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestCsvTypesComeFromTheWholeFile:
+    """A value anywhere in the file decides its column's type, and never fails a read.
+
+    The snapshot used to type a column from its first 1,000 rows. Polars parses a
+    little past ``n_rows`` with the types it guessed, so text just after row 1,000
+    in a column of whole numbers failed the snapshot; further down it was missed
+    and the column was recorded as a number. The load guessed from 100 rows and
+    failed on any later text.
+    """
+
+    @pytest.mark.parametrize("value", ["ABC", "N/A"])
+    @pytest.mark.parametrize("text_row", [150, 1000, 1001, 1200, 2000, 2900])
+    def test_one_text_value_anywhere_makes_the_column_text(self, tmp_path, text_row, value):
+        _late_text_file(tmp_path, text_row, value)
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        types = {c.name: c.data_type for c in table.columns}
+        assert types == {"ID": "integer", "CODE": "text", "NAME": "text"}
+        assert table.primary_key == ["ID"]
+
+    def test_one_decimal_anywhere_makes_the_column_floating_point(self, tmp_path):
+        _late_text_file(tmp_path, 2900, "12.5")
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert {c.name: c.data_type for c in table.columns}["CODE"] == "double precision"
+
+    def test_a_small_sample_still_types_from_the_whole_file(self, tmp_path):
+        _late_text_file(tmp_path, 40, total=50)
+        table = CsvConnector(str(tmp_path), sample_rows=10).get_schema().tables["events"]
+        assert {c.name: c.data_type for c in table.columns}["CODE"] == "text"
+        assert table.primary_key == ["ID"]
+
+    def test_the_key_check_reads_the_sample_only(self, tmp_path):
+        # ID repeats at row 30, outside a 10-row sample: still proposed as the key.
+        lines = ["ID,CODE"] + [f"{1 if i == 30 else i},{i}" for i in range(1, 51)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path), sample_rows=10).get_schema().tables[
+            "events"
+        ].primary_key == ["ID"]
+        assert CsvConnector(str(tmp_path), sample_rows=40).get_schema().tables[
+            "events"
+        ].primary_key == []
+
+    @pytest.mark.parametrize("text_row", [150, 1200, 2900])
+    def test_the_load_reads_every_row_whatever_the_first_rows_look_like(
+        self, tmp_path, text_row
+    ):
+        _late_text_file(tmp_path, text_row)
+        with CsvConnector(str(tmp_path)).open_session() as sess:
+            rows = list(sess.stream_rows("events"))
+        assert len(rows) == 3000
+        assert rows[text_row - 1]["CODE"] == "ABC"
+        # One text value makes the column text in the file as a whole.
+        assert rows[0]["CODE"] == "1"
+        assert rows[0]["ID"] == 1
+
+    @pytest.mark.parametrize("value", ["ABC", "12.5", ""])
+    @pytest.mark.parametrize("text_row", [150, 1200, 2900])
+    def test_the_snapshot_types_a_column_as_the_load_reads_it(self, tmp_path, text_row, value):
+        from r2g.connectors.csv_source import _polars_dtype_to_type
+
+        _late_text_file(tmp_path, text_row, value)
+        conn = CsvConnector(str(tmp_path))
+        table = conn.get_schema().tables["events"]
+        with conn.open_session() as sess:
+            loaded = sess._reader("events").read_dataframe()
+        assert [c.data_type for c in table.columns] == [
+            _polars_dtype_to_type(d) for d in loaded.dtypes
+        ]
+
+    def test_a_column_empty_at_the_top_is_typed_by_the_values_below(self, tmp_path):
+        lines = ["id,qty"] + [f"{i},{'' if i <= 150 else i}" for i in range(1, 301)]
+        (tmp_path / "t.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        conn = CsvConnector(str(tmp_path))
+        assert [c.data_type for c in conn.get_schema().tables["t"].columns] == [
+            "integer",
+            "integer",
+        ]
+        with conn.open_session() as sess:
+            rows = list(sess.stream_rows("t"))
+        assert rows[0]["qty"] is None and rows[150]["qty"] == 151
+
+    def test_types_are_what_polars_infers_for_the_same_file(self, tmp_path):
+        body = (
+            "id,name,qty,price,active,seen_at,note,zip\n"
+            '1,Alice,3,12.50,true,2026-01-02T03:04:05,"",00789\n'
+            "2,Bob,,0.00,false,2026-02-03T04:05:06,x,10001\n"
+            "3,\\N,7,\\N,true,\\N,y,\\N\n"
+        )
+        (tmp_path / "t.csv").write_text(body, encoding="utf-8")
+        direct = pl.read_csv(
+            str(tmp_path / "t.csv"), infer_schema_length=None, null_values=["\\N"]
+        )
+        table = CsvConnector(str(tmp_path)).get_schema().tables["t"]
+        from r2g.connectors.csv_source import _polars_dtype_to_type
+
+        assert [c.data_type for c in table.columns] == [
+            _polars_dtype_to_type(d) for d in direct.dtypes
+        ]
+
+    def test_a_headerless_tab_separated_file_is_typed_too(self, tmp_path):
+        (tmp_path / "t.tsv").write_text("1\ta,b\t2.5\n2\tc\t3.5\n", encoding="utf-8")
+        table = CsvConnector(str(tmp_path), delimiter="\t", has_header=False).get_schema().tables["t"]
+        assert [(c.name, c.data_type) for c in table.columns] == [
+            ("column_1", "integer"),
+            ("column_2", "text"),
+            ("column_3", "double precision"),
+        ]

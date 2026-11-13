@@ -9,6 +9,20 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSV source types each column from the whole file, at snapshot and at load (#80, PRD
+  P5b.1.2, P6.4).** The snapshot guessed types from the first 1,000 rows of each file and the load
+  from the first 100. A value further down that did not fit the guess, such as text in a column of
+  whole numbers, stopped the read with `could not parse ... as dtype i64`: the snapshot when the
+  value came shortly after row 1,000, the load when it came anywhere after row 100. Further down
+  still, the snapshot missed it and recorded a number. Both now read every row to decide a type,
+  so they agree with each other and neither fails on such a value. A sample cannot do this job:
+  one exceptional value in a 60,000-row file falls outside a 1,000-row sample 98% of the time.
+  **What changes for an existing source:** a column's type can differ on the next snapshot (a
+  number column with one text value becomes text). A column that is empty for its first 100 rows
+  used to load as text and is now typed by the values below, so `00789` there loads as `789`, as it
+  always has in a column with values in its first rows. Typing takes one pass over the file,
+  measured at about 220 MB per second (1.5 s for a 325 MB file), at each snapshot and each load.
+  The primary-key check still reads only the first 1,000 rows.
 - **CSV-direct import scripts keep text columns as text where `arangoimport` allows it
   (PRD P1.7).** Text columns had no `--datatype`, so `arangoimport` converted any value that
   looked like a number or boolean: a ZIP code `00789` was stored as the number `789`, with no
