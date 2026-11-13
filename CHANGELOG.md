@@ -9,6 +9,15 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSV source no longer fails on a value its type guess did not expect (PRD P5b.1.2, P6.4).**
+  Column types are guessed from the first 1,000 rows of each file. Introspection read a little
+  past those rows, so a text value shortly after row 1,000 in a column of whole numbers stopped
+  the snapshot with `could not parse ... as dtype i64`, although that row was never sampled. The
+  load was stricter still: it guessed from the first 100 rows and stopped on any later value that
+  did not fit. The snapshot now types a column from the sampled rows and nothing else, and the
+  load (`r2g stream`, Studio Load, and the dump-file commands) types it from the whole file, so
+  such a column loads as text. Known limit: when the only non-numeric values lie beyond the first
+  1,000 rows, the snapshot still records the column as a number while its values load as text.
 - **CSV-direct import scripts keep text columns as text where `arangoimport` allows it
   (PRD P1.7).** Text columns had no `--datatype`, so `arangoimport` converted any value that
   looked like a number or boolean: a ZIP code `00789` was stored as the number `789`, with no

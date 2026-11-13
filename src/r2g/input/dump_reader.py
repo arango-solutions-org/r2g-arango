@@ -29,7 +29,14 @@ class DumpReader:
         return str(self.file_path)
 
     def _polars_csv_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"separator": self.delimiter, "has_header": self.has_header}
+        kwargs: dict[str, Any] = {
+            "separator": self.delimiter,
+            "has_header": self.has_header,
+            # Type each column from the whole file. Polars' default looks at
+            # the first 100 rows only and then fails on a later value that
+            # does not fit (text in a column that began with whole numbers).
+            "infer_schema_length": None,
+        }
         if self.null_values:
             kwargs["null_values"] = list(self.null_values)
         return kwargs

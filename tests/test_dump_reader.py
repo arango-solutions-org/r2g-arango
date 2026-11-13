@@ -96,3 +96,33 @@ class TestFileNotFound:
         reader = DumpReader(str(tmp_path / "nope.csv"))
         with pytest.raises(FileNotFoundError):
             list(reader.read_chunks(chunk_size=2))
+
+
+class TestTypesComeFromTheWholeFile:
+    """Polars' default types a column from its first 100 rows and then fails on a
+    later value that does not fit; the reader types from every row instead."""
+
+    @pytest.fixture
+    def late_text(self, tmp_path):
+        lines = ["id,code"] + [f"{i},{'ABC' if i == 150 else i}" for i in range(1, 301)]
+        path = tmp_path / "late.csv"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return str(path)
+
+    def test_read_dataframe(self, late_text):
+        df = DumpReader(late_text).read_dataframe()
+        assert df.height == 300
+        assert df.schema["id"] == pl.Int64
+        assert df["code"][149] == "ABC"
+
+    def test_read_rows(self, late_text):
+        rows = list(DumpReader(late_text).read_rows())
+        assert rows[149] == {"id": 150, "code": "ABC"}
+
+    def test_read_chunks(self, late_text):
+        chunks = list(DumpReader(late_text).read_chunks(chunk_size=100))
+        assert sum(c.height for c in chunks) == 300
+        assert "ABC" in pl.concat(chunks)["code"].to_list()
+
+    def test_row_count(self, late_text):
+        assert DumpReader(late_text).row_count() == 300

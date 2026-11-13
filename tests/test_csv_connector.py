@@ -390,3 +390,82 @@ class TestCsvNullMarker:
         assert conn.null_values == ()
         with pytest.raises(ValueError, match="null_values"):
             create_source_connector("csv", str(tmp_path), source_params={"null_values": 0})
+
+
+def _late_text_file(directory: Path, text_row: int, value: str = "ABC", total: int = 3000) -> None:
+    """A table whose CODE column holds whole numbers except one value at ``text_row``."""
+    lines = ["ID,CODE,NAME"]
+    for i in range(1, total + 1):
+        lines.append(f"{i},{value if i == text_row else i % 97},name{i}")
+    (directory / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestCsvTypesComeFromTheSampleOnly:
+    """A value beyond the sampled rows must not fail introspection or the load.
+
+    Polars parses a little past ``n_rows`` with the types it guessed from the
+    sample, so text just after row 1,000 in a column of whole numbers failed the
+    snapshot; the load guessed from 100 rows and failed on any later text.
+    """
+
+    @pytest.mark.parametrize("value", ["ABC", "N/A", "12.5"])
+    @pytest.mark.parametrize("text_row", [1001, 1200, 2000])
+    def test_a_value_just_past_the_sample_does_not_fail_the_snapshot(
+        self, tmp_path, text_row, value
+    ):
+        _late_text_file(tmp_path, text_row, value)
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        types = {c.name: c.data_type for c in table.columns}
+        # The sample holds whole numbers only, so that is the type it gives.
+        assert types == {"ID": "integer", "CODE": "integer", "NAME": "text"}
+        assert table.primary_key == ["ID"]
+
+    def test_a_value_inside_the_sample_still_decides_the_type(self, tmp_path):
+        _late_text_file(tmp_path, 1000)
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert {c.name: c.data_type for c in table.columns}["CODE"] == "text"
+
+    def test_the_sample_size_bounds_what_is_read(self, tmp_path):
+        _late_text_file(tmp_path, 11, total=50)
+        table = CsvConnector(str(tmp_path), sample_rows=10).get_schema().tables["events"]
+        assert {c.name: c.data_type for c in table.columns}["CODE"] == "integer"
+
+    @pytest.mark.parametrize("text_row", [150, 1200, 2900])
+    def test_the_load_reads_every_row_whatever_the_first_rows_look_like(
+        self, tmp_path, text_row
+    ):
+        _late_text_file(tmp_path, text_row)
+        with CsvConnector(str(tmp_path)).open_session() as sess:
+            rows = list(sess.stream_rows("events"))
+        assert len(rows) == 3000
+        assert rows[text_row - 1]["CODE"] == "ABC"
+        # One text value makes the column text in the file as a whole.
+        assert rows[0]["CODE"] == "1"
+        assert rows[0]["ID"] == 1
+
+    def test_sample_types_are_what_polars_infers_for_the_same_rows(self, tmp_path):
+        body = (
+            "id,name,qty,price,active,seen_at,note,zip\n"
+            '1,Alice,3,12.50,true,2026-01-02T03:04:05,"",00789\n'
+            "2,Bob,,0.00,false,2026-02-03T04:05:06,x,10001\n"
+            "3,\\N,7,\\N,true,\\N,y,\\N\n"
+        )
+        (tmp_path / "t.csv").write_text(body, encoding="utf-8")
+        direct = pl.read_csv(
+            str(tmp_path / "t.csv"), infer_schema_length=None, null_values=["\\N"]
+        )
+        table = CsvConnector(str(tmp_path)).get_schema().tables["t"]
+        from r2g.connectors.csv_source import _polars_dtype_to_type
+
+        assert [c.data_type for c in table.columns] == [
+            _polars_dtype_to_type(d) for d in direct.dtypes
+        ]
+
+    def test_a_headerless_tab_separated_sample_is_typed_too(self, tmp_path):
+        (tmp_path / "t.tsv").write_text("1\ta,b\t2.5\n2\tc\t3.5\n", encoding="utf-8")
+        table = CsvConnector(str(tmp_path), delimiter="\t", has_header=False).get_schema().tables["t"]
+        assert [(c.name, c.data_type) for c in table.columns] == [
+            ("column_1", "integer"),
+            ("column_2", "text"),
+            ("column_3", "double precision"),
+        ]
