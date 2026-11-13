@@ -9,6 +9,18 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A CSV column of whole numbers too large for a 64-bit integer loads as text, as the snapshot
+  types it (PRD P5b.1.2, P6.4).** The snapshot called such a column text, but the load read it as
+  numbers. ArangoDB stores a number above the 64-bit integer range as a double, so
+  `10000000000000000001` was stored as `1e+19` and every value in a column of 20-digit identifiers
+  lost its low digits. A value of 40 digits or more failed both the snapshot and the load. The
+  load now reads the column as text, exactly as written in the file, leading zeros included.
+  **What changes for an existing source:** the values of such a column load as strings, not
+  numbers, and `--since` on such a column compares as text. A column whose values all fit a
+  64-bit integer is unchanged.
+- **A CSV text column holding an empty value is not proposed as the primary key (PRD P5b.1.2).**
+  A quoted `""` is a value, not a missing one, so the column passed the unique and non-null check,
+  but an empty value cannot be a document key. The next `id`-like column is tried.
 - **A CSV source proposes a primary key only when the column is unique in the whole file (PRD
   P5b.1.2).** The check read the first 1,000 rows. A value repeated once is only seen there when
   both copies fall inside those rows, and a missing value only when it does, so a column that was

@@ -581,3 +581,58 @@ class TestCsvKeyCheckReadsTheWholeFile:
         assert DumpReader(str(path)).read_dataframe().height == 3000
         table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
         assert table.primary_key == (["ID"] if header.startswith("ID") else [])
+
+
+class TestCsvWholeNumbersTooLargeFor64Bits:
+    """The snapshot types such a column as text and the load reads it as text."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [str(2**63), "10000000000000000001", "1" + "0" * 39],
+        ids=["just-past-int64", "20-digits", "40-digits"],
+    )
+    @pytest.mark.parametrize("has_header", [True, False], ids=["header", "headerless"])
+    def test_snapshot_and_load_agree(self, tmp_path, value, has_header):
+        body = "".join(f"{value if i == 2000 else i},{i % 97}\n" for i in range(1, 3001))
+        (tmp_path / "events.csv").write_text(
+            ("ID,CODE\n" if has_header else "") + body, encoding="utf-8"
+        )
+        connector = CsvConnector(str(tmp_path), has_header=has_header)
+        table = connector.get_schema().tables["events"]
+        assert [c.data_type for c in table.columns] == ["text", "integer"]
+        with connector.open_session() as session:
+            rows = list(session.stream_rows("events"))
+        first, wide = list(rows[0].values()), list(rows[1999].values())
+        assert first == ["1", 1]
+        assert wide[0] == value
+
+    def test_a_unique_wide_column_is_the_key_on_its_text(self, tmp_path):
+        lines = ["ID,CODE"] + [f"{10**19 + i},{i}" for i in range(1, 3001)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == ["ID"]
+
+    def test_a_repeated_wide_value_means_no_key(self, tmp_path):
+        lines = ["ID,CODE"] + [f"{10**19 + (1 if i == 2000 else i)},{i}" for i in range(1, 3001)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == []
+
+
+class TestCsvAnEmptyTextValueIsNotAKey:
+    """A quoted ``""`` is a value, not a null, but it cannot be a document key."""
+
+    def test_one_empty_value_means_no_key(self, tmp_path):
+        lines = ["ID,CODE"] + [('"",x' if i == 2000 else f"k{i},x") for i in range(1, 3001)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == []
+
+    def test_the_next_candidate_is_tried(self, tmp_path):
+        lines = ["id,event_id"] + [
+            ('"",e2000' if i == 2000 else f"k{i},e{i}") for i in range(1, 3001)
+        ]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == ["event_id"]
+
+    def test_text_keys_without_an_empty_value_are_unaffected(self, tmp_path):
+        lines = ["ID,CODE"] + [f"k{i},x" for i in range(1, 3001)]
+        (tmp_path / "events.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert CsvConnector(str(tmp_path)).get_schema().tables["events"].primary_key == ["ID"]

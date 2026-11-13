@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterator, Optional, Sequence
+from typing import Any, Dict, Generator, Iterator, Mapping, Optional, Sequence
 
 import polars as pl
 
 from r2g.log import get_logger
 
 logger = get_logger(__name__)
+
+# Integer types wider than 64 bits. Polars infers one for a column of whole
+# numbers when a value does not fit a 64-bit integer. Absent from old Polars,
+# which fails on such a value instead.
+_WIDE_INTEGER_TYPES = tuple(
+    t for t in (getattr(pl, "Int128", None), getattr(pl, "UInt128", None)) if t is not None
+)
+
+
+def wide_integer_columns(schema: Mapping[str, Any]) -> list[str]:
+    """Columns of whole numbers too large for a 64-bit integer.
+
+    r2g reads these as text. ArangoDB stores a number above the 64-bit range
+    as a double, so its low digits are lost (``10000000000000000001`` comes
+    back as ``1e+19``), and such a column usually holds identifiers. Read as
+    a number, a value past 128 bits also fails to parse at all.
+    """
+    return [name for name, dtype in schema.items() if dtype in _WIDE_INTEGER_TYPES]
+
+
+def text_overrides(columns: Sequence[str]) -> dict[str, Any]:
+    """``schema_overrides`` that read ``columns`` as text, as written in the file."""
+    return {name: pl.String for name in columns}
 
 
 class DumpReader:
@@ -45,8 +68,21 @@ class DumpReader:
     def read_dataframe(self) -> pl.DataFrame:
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dump file not found: {self.file_path}")
+        path, kwargs = self._csv_path(), self._polars_csv_kwargs()
         try:
-            return pl.read_csv(self._csv_path(), **self._polars_csv_kwargs())
+            try:
+                frame = pl.read_csv(path, **kwargs)
+                wide = wide_integer_columns(frame.schema)
+            except pl.exceptions.ComputeError:
+                # A whole number past 128 bits does not parse as the integer
+                # Polars inferred for its column. Any other failure is real.
+                wide = wide_integer_columns(pl.scan_csv(path, **kwargs).collect_schema())
+                if not wide:
+                    raise
+            if wide:
+                # Rare, so the second read is paid only by a file that needs it.
+                frame = pl.read_csv(path, schema_overrides=text_overrides(wide), **kwargs)
+            return frame
         except Exception as e:
             logger.error("error_reading_dump", path=str(self.file_path), error=str(e))
             raise
@@ -67,7 +103,11 @@ class DumpReader:
         if not self.file_path.exists():
             raise FileNotFoundError(f"Dump file not found: {self.file_path}")
         try:
-            lf = pl.scan_csv(self._csv_path(), **self._polars_csv_kwargs())
+            path, kwargs = self._csv_path(), self._polars_csv_kwargs()
+            lf = pl.scan_csv(path, **kwargs)
+            wide = wide_integer_columns(lf.collect_schema())
+            if wide:
+                lf = pl.scan_csv(path, schema_overrides=text_overrides(wide), **kwargs)
             yield from lf.collect_batches(chunk_size=chunk_size)
         except Exception as e:
             logger.error("error_reading_chunks", path=str(self.file_path), error=str(e))
