@@ -35,7 +35,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 import polars as pl
 
-from r2g.input.dump_reader import DumpReader
+from r2g.input.dump_reader import DumpReader, text_overrides, wide_integer_columns
 from r2g.log import get_logger
 from r2g.naming import singularize
 from r2g.types import Column, Schema, Table
@@ -208,6 +208,19 @@ class CsvConnector:
             # the two disagree.
             lazy = pl.scan_csv(str(path), infer_schema_length=None, **read_options)
             file_schema = lazy.collect_schema()
+            # Whole numbers too large for a 64-bit integer are text, here and
+            # at load: see ``wide_integer_columns``.
+            wide = wide_integer_columns(file_schema)
+            if wide:
+                file_schema = pl.Schema(
+                    {n: pl.String if n in wide else t for n, t in file_schema.items()}
+                )
+                lazy = pl.scan_csv(
+                    str(path),
+                    infer_schema_length=None,
+                    schema_overrides=text_overrides(wide),
+                    **read_options,
+                )
             if self.has_header:
                 # Read with the types just inferred rather than infer them a
                 # second time, which more than doubles the snapshot. Without
@@ -261,7 +274,7 @@ class CsvConnector:
 
         Candidate names are tried in priority order; the first that maps
         to a real column wins. With data rows present the winner must be
-        unique and non-null across every row of the file, so we never
+        unique, non-null and non-empty across every row of the file, so we never
         invent a key from a non-unique column. The first rows alone cannot
         show that: a value repeated once is seen only when both copies
         fall inside the sample. With no data rows we accept the first
@@ -281,6 +294,10 @@ class CsvConnector:
         measures = [pl.len().alias("rows"), pl.all().null_count().name.prefix("nulls:")]
         for i, col in enumerate(candidates):
             measures.append(pl.col(col).n_unique().alias(f"distinct:{i}"))
+            if file_schema[col] == pl.String:
+                # A quoted ``""`` is a value, not a null, but it cannot be a
+                # document key.
+                measures.append((pl.col(col) == "").sum().alias(f"empty:{i}"))
         stats = lazy.select(measures).collect(engine="streaming").row(0, named=True)
 
         if not candidates:
@@ -290,7 +307,11 @@ class CsvConnector:
             return [candidates[0]]
 
         for i, col in enumerate(candidates):
-            if stats[f"nulls:{col}"] == 0 and stats[f"distinct:{i}"] == rows:
+            if (
+                stats[f"nulls:{col}"] == 0
+                and stats[f"distinct:{i}"] == rows
+                and not stats.get(f"empty:{i}")
+            ):
                 return [col]
         return []
 

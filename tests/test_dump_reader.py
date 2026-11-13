@@ -126,3 +126,58 @@ class TestTypesComeFromTheWholeFile:
 
     def test_row_count(self, late_text):
         assert DumpReader(late_text).row_count() == 300
+
+
+class TestWholeNumbersTooLargeFor64BitsAreText:
+    """ArangoDB stores a number above the 64-bit integer range as a double and
+    loses its low digits, so a column holding one is read as text, as written."""
+
+    @staticmethod
+    def _file(tmp_path, value, header="id,code\n"):
+        lines = [f"{i},{value if i == 150 else i}" for i in range(1, 301)]
+        path = tmp_path / "wide.csv"
+        path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
+        return str(path)
+
+    @pytest.mark.parametrize(
+        "value",
+        [str(2**63), "10000000000000000001", "-10000000000000000001", "1" + "0" * 39],
+        ids=["just-past-int64", "20-digits", "negative", "40-digits"],
+    )
+    def test_the_column_is_text_and_keeps_every_digit(self, tmp_path, value):
+        df = DumpReader(self._file(tmp_path, value)).read_dataframe()
+        assert df.schema["code"] == pl.String
+        assert df["code"][149] == value
+        assert df["code"][0] == "1"
+        assert df.schema["id"] == pl.Int64
+
+    def test_leading_zeros_are_kept(self, tmp_path):
+        df = DumpReader(self._file(tmp_path, "00010000000000000000001")).read_dataframe()
+        assert df["code"][149] == "00010000000000000000001"
+
+    def test_the_largest_64_bit_integer_is_still_a_number(self, tmp_path):
+        df = DumpReader(self._file(tmp_path, str(2**63 - 1))).read_dataframe()
+        assert df.schema["code"] == pl.Int64
+        assert df["code"][149] == 2**63 - 1
+
+    def test_rows_and_chunks_agree(self, tmp_path):
+        path = self._file(tmp_path, "10000000000000000001")
+        assert list(DumpReader(path).read_rows())[149] == {
+            "id": 150,
+            "code": "10000000000000000001",
+        }
+        chunks = pl.concat(list(DumpReader(path).read_chunks(chunk_size=100)))
+        assert chunks.schema["code"] == pl.String
+        assert chunks["code"][149] == "10000000000000000001"
+
+    def test_a_headerless_file(self, tmp_path):
+        path = self._file(tmp_path, "1" + "0" * 39, header="")
+        df = DumpReader(path, has_header=False).read_dataframe()
+        assert df["column_2"][149] == "1" + "0" * 39
+
+    def test_a_value_that_fits_no_type_is_still_an_error(self, tmp_path):
+        # Not a wide-integer column, so the failure is not retried as text.
+        path = tmp_path / "bad.csv"
+        path.write_bytes(b"id,name\n1,ok\n2,caf\xe9\n")
+        with pytest.raises(pl.exceptions.ComputeError):
+            DumpReader(str(path)).read_dataframe()
