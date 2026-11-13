@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from r2g.config import pg_type_to_json_type
+from r2g.config import _base_pg_type_name, pg_type_to_json_type
 from r2g.log import get_logger
 from r2g.security import scrub_dsn_credentials
 from r2g.types import CollectionMapping, MappingConfig, Schema
@@ -114,9 +114,16 @@ def _guarded(command: str, label: str, *, null_fk_ok: bool = False) -> str:
 
 
 def _bash_env_default(var_name: str, value: str) -> str:
+    """A line that sets ``var_name`` to ``value`` unless the caller set it.
+
+    The default is a plain assignment, where ``shlex.quote`` means what it
+    says. Inside ``"${VAR:-...}"`` bash keeps single quotes as part of the
+    value and still expands ``$``, so a default containing a space, ``!`` or
+    ``$`` used to arrive quoted, or abort the script under ``set -u``.
+    """
     if value == "":
         return f'{var_name}="${{{var_name}:-}}"'
-    return f'{var_name}="${{{var_name}:-{shlex.quote(value)}}}"'
+    return f'[ -n "${{{var_name}:-}}" ] || {var_name}={shlex.quote(value)}'
 
 
 def _collection_mapping_for_ref(
@@ -158,9 +165,8 @@ def _script_environment(
         # client tool resolves from its own environment. A plain assignment is
         # a shell variable only: a password baked into the script would never
         # reach arangoimport, and the import would fail with HTTP 401.
-        "export " + _bash_env_default(
-            "ARANGO_PASSWORD", "" if secret_safe else password
-        ),
+        _bash_env_default("ARANGO_PASSWORD", "" if secret_safe else password),
+        "export ARANGO_PASSWORD",
     ]
 
 
@@ -688,7 +694,23 @@ _PG_TO_ARANGO_DATATYPE = {
     "integer": "number",
     "float": "number",
     "boolean": "boolean",
+    "string": "string",
 }
+
+# Column types whose text form never looks like a number, a boolean or `null`,
+# so arangoimport's value conversion cannot change them. Every other type that
+# loads as a string is named in the nullable-text warning, unknown types
+# included: an enum or domain value can be `1` or `true`.
+_NEVER_CONVERTED_TYPES = frozenset({
+    "date", "time", "time without time zone", "time with time zone", "timetz",
+    "timestamp", "timestamp without time zone", "timestamp with time zone",
+    "timestamptz", "interval", "uuid", "inet", "cidr", "macaddr", "macaddr8",
+    "bytea", "point", "line", "lseg", "box", "path", "polygon", "circle",
+    "tsvector", "tsquery",
+    # The same kinds as MySQL, SQL Server and ClickHouse spell them.
+    "datetime", "datetime2", "smalldatetime", "datetimeoffset",
+    "uniqueidentifier", "date32", "datetime64", "ipv4", "ipv6",
+})
 
 
 class CsvDirectUnsupportedError(ValueError):
@@ -738,6 +760,16 @@ class CsvImportGenerator:
         Nullable columns are also skipped for number/boolean because
         arangoimport cannot coerce an empty CSV value to those types.
 
+        Text columns are typed ``string`` only when NOT NULL. Without a type,
+        arangoimport converts any value that looks like a number, boolean or
+        ``null`` (its ``--convert`` default), so ``00789`` is stored as ``789``.
+        With ``string``, an empty field becomes ``""`` instead of a missing
+        value, so a NULL in a nullable text column would load as empty text.
+        ``--convert`` is one switch for the whole file, and turning it off
+        would load every untyped number column as text. Measured on 3.12.11.
+        No arangoimport setting gets a nullable text column right, so those
+        are left untyped and named by :meth:`nullable_text_columns` instead.
+
         .. warning::
 
            That nullable skip is a partial guard against a silent data-loss
@@ -776,9 +808,51 @@ class CsvImportGenerator:
                 continue
             json_type = pg_type_to_json_type(col.data_type)
             arango_dt = _PG_TO_ARANGO_DATATYPE.get(json_type)
-            if arango_dt and not (col.is_nullable and arango_dt in ("number", "boolean")):
+            if arango_dt and not col.is_nullable:
                 flags.extend(["--datatype", shlex.quote(f"{col.name}={arango_dt}")])
         return flags
+
+    def nullable_text_columns(self) -> tuple[str, ...]:
+        """``table.column`` for every mapped nullable text column, once each.
+
+        arangoimport converts number-, boolean- and ``null``-looking values in
+        these columns (``00789`` becomes ``789``, ``true`` a boolean), and no
+        setting avoids that without turning a NULL into ``""``; see
+        :meth:`_datatype_flags`. Primary-key columns are excluded, since they
+        become ``_key`` and are always typed ``string``. So are types whose
+        values can never look like one of those (dates, UUIDs and the like;
+        see ``_NEVER_CONVERTED_TYPES``).
+        """
+        found: list[str] = []
+        for mapping in self.config.collections.values():
+            if mapping.collection_type != "document":
+                continue
+            table = self.schema.tables.get(mapping.source_table)
+            if table is None:
+                continue
+            for col in table.columns:
+                if (
+                    col.is_nullable
+                    and col.name not in table.primary_key
+                    and pg_type_to_json_type(col.data_type) == "string"
+                    and _base_pg_type_name(col.data_type) not in _NEVER_CONVERTED_TYPES
+                ):
+                    found.append(f"{table.name}.{col.name}")
+        # A table mapped to two collections is loaded twice but named once.
+        return tuple(dict.fromkeys(found))
+
+    def text_conversion_warnings(self) -> tuple[str, ...]:
+        """The script's ``# WARNING`` text, also shown by Studio and the CLI."""
+        columns = self.nullable_text_columns()
+        if not columns:
+            return ()
+        return (
+            "arangoimport converts number-, boolean- and null-looking values in "
+            "these nullable text columns (00789 is stored as 789, true as a "
+            "boolean): "
+            + ", ".join(columns)
+            + ". Use JSONL mode where those values must stay exact text.",
+        )
 
     def _fk_is_nullable(self, table_name: str, fk_cols: tuple[str, ...]) -> bool:
         """Whether a NULL is legal in any of an edge's FK columns.
@@ -1102,6 +1176,8 @@ class CsvImportGenerator:
             ),
             "",
         ]
+        for warning in self.text_conversion_warnings():
+            lines.append(f"# WARNING: {warning}")
         lines.extend(["", "# === Document collections ===", ""])
         for spec in documents:
             msg = (
@@ -1175,6 +1251,7 @@ class CsvImportGenerator:
                 password=self.password,
                 secret_safe=secret_safe,
             ),
+            warnings=self.text_conversion_warnings(),
         )
 
     def generate_csv_script(

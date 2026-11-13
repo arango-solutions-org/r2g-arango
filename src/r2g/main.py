@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
 from rich.syntax import Syntax
 from rich.table import Table as RichTable
@@ -520,6 +521,8 @@ def generate_csv_import(
         )
         gen.generate_csv_script(output, overwrite_on_initial=True, graph_name=graph_name)
         console.print(f"[green]Wrote CSV import script:[/green] [bold]{output}[/bold]")
+        for warning in gen.text_conversion_warnings():
+            console.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
         console.print(
             f"  [dim]{len(mapping.collections)} document collections, "
             f"{len(mapping.edges)} edge collections[/dim]"

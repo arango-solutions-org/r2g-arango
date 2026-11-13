@@ -56,3 +56,26 @@ def test_source_picker_lists_all_supported_relational_sources():
     ):
         assert f'<option value="{source_type}">' in index
     assert "Demo tomorrow" not in index
+
+
+def test_bare_command_views_say_what_the_bundle_adds():
+    """Selected command, documents and edges show commands without the preamble.
+
+    A bare command lacks the bundle's exported ARANGO_PASSWORD and its
+    run_import check, which stops on rows arangoimport drops while exiting 0.
+    Every view that shows bare commands leads with a note saying so; the full
+    bundle and the graph script do not need one.
+    """
+    source = (STATIC_DIR / "arangoimport-viewer.js").read_text(encoding="utf-8")
+    note_start = source.index("const BARE_COMMAND_NOTE")
+    note = source[note_start:source.index("].join", note_start)]
+    assert "export ARANGO_PASSWORD first" in note
+    assert "exits 0 even when it drops rows" in note
+    assert "warnings/errors:" in note
+    for expression in (
+        "BARE_COMMAND_NOTE + result.focused_command.command",
+        "BARE_COMMAND_NOTE + joinedCommands(result.documents)",
+        "BARE_COMMAND_NOTE + joinedCommands(result.edges)",
+    ):
+        assert expression in source
+    assert "return result.script || '';" in source

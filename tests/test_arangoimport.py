@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import stat
+import subprocess
 
 import pytest
 
 from r2g.config import ConfigManager
-from r2g.generators.arangoimport import ArangoImportGenerator
+from r2g.generators.arangoimport import ArangoImportGenerator, _script_environment
 from r2g.types import CollectionMapping, EdgeDefinition, MappingConfig
 
 
@@ -292,4 +295,58 @@ def test_jsonl_imports_all_run_through_the_strict_guard(generator):
         ["run_import", "orders", "strict"],
         ["run_import", "orders_to_users", "strict"],
     ]
-    assert "export ARANGO_PASSWORD=" in script
+    assert "\nexport ARANGO_PASSWORD\n" in script
+
+
+# Values that broke the old `VAR="${VAR:-'...'}"` form: bash kept the single
+# quotes as part of the value, and expanded `$`, which aborts under `set -u`.
+_AWKWARD = {
+    "ARANGO_ENDPOINT": "http://db.example:8529/?a=1&b=2",
+    "ARANGO_DB": "db name",
+    "ARANGO_USER": "o'brien",
+    "ARANGO_PASSWORD": "p@ss w0rd!$x`}\\\"'",
+}
+
+
+def _run_preamble(env_overrides: dict[str, str]) -> list[str]:
+    """Run the generated environment block; print what a child process sees."""
+    preamble = "\n".join([
+        "set -euo pipefail",
+        *_script_environment(
+            endpoint=_AWKWARD["ARANGO_ENDPOINT"],
+            database=_AWKWARD["ARANGO_DB"],
+            username=_AWKWARD["ARANGO_USER"],
+            password=_AWKWARD["ARANGO_PASSWORD"],
+            secret_safe=False,
+        ),
+        # A child process, as arangoimport is: it sees only exported values.
+        "bash -c 'printf \"%s\\0\" \"$ARANGO_PASSWORD\"'",
+        'printf "%s\\0" "$ARANGO_ENDPOINT" "$ARANGO_DB" "$ARANGO_USER"',
+    ])
+    env = {k: v for k, v in os.environ.items() if k not in _AWKWARD}
+    env.update(env_overrides)
+    result = subprocess.run(
+        ["bash", "-c", preamble], capture_output=True, text=True, env=env, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.split("\0")[:4]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_script_defaults_arrive_exactly_as_given():
+    password, endpoint, database, user = _run_preamble({})
+
+    assert password == _AWKWARD["ARANGO_PASSWORD"]
+    assert endpoint == _AWKWARD["ARANGO_ENDPOINT"]
+    assert database == _AWKWARD["ARANGO_DB"]
+    assert user == _AWKWARD["ARANGO_USER"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_caller_environment_still_overrides_the_defaults():
+    password, endpoint, _, _ = _run_preamble(
+        {"ARANGO_PASSWORD": "from-env", "ARANGO_ENDPOINT": "http://other:8529"}
+    )
+
+    assert password == "from-env"
+    assert endpoint == "http://other:8529"

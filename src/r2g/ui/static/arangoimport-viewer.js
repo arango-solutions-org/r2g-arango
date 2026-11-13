@@ -73,14 +73,25 @@
     ).join('\n\n');
   }
 
+  // A bare command lacks what the bundle's preamble supplies: the exported
+  // password it reads as @ARANGO_PASSWORD@, and the run_import check that
+  // stops on rows arangoimport drops while still exiting 0.
+  const BARE_COMMAND_NOTE = [
+    '# Bare arangoimport command(s), without the full bundle\'s safeguards:',
+    '#  - export ARANGO_PASSWORD first; the command reads it as @ARANGO_PASSWORD@',
+    '#  - arangoimport exits 0 even when it drops rows; check its',
+    '#    "warnings/errors:" line, or run the full bundle, which checks it',
+    '',
+  ].join('\n');
+
   function visibleContent() {
     const result = state.result;
     if (!result) return '';
     if (state.view === 'focused' && result.focused_command) {
-      return result.focused_command.command;
+      return BARE_COMMAND_NOTE + result.focused_command.command;
     }
-    if (state.view === 'documents') return joinedCommands(result.documents);
-    if (state.view === 'edges') return joinedCommands(result.edges);
+    if (state.view === 'documents') return BARE_COMMAND_NOTE + joinedCommands(result.documents);
+    if (state.view === 'edges') return BARE_COMMAND_NOTE + joinedCommands(result.edges);
     if (state.view === 'graph') return result.graph_script || '';
     return result.script || '';
   }

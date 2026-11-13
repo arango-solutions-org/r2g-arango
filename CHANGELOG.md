@@ -9,6 +9,26 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CSV-direct import scripts keep text columns as text where `arangoimport` allows it
+  (PRD P1.7).** Text columns had no `--datatype`, so `arangoimport` converted any value that
+  looked like a number or boolean: a ZIP code `00789` was stored as the number `789`, with no
+  warning. Required (NOT NULL) columns that load as text are now typed `string`: text, and also
+  dates, UUIDs and `bit`, so a required `bit` value `1` now loads as `"1"`, as JSONL mode stores it.
+  Nullable text columns cannot be fixed the same way, because `arangoimport` then stores a NULL as
+  `""`, and its `--convert` switch applies to the whole file. The script, Studio's preview and
+  `r2g generate-csv-import` now name those columns in a warning and point to JSONL mode, which keeps
+  every value exact. Types whose values never look like a number or boolean, such as dates and UUIDs,
+  are not named.
+- **Generated import scripts accept passwords and other defaults with spaces or symbols.**
+  A default written into the script sat inside `"${VAR:-...}"`, where bash keeps shell quotes
+  as part of the value and expands `$`. A password with a space or `!` arrived wrapped in
+  quotes and failed to log in, and one with `$` stopped the script (`unbound variable`). The
+  default is now a plain shell assignment, used only when the variable is not already set.
+- **Studio's single-command views say what a bare command leaves out.** The Selected command,
+  documents and edges views of the batch-import viewer show commands without the script's
+  preamble: they need `ARANGO_PASSWORD` exported, and nothing checks `arangoimport`'s
+  `warnings/errors:` line, which it leaves non-zero while still exiting 0 after dropping rows.
+  A comment at the top of those views now says so; the full bundle does both.
 - **A CSV source reads `\N` as NULL (#73, PRD P6.4).** `\N` is how PostgreSQL's
   text-format `COPY` and Snowflake's default unload write NULL. A single one made a numeric
   column text, and the missing values loaded as the two-character string `\N`, with no
