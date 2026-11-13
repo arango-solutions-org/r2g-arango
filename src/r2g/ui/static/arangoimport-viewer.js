@@ -80,7 +80,7 @@
     '# Bare arangoimport command(s), without the full bundle\'s safeguards:',
     '#  - export ARANGO_PASSWORD first; the command reads it as @ARANGO_PASSWORD@',
     '#  - arangoimport exits 0 even when it drops rows; check its',
-    '#    "warnings/errors:" line is 0, or run the full bundle, which checks it',
+    '#    "warnings/errors:" line, or run the full bundle, which checks it',
     '',
   ].join('\n');
 
