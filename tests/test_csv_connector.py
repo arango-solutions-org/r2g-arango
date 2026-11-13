@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 
 from r2g.connectors.csv_source import CsvConnector
+from r2g.input.dump_reader import DumpReader
 
 
 @pytest.fixture
@@ -543,10 +544,31 @@ class TestCsvKeyCheckReadsTheWholeFile:
             "events"
         ].primary_key == []
 
-    def test_a_file_that_cannot_be_read_to_the_end_is_an_error(self, tmp_path):
-        body = b"ID,NAME\n" + b"".join(
-            b"%d,caf\xe9\n" % i if i == 2000 else b"%d,n\n" % i for i in range(1, 3001)
+    @pytest.mark.parametrize("header", [b"ID,NAME,V\n", b"A,NAME,V\n"], ids=["id", "no-id"])
+    @pytest.mark.parametrize(
+        "bad_line",
+        [b"%d,caf\xe9,1.5\n", b'%d,"open,1.5\n', b"%d,name,1.5,x\n"],
+        ids=["invalid-utf8", "unclosed-quote", "extra-field"],
+    )
+    def test_a_file_the_load_cannot_read_fails_the_snapshot(self, tmp_path, header, bad_line):
+        # With or without a key candidate: the snapshot and the load agree.
+        body = header + b"".join(
+            (bad_line if i == 2000 else b"%d,name,1.5\n") % i for i in range(1, 3001)
         )
-        (tmp_path / "events.csv").write_bytes(body)
-        with pytest.raises(RuntimeError, match="Failed to read CSV file for 'events'"):
+        path = tmp_path / "events.csv"
+        path.write_bytes(body)
+        with pytest.raises(pl.exceptions.PolarsError):
+            DumpReader(str(path)).read_dataframe()
+        with pytest.raises(RuntimeError, match="for 'events'"):
             CsvConnector(str(tmp_path)).get_schema()
+
+    @pytest.mark.parametrize("header", ["ID,NAME,V\n", "A,NAME,V\n"], ids=["id", "no-id"])
+    def test_a_short_row_is_read_by_both(self, tmp_path, header):
+        body = header + "".join(
+            f"{i},name\n" if i == 2000 else f"{i},name,1.5\n" for i in range(1, 3001)
+        )
+        path = tmp_path / "events.csv"
+        path.write_text(body, encoding="utf-8")
+        assert DumpReader(str(path)).read_dataframe().height == 3000
+        table = CsvConnector(str(tmp_path)).get_schema().tables["events"]
+        assert table.primary_key == (["ID"] if header.startswith("ID") else [])

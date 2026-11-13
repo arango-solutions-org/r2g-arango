@@ -15,11 +15,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a key was proposed as one for almost any longer file: one repeated value in a 60,000-row
   file was caught 0.03% of the time. Every row is now read. **What changes for an existing
   source:** a table whose `id`-like column repeats or is empty further down has no proposed key on
-  the next snapshot. A file that cannot be read to its end (invalid UTF-8 or an unclosed quote past
-  the first 1,000 rows) now fails the snapshot, naming the table, where it used to pass the
-  snapshot and fail the load. The check adds no time: it replaces the sample read, and the snapshot
-  of a 325 MB file took 1.2 s against 1.5 s before. `CsvConnector` no longer takes `sample_rows`.
-  The error for an unreadable file now says "Failed to read CSV file", not "CSV header".
+  the next snapshot. The same pass reads every column, so a file the load cannot read (invalid
+  UTF-8, an unclosed quote, a row with more fields than the header) fails the snapshot, naming the
+  table, whether or not it has an `id`-like column. Before, whether such a file passed the snapshot
+  depended on the kind of bad row, its position and the file's size. Measured on a 325 MB,
+  4,000,000-row file: the snapshot takes 1.2 s against 1.1 s before, and its peak memory is 720 MB
+  against 515 MB. `CsvConnector` no longer takes `sample_rows`. The error for an unreadable file
+  now says "Failed to read CSV file", not "CSV header".
 - **A CSV source types each column from the whole file, at snapshot and at load (#80, PRD
   P5b.1.2, P6.4).** The snapshot guessed types from the first 1,000 rows of each file and the load
   from the first 100. A value further down that did not fit the guess, such as text in a column of

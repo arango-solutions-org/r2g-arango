@@ -263,29 +263,35 @@ class CsvConnector:
         fall inside the sample. With no data rows we accept the first
         name match (legacy behaviour) so a fresh / empty export still
         gets a proposed key.
+
+        The pass reads every column, with or without a candidate, so a
+        file the load cannot read (invalid UTF-8, an unclosed quote, a row
+        with more fields than the header) raises here too.
         """
         candidates = self._key_candidates(table_name, file_schema.names())
-        if not candidates:
-            return []
 
-        # One pass over the file, parsing only the candidate columns.
-        measures = [pl.len().alias("rows")]
+        # One pass over the file. Counting each column's nulls makes the
+        # reader parse every field; a pass over the candidates alone skips
+        # the other columns and misses a row the load would reject. The
+        # streaming engine keeps the file out of memory.
+        measures = [pl.len().alias("rows"), pl.all().null_count().name.prefix("nulls:")]
         for i, col in enumerate(candidates):
-            measures.append(pl.col(col).null_count().alias(f"nulls_{i}"))
-            measures.append(pl.col(col).n_unique().alias(f"distinct_{i}"))
+            measures.append(pl.col(col).n_unique().alias(f"distinct:{i}"))
         stats = (
             pl.scan_csv(str(path), schema=file_schema, **read_options)
             .select(measures)
-            .collect()
+            .collect(engine="streaming")
             .row(0, named=True)
         )
 
+        if not candidates:
+            return []
         rows = stats["rows"]
         if rows == 0:
             return [candidates[0]]
 
         for i, col in enumerate(candidates):
-            if stats[f"nulls_{i}"] == 0 and stats[f"distinct_{i}"] == rows:
+            if stats[f"nulls:{col}"] == 0 and stats[f"distinct:{i}"] == rows:
                 return [col]
         return []
 
