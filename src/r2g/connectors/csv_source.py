@@ -206,10 +206,15 @@ class CsvConnector:
             # 60,000 rows is outside a 1,000-row sample 98% of the time), and
             # the load types from the whole file, so the snapshot must too or
             # the two disagree.
-            file_schema = pl.scan_csv(
-                str(path), infer_schema_length=None, **read_options
-            ).collect_schema()
-            pk = self._detect_primary_key(table_name, path, file_schema, read_options)
+            lazy = pl.scan_csv(str(path), infer_schema_length=None, **read_options)
+            file_schema = lazy.collect_schema()
+            if self.has_header:
+                # Read with the types just inferred rather than infer them a
+                # second time, which more than doubles the snapshot. Without
+                # a header the column count itself is inferred from every
+                # row, so that file keeps the scan the load makes.
+                lazy = pl.scan_csv(str(path), schema=file_schema, **read_options)
+            pk = self._detect_primary_key(table_name, lazy, file_schema)
         except Exception as e:  # noqa: BLE001
             logger.error("csv_introspect_failed", path=str(path), error=str(e))
             raise RuntimeError(f"Failed to read CSV file for '{table_name}': {e}")
@@ -249,9 +254,8 @@ class CsvConnector:
     def _detect_primary_key(
         self,
         table_name: str,
-        path: Path,
+        lazy: "pl.LazyFrame",
         file_schema: "pl.Schema",
-        read_options: dict[str, Any],
     ) -> list[str]:
         """Pick a single-column primary key by name + uniqueness in the file.
 
@@ -277,12 +281,7 @@ class CsvConnector:
         measures = [pl.len().alias("rows"), pl.all().null_count().name.prefix("nulls:")]
         for i, col in enumerate(candidates):
             measures.append(pl.col(col).n_unique().alias(f"distinct:{i}"))
-        stats = (
-            pl.scan_csv(str(path), schema=file_schema, **read_options)
-            .select(measures)
-            .collect(engine="streaming")
-            .row(0, named=True)
-        )
+        stats = lazy.select(measures).collect(engine="streaming").row(0, named=True)
 
         if not candidates:
             return []

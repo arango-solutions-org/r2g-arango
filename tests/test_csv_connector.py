@@ -562,6 +562,15 @@ class TestCsvKeyCheckReadsTheWholeFile:
         with pytest.raises(RuntimeError, match="for 'events'"):
             CsvConnector(str(tmp_path)).get_schema()
 
+    def test_a_headerless_file_with_a_longer_row_is_read_by_both(self, tmp_path):
+        # Without a header the widest row sets the column count, at snapshot and at load.
+        body = "".join(f"{i},name,1.5,x\n" if i == 2000 else f"{i},name,1.5\n" for i in range(1, 3001))
+        path = tmp_path / "events.csv"
+        path.write_text(body, encoding="utf-8")
+        assert DumpReader(str(path), has_header=False).read_dataframe().shape == (3000, 4)
+        table = CsvConnector(str(tmp_path), has_header=False).get_schema().tables["events"]
+        assert [c.name for c in table.columns] == ["column_1", "column_2", "column_3", "column_4"]
+
     @pytest.mark.parametrize("header", ["ID,NAME,V\n", "A,NAME,V\n"], ids=["id", "no-id"])
     def test_a_short_row_is_read_by_both(self, tmp_path, header):
         body = header + "".join(
