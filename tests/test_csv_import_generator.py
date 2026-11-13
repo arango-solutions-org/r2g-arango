@@ -860,6 +860,33 @@ class TestTextColumns:
         assert "00789 is stored as 789" in warning
         assert f"# WARNING: {warning}" in plan.script
 
+    def test_types_that_never_look_like_numbers_are_not_named(
+        self, ecommerce_config, ecommerce_schema
+    ):
+        customers = ecommerce_schema.tables["customers"]
+        for name, data_type in [
+            ("born", "date"),
+            ("seen_at", "timestamp(3) with time zone"),
+            ("uid", "uuid"),
+            ("ip", "inet"),
+            ("tier", "customer_tier"),  # an enum: its values can be 1 or true
+            ("flags", "bit varying(8)"),
+        ]:
+            customers.columns.append(Column(name=name, data_type=data_type, is_nullable=True))
+
+        named = CsvImportGenerator(ecommerce_config, ecommerce_schema).nullable_text_columns()
+
+        assert named == ("customers.email", "customers.tier", "customers.flags", "orders.notes")
+
+    def test_a_table_mapped_twice_is_named_once(self, ecommerce_config, ecommerce_schema):
+        ecommerce_config.collections["vip_customers"] = CollectionMapping(
+            source_table="customers", target_collection="vip_customers"
+        )
+
+        named = CsvImportGenerator(ecommerce_config, ecommerce_schema).nullable_text_columns()
+
+        assert named == ("customers.email", "orders.notes")
+
     def test_no_warning_when_every_text_column_is_required(self, ecommerce_config, ecommerce_schema):
         for table in ecommerce_schema.tables.values():
             for col in table.columns:

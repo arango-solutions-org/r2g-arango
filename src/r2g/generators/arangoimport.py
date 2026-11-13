@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from r2g.config import pg_type_to_json_type
+from r2g.config import _base_pg_type_name, pg_type_to_json_type
 from r2g.log import get_logger
 from r2g.security import scrub_dsn_credentials
 from r2g.types import CollectionMapping, MappingConfig, Schema
@@ -697,6 +697,21 @@ _PG_TO_ARANGO_DATATYPE = {
     "string": "string",
 }
 
+# Column types whose text form never looks like a number, a boolean or `null`,
+# so arangoimport's value conversion cannot change them. Every other type that
+# loads as a string is named in the nullable-text warning, unknown types
+# included: an enum or domain value can be `1` or `true`.
+_NEVER_CONVERTED_TYPES = frozenset({
+    "date", "time", "time without time zone", "time with time zone", "timetz",
+    "timestamp", "timestamp without time zone", "timestamp with time zone",
+    "timestamptz", "interval", "uuid", "inet", "cidr", "macaddr", "macaddr8",
+    "bytea", "point", "line", "lseg", "box", "path", "polygon", "circle",
+    "tsvector", "tsquery",
+    # The same kinds as MySQL, SQL Server and ClickHouse spell them.
+    "datetime", "datetime2", "smalldatetime", "datetimeoffset",
+    "uniqueidentifier", "date32", "datetime64", "ipv4", "ipv6",
+})
+
 
 class CsvDirectUnsupportedError(ValueError):
     """A mapping uses a feature the CSV-direct import cannot reproduce."""
@@ -798,13 +813,15 @@ class CsvImportGenerator:
         return flags
 
     def nullable_text_columns(self) -> tuple[str, ...]:
-        """``table.column`` for every mapped nullable text column.
+        """``table.column`` for every mapped nullable text column, once each.
 
         arangoimport converts number-, boolean- and ``null``-looking values in
         these columns (``00789`` becomes ``789``, ``true`` a boolean), and no
         setting avoids that without turning a NULL into ``""``; see
         :meth:`_datatype_flags`. Primary-key columns are excluded, since they
-        become ``_key`` and are always typed ``string``.
+        become ``_key`` and are always typed ``string``. So are types whose
+        values can never look like one of those (dates, UUIDs and the like;
+        see ``_NEVER_CONVERTED_TYPES``).
         """
         found: list[str] = []
         for mapping in self.config.collections.values():
@@ -818,11 +835,14 @@ class CsvImportGenerator:
                     col.is_nullable
                     and col.name not in table.primary_key
                     and pg_type_to_json_type(col.data_type) == "string"
+                    and _base_pg_type_name(col.data_type) not in _NEVER_CONVERTED_TYPES
                 ):
                     found.append(f"{table.name}.{col.name}")
-        return tuple(found)
+        # A table mapped to two collections is loaded twice but named once.
+        return tuple(dict.fromkeys(found))
 
-    def _text_conversion_warnings(self) -> tuple[str, ...]:
+    def text_conversion_warnings(self) -> tuple[str, ...]:
+        """The script's ``# WARNING`` text, also shown by Studio and the CLI."""
         columns = self.nullable_text_columns()
         if not columns:
             return ()
@@ -1156,7 +1176,7 @@ class CsvImportGenerator:
             ),
             "",
         ]
-        for warning in self._text_conversion_warnings():
+        for warning in self.text_conversion_warnings():
             lines.append(f"# WARNING: {warning}")
         lines.extend(["", "# === Document collections ===", ""])
         for spec in documents:
@@ -1231,7 +1251,7 @@ class CsvImportGenerator:
                 password=self.password,
                 secret_safe=secret_safe,
             ),
-            warnings=self._text_conversion_warnings(),
+            warnings=self.text_conversion_warnings(),
         )
 
     def generate_csv_script(

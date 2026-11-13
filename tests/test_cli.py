@@ -400,6 +400,21 @@ class TestGenerateCsvImport:
         assert result.exit_code == 0
         assert "Wrote CSV import script" in result.output
 
+    def test_names_nullable_text_columns_on_screen(
+        self, schema_file, config_file, dumps_dir, tmp_path
+    ):
+        result = runner.invoke(app, [
+            "generate-csv-import",
+            "--schema", schema_file,
+            "--config", config_file,
+            "--data-dir", dumps_dir,
+            "--output", str(tmp_path / "import_csv.sh"),
+        ])
+        assert result.exit_code == 0
+        said = " ".join(plain_output(result).split())  # Rich wraps long lines
+        assert "Warning: arangoimport converts" in said
+        assert "users.email" in said
+
     def test_refuses_a_masked_column_and_writes_no_script(
         self, schema_file, config_file, dumps_dir, tmp_path, monkeypatch
     ):

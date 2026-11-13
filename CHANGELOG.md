@@ -12,10 +12,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CSV-direct import scripts keep text columns as text where `arangoimport` allows it
   (PRD P1.7).** Text columns had no `--datatype`, so `arangoimport` converted any value that
   looked like a number or boolean: a ZIP code `00789` was stored as the number `789`, with no
-  warning. Required (NOT NULL) text columns are now typed `string`. Nullable text columns cannot
-  be fixed the same way, because `arangoimport` then stores a NULL as `""`, and its `--convert`
-  switch applies to the whole file. The script and Studio's preview now name those columns in a
-  warning and point to JSONL mode, which keeps every value exact.
+  warning. Required (NOT NULL) columns that load as text are now typed `string`: text, and also
+  dates, UUIDs and `bit`, so a required `bit` value `1` now loads as `"1"`, as JSONL mode stores it.
+  Nullable text columns cannot be fixed the same way, because `arangoimport` then stores a NULL as
+  `""`, and its `--convert` switch applies to the whole file. The script, Studio's preview and
+  `r2g generate-csv-import` now name those columns in a warning and point to JSONL mode, which keeps
+  every value exact. Types whose values never look like a number or boolean, such as dates and UUIDs,
+  are not named.
 - **Generated import scripts accept passwords and other defaults with spaces or symbols.**
   A default written into the script sat inside `"${VAR:-...}"`, where bash keeps shell quotes
   as part of the value and expands `$`. A password with a space or `!` arrived wrapped in
