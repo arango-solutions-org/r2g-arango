@@ -32,9 +32,10 @@ class DumpReader:
         kwargs: dict[str, Any] = {
             "separator": self.delimiter,
             "has_header": self.has_header,
-            # Type each column from the whole file. Polars' default looks at
-            # the first 100 rows only and then fails on a later value that
-            # does not fit (text in a column that began with whole numbers).
+            # Type each column from the whole file, as the CSV source's
+            # snapshot does. Polars' default looks at the first 100 rows only
+            # and then fails on a later value that does not fit (text in a
+            # column that began with whole numbers).
             "infer_schema_length": None,
         }
         if self.null_values:

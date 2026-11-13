@@ -2,9 +2,9 @@
 
 A CSV source is a directory of delimited files: each file is one table,
 the filename stem is the table name, and the header row supplies the
-column names. Column types are inferred from a bounded sample (the
-first ``sample_rows`` rows, and only those rows) using Polars' CSV type
-inference, then mapped onto the same source-agnostic
+column names. Column types are inferred from every row of the file
+using Polars' CSV type inference, which is also how a load types the
+values it reads, then mapped onto the same source-agnostic
 type strings (``integer`` / ``double precision`` / ``boolean`` /
 ``timestamp`` / ``text``) that the transformer's type map already
 understands.
@@ -13,7 +13,8 @@ CSV has no notion of primary or foreign keys. We apply a small,
 documented heuristic so auto-mapping produces a usable ``_key``: the
 first of ``id`` / ``{table}_id`` / ``{singular(table)}_id`` /
 ``{table}id`` / ``{singular(table)}id`` (case-insensitive) that exists
-and is **unique and non-null in the read sample** is treated as the
+and is **unique and non-null in the read sample** (the first
+``sample_rows`` rows) is treated as the
 primary key (e.g. ``customers.csv`` keyed on ``customer_id``). When the
 file has no data rows we fall back to a name-only match so introspection
 still proposes a key. Relationships can be recovered afterwards with FK
@@ -27,7 +28,6 @@ can be streamed into ArangoDB exactly like a relational source.
 
 from __future__ import annotations
 
-import io
 import os
 import shutil
 from datetime import datetime, timezone
@@ -140,19 +140,6 @@ def _polars_dtype_to_type(dtype: Any) -> str:
     return _POLARS_TYPE_MAP.get(base, "text")
 
 
-def _infer_sample_types(sample: "pl.DataFrame") -> "pl.DataFrame":
-    """Type a sample that was read as text, from exactly the rows it holds.
-
-    The sample is written back out as CSV and read with inference over every
-    row, so the types are the ones Polars' own CSV inference gives and no row
-    outside the sample is ever parsed. A null stays null (written as an empty
-    field) and an empty string stays an empty string (written quoted).
-    """
-    if sample.width == 0:
-        return sample
-    return pl.read_csv(io.BytesIO(sample.write_csv().encode()), infer_schema_length=None)
-
-
 class CsvConnector:
     """Introspect and read a directory of CSV files as a schema.
 
@@ -210,22 +197,31 @@ class CsvConnector:
 
     def _process_file(self, table_name: str, path: Path) -> Table:
         try:
-            # Read the sample as text, then type it. Asking Polars for typed
-            # rows directly makes it parse a little past ``n_rows`` with the
-            # types it guessed from the sample, so a value just beyond the
-            # sample that does not fit (text in a column of whole numbers)
-            # failed the whole introspection, though it was never sampled.
-            sample = pl.read_csv(
-                str(path),
-                separator=self.delimiter,
-                has_header=self.has_header,
-                n_rows=self.sample_rows,
-                infer_schema_length=0,
+            read_options: dict[str, Any] = {
+                "separator": self.delimiter,
+                "has_header": self.has_header,
                 # The same markers the session reads as null, so a column's
                 # inferred type matches the values it streams.
-                null_values=list(self.null_values) or None,
+                "null_values": list(self.null_values) or None,
+            }
+            # Type each column from every row. A sample of the first rows
+            # misses a rare value almost every time (one text value among
+            # 60,000 rows is outside a 1,000-row sample 98% of the time), and
+            # the load types from the whole file, so the snapshot must too or
+            # the two disagree.
+            file_schema = pl.scan_csv(
+                str(path), infer_schema_length=None, **read_options
+            ).collect_schema()
+            # The key check still reads a bounded sample. It is read with the
+            # file's types: Polars parses a little past ``n_rows``, and types
+            # guessed from the sample alone fail on a later value that does
+            # not fit them.
+            frame = pl.read_csv(
+                str(path),
+                n_rows=self.sample_rows,
+                schema_overrides=dict(file_schema),
+                **read_options,
             )
-            frame = _infer_sample_types(sample)
         except Exception as e:  # noqa: BLE001
             logger.error("csv_introspect_failed", path=str(path), error=str(e))
             raise RuntimeError(f"Failed to read CSV header for '{table_name}': {e}")
