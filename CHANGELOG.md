@@ -7,6 +7,32 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Forge at volume (PLAN F-9, F-10, F-11; contextual-data-fabric S5 and ADR-0011 D9).**
+  - *Self-links.* An ontology may link a class to itself (`Employee -> Employee`, type
+    `employeesToEmployees`). Each row points at an earlier row of its table or is a root (row 1
+    always is), so the links form a forest, load in order with the declared constraint, and
+    re-derive through Auto-Map as the declared relationship. The foreign-key column is nullable.
+    A cycle between two different classes is still refused.
+  - *Scale knobs.* `ForgeScale` (`r2g forge generate --scale scale.json`, and a `scale` argument on
+    `generate`, `plan_schema` and `synthesize_rows`): a row count per class, and per relationship a
+    fan-out distribution (`uniform`, or `zipf` with an `exponent`) and a `nullRate`. A knob naming
+    nothing in the ontology, or out of range, is refused by name. With no knob set the rows are
+    byte-identical to 0.10.0's for the same seed, so committed Forge suites do not move.
+  - *Streaming.* `stream_rows` yields `(table, row)` without holding any row; `synthesize_rows`
+    now collects it. `generate_bulk` / `BulkWriter` (`r2g forge generate --bulk --chunk-rows N`)
+    write chunked CSV (SQL dialects) or JSON lines (arango), a bulk loader per dialect
+    (`\copy`, `FROM INFILE`, `PUT`/`COPY INTO`, batched `import_bulk`) and `forge.bulk.json`, a
+    manifest with each file's row count and SHA-256. Memory does not grow with the rows.
+
+### Changed
+
+- **ArangoDB projection skips an edge whose foreign key is NULL** (`project_documents` and the
+  generated `forge.load.py`). No ontology generated one before self-links and `nullRate`.
+- `ColumnPlan` and `EdgePlan` gain `optional` (default `False`); `ColumnPlan.nullable` is true
+  for an optional foreign key.
+
 ### Fixed
 
 - **A CSV source proposes a primary key only when the column is unique in the whole file (PRD

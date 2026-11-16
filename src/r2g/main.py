@@ -4203,6 +4203,23 @@ def forge_generate(
         help="Output directory: forge.sql + forge.load.sql (SQL dialects) or "
         "forge.collections.json + forge.load.py (arango), plus forge.rows.json",
     ),
+    scale_path: Optional[str] = typer.Option(
+        None,
+        "--scale",
+        help="Volume knobs as JSON: {\"rows\": {Entity: n}, \"relationships\": "
+        "{type: {\"distribution\": \"uniform\"|\"zipf\", \"exponent\": s, "
+        "\"nullRate\": p}}} (PLAN F-10)",
+    ),
+    bulk: bool = typer.Option(
+        False,
+        "--bulk",
+        help="Stream rows into chunked data files plus a bulk loader and forge.bulk.json, "
+        "instead of an INSERT loader and forge.rows.json; memory does not grow with "
+        "the rows (PLAN F-11)",
+    ),
+    chunk_rows: int = typer.Option(
+        100_000, "--chunk-rows", help="Records per data file with --bulk"
+    ),
 ) -> None:
     """Generate a physical schema + seeded synthetic data from an ontology.
 
@@ -4223,11 +4240,20 @@ def forge_generate(
     if rows_per_entity < 1:
         console.print(f"[red]--rows-per-entity must be >= 1 (got {rows_per_entity}).[/red]")
         raise typer.Exit(code=2)
+    if chunk_rows < 1:
+        console.print(f"[red]--chunk-rows must be >= 1 (got {chunk_rows}).[/red]")
+        raise typer.Exit(code=2)
 
     try:
         ontology = load_ontology_file(ontology_path)
+        scale = _load_forge_scale(scale_path) if scale_path else None
+        if bulk:
+            _forge_generate_bulk(
+                ontology, out_dir, dialect, seed, rows_per_entity, scale, chunk_rows
+            )
+            return
         artifacts = forge_generate_artifacts(
-            ontology, dialect=dialect, seed=seed, rows_per_entity=rows_per_entity
+            ontology, dialect=dialect, seed=seed, rows_per_entity=rows_per_entity, scale=scale
         )
     except ForgeError as e:
         # A refused ontology or unsupported request is a caller problem, kin
@@ -4253,6 +4279,58 @@ def forge_generate(
         log.exception("forge_write_failed", out_dir=out_dir)
         console.print(f"[red]Failed to write artifacts:[/red] {e}")
         raise typer.Exit(code=1)
+
+
+def _load_forge_scale(path: str) -> Any:
+    """Read ``--scale``: unreadable or malformed input is a ForgeError (exit 2)."""
+    from r2g.forge import ForgeError, ForgeScale
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            document = json.load(fh)
+    except OSError as exc:
+        raise ForgeError(f"cannot read scale file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ForgeError(f"{path} is not valid JSON: {exc}") from exc
+    return ForgeScale.from_document(document)
+
+
+def _forge_generate_bulk(
+    ontology: Any,
+    out_dir: str,
+    dialect: str,
+    seed: int,
+    rows_per_entity: int,
+    scale: Any,
+    chunk_rows: int,
+) -> None:
+    """``forge generate --bulk``: stream into chunked files and report the manifest.
+
+    Write failures surface as OSError, which the caller's generic handler
+    reports with exit 1; a refused scale or ontology is a ForgeError (exit 2)."""
+    import time
+
+    from r2g.forge import BULK_MANIFEST_FILE, generate_bulk
+
+    started = time.perf_counter()
+    manifest = generate_bulk(
+        ontology,
+        out_dir,
+        dialect=dialect,
+        seed=seed,
+        rows_per_entity=rows_per_entity,
+        scale=scale,
+        chunk_rows=chunk_rows,
+    )
+    seconds = time.perf_counter() - started
+    records = sum(t["rows"] for t in manifest["targets"])
+    files = sum(len(t["files"]) for t in manifest["targets"])
+    console.print(
+        f"[green]Forged[/green] {len(ontology.entities)} entities, "
+        f"{len(ontology.relationships)} relationships, {records} records in {files} "
+        f"files [dim](dialect {dialect}, seed {seed}, {seconds:.1f} s)[/dim]"
+    )
+    console.print(f"  [dim]{os.path.join(out_dir, BULK_MANIFEST_FILE)}[/dim]")
 
 
 if __name__ == "__main__":

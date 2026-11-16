@@ -14,9 +14,30 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, List, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar, Dict, Iterable, List, Mapping, Tuple
 
 from ..core import JSON_TYPES, SURROGATE_KEY, ForgeError, Rows, SchemaPlan, TablePlan
+
+
+@dataclass(frozen=True)
+class BulkTarget:
+    """One thing a bulk load fills: a table, or a document or edge collection.
+
+    ``name`` is the canonical (snake_case) name the data files are named after;
+    ``physical`` is the dialect's spelling the loader addresses; ``columns``
+    are the physical columns a CSV record carries, in order (empty for JSON
+    lines, whose records name their own fields)."""
+
+    name: str
+    physical: str
+    kind: str
+    columns: Tuple[str, ...] = ()
+
+
+#: Turns one canonical row of a table into ``(target name, record line)``
+#: pairs — one for a SQL table, a document plus one per edge for ArangoDB.
+BulkProjector = Callable[[Dict[str, Any]], Iterable[Tuple[str, str]]]
 
 
 class ForgeDialect(ABC):
@@ -50,6 +71,24 @@ class ForgeDialect(ABC):
     @abstractmethod
     def render_loader(self, plan: SchemaPlan, rows: Rows, seed: int) -> str:
         """The loader that puts ``rows`` into the schema (INSERTs, or a script)."""
+
+    # -- bulk (PLAN F-11): chunked data files and a loader that reads them --
+
+    #: The bulk loader's file name and the data files' extension.
+    bulk_loader_filename: ClassVar[str] = "forge.bulk.sql"
+    bulk_extension: ClassVar[str] = "csv"
+
+    @abstractmethod
+    def bulk_targets(self, plan: SchemaPlan) -> List[BulkTarget]:
+        """Every target a bulk load of ``plan`` fills, in load order."""
+
+    @abstractmethod
+    def bulk_projector(self, plan: SchemaPlan, table: TablePlan) -> BulkProjector:
+        """How one row of ``table`` becomes record lines (built once per table)."""
+
+    @abstractmethod
+    def render_bulk_loader(self, plan: SchemaPlan, manifest: Dict[str, Any]) -> str:
+        """The loader that reads the chunk files ``manifest`` lists, in order."""
 
 
 def check_type_table(dialect: ForgeDialect) -> None:
@@ -94,6 +133,32 @@ def sql_literal(value: Any, *, true: str = "TRUE", false: str = "FALSE") -> str:
         return repr(int(value) if isinstance(value, int) else value)
     escaped = str(value).replace("'", "''")
     return f"'{escaped}'"
+
+
+#: How a NULL is written in a bulk CSV: unquoted ``\N``, which Postgres
+#: (``NULL '\N'``), ClickHouse and Snowflake (their default ``NULL_IF``) all
+#: read as NULL. Strings are always quoted, so a string ``\N`` stays a string.
+CSV_NULL = "\\N"
+
+
+def csv_value(value: Any) -> str:
+    """One synthesized value as a bulk-CSV field (no header, comma-separated).
+
+    Strings are always double-quoted with ``""`` doubling, so neither a comma,
+    a newline nor a literal ``\\N`` can be misread. Non-finite floats are
+    refused, as :func:`sql_literal` refuses them: no engine reads ``inf`` back
+    as the value it was."""
+    if value is None:
+        return CSV_NULL
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(int(value))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ForgeError(f"{value!r} has no CSV form a database reads back")
+        return repr(value)
+    return '"' + str(value).replace('"', '""') + '"'
 
 
 def split_sql_statements(sql: str, *, backslash_escapes: bool = False) -> List[str]:
@@ -280,11 +345,61 @@ class SqlDialect(ForgeDialect):
             parts.append("")
         return "\n".join(parts)
 
+    # -- bulk -----------------------------------------------------------
+
+    def bulk_targets(self, plan: SchemaPlan) -> List[BulkTarget]:
+        return [
+            BulkTarget(
+                name=t.table,
+                physical=self.physical_table(t.table),
+                kind="table",
+                columns=tuple(self.physical_column(c.name) for c in t.columns),
+            )
+            for t in plan.tables
+        ]
+
+    def bulk_projector(self, plan: SchemaPlan, table: TablePlan) -> BulkProjector:
+        name = table.table
+        columns = [c.name for c in table.columns]
+
+        def project(row: Dict[str, Any]) -> Iterable[Tuple[str, str]]:
+            return ((name, ",".join(csv_value(row[c]) for c in columns)),)
+
+        return project
+
+    def render_bulk_loader(self, plan: SchemaPlan, manifest: Dict[str, Any]) -> str:
+        parts = [
+            "-- Federation Forge — generated bulk loader",
+            f"-- dialect: {self.name}; seed: {manifest.get('seed')}",
+            *self.bulk_header(),
+            "",
+        ]
+        for target in manifest["targets"]:
+            columns = ", ".join(target["columns"])
+            parts.extend(
+                self.bulk_load_statement(target["physical"], columns, f["path"])
+                for f in target["files"]
+            )
+        parts.append("")
+        return "\n".join(parts)
+
+    def bulk_header(self) -> List[str]:
+        """Comment lines saying how to run the bulk loader."""
+        return []
+
+    def bulk_load_statement(self, physical: str, columns: str, path: str) -> str:
+        """One statement loading one chunk file into ``physical``."""
+        raise ForgeError(f"dialect {self.name!r} renders no bulk loader")
+
 
 __all__ = [
+    "CSV_NULL",
+    "BulkProjector",
+    "BulkTarget",
     "ForgeDialect",
     "SqlDialect",
     "check_type_table",
+    "csv_value",
     "split_sql_statements",
     "sql_literal",
 ]

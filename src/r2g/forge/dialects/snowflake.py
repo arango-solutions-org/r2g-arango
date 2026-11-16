@@ -46,5 +46,20 @@ class SnowflakeDialect(SqlDialect):
             "-- recorded by Snowflake but not enforced — which is what the analyzers read.",
         ]
 
+    def bulk_header(self) -> List[str]:
+        return [
+            "-- SnowSQL: PUT uploads each file to the table's stage, COPY INTO loads and",
+            "-- purges it. Run from this directory, after the DDL:",
+            "--   snowsql -o exit_on_error=true -f forge.sql -f forge.bulk.sql",
+            "-- \\N reads as NULL (the CSV file format's default NULL_IF).",
+        ]
+
+    def bulk_load_statement(self, physical: str, columns: str, path: str) -> str:
+        return (
+            f"PUT 'file://{path}' @%{physical} AUTO_COMPRESS = TRUE OVERWRITE = TRUE;\n"
+            f"COPY INTO {physical} ({columns}) FROM @%{physical} "
+            f"FILE_FORMAT = (TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = '\"') PURGE = TRUE;"
+        )
+
 
 __all__ = ["SNOWFLAKE_TYPE_FOR_JSON_TYPE", "SnowflakeDialect"]
