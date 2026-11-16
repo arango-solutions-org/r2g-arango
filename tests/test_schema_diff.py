@@ -85,6 +85,34 @@ class TestDiffSchemas:
         assert changes[0]["old_type"] == "text"
         assert changes[0]["new_type"] == "varchar(255)"
 
+    def test_scale_recorded_where_an_older_snapshot_had_none_is_not_a_change(self):
+        """r2g-arango#24: the Snowflake connector now records ``number(38,0)``
+        where a snapshot written before then has ``number``. That is the same
+        column, so it must not report every number column as changed."""
+        old = _make_schema(t={
+            "columns": [("ID", "number", False, True), ("AMOUNT", "number", True, False)],
+            "pk": ["ID"],
+        })
+        new = _make_schema(t={
+            "columns": [("ID", "number(38,0)", False, True), ("AMOUNT", "number(10,2)", True, False)],
+            "pk": ["ID"],
+        })
+        assert diff_schemas(old, new)["modified_tables"] == {}
+        assert diff_schemas(new, old)["modified_tables"] == {}
+
+    def test_a_changed_scale_is_a_change(self):
+        old = _make_schema(t={"columns": [("AMOUNT", "number(38,0)", True, False)]})
+        new = _make_schema(t={"columns": [("AMOUNT", "number(10,2)", True, False)]})
+        changes = diff_schemas(old, new)["modified_tables"]["t"]["type_changes"]
+        assert changes == [
+            {"column": "AMOUNT", "old_type": "number(38,0)", "new_type": "number(10,2)"}
+        ]
+
+    def test_bare_and_parameterised_text_types_still_differ(self):
+        old = _make_schema(t={"columns": [("NAME", "varchar", True, False)]})
+        new = _make_schema(t={"columns": [("NAME", "varchar(40)", True, False)]})
+        assert diff_schemas(old, new)["modified_tables"]["t"]["type_changes"]
+
     def test_nullable_change(self):
         old = _make_schema(users={
             "columns": [("id", "integer", False, True), ("email", "text", False, False)],

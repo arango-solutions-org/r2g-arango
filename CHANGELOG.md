@@ -81,6 +81,29 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preamble: they need `ARANGO_PASSWORD` exported, and nothing checks `arangoimport`'s
   `warnings/errors:` line, which it leaves non-zero while still exiting 0 after dropping rows.
   A comment at the top of those views now says so; the full bundle does both.
+- **R2RML: a missing `rr:datatype` now means only "r2g did not classify this column"
+  (#24, PRD P12.1).** Text columns were emitted with no `rr:datatype`, leaning on R2RML's
+  natural mapping, and so were types r2g did not recognise, so a consumer could not tell
+  "this is text" from "unknown". Text columns (`char`, `varchar`, `character varying`,
+  `bpchar`, `text`, Snowflake `VARCHAR`/`TEXT`/`STRING`, ClickHouse `String`/`FixedString`,
+  and the MySQL and SQL Server text types) now carry an explicit `rr:datatype xsd:string`.
+  Some integer columns were left untyped and now carry `xsd:integer`: ClickHouse
+  `Nullable(…)` and `LowCardinality(…)` are unwrapped before classifying, `NUMBER`/`DECIMAL`/
+  `NUMERIC` with scale 0 (`NUMBER(38,0)`) is an integer, as are MySQL `tinyint` and
+  `mediumint`. A `NUMBER` whose type string carries no scale may hold fractions and is
+  `xsd:decimal` (it was untyped). `uuid`, `json`/`jsonb`, `bytea`, arrays and other
+  unclassified types still have no `rr:datatype`; so do `interval` and range types such as
+  `int4range`, which were wrongly `xsd:integer` because their names start with `int`.
+- **The Snowflake connector records a number column's precision and scale (#24).**
+  Snowflake's `INFORMATION_SCHEMA` reports every integer column (`INT`, `BIGINT`, …) as bare
+  `NUMBER`, so without the scale none of them could be typed as an integer. A snapshot now
+  records `number(38,0)` or `number(10,2)` from `NUMERIC_PRECISION` and `NUMERIC_SCALE`.
+  The JSON type is unchanged (still `float`), and `--compare-last`, `diff-schema` and the
+  MCP diff treat a snapshot's older bare `number` as the same type, so re-snapshotting
+  reports no change. A `schema.json` written by hand or by an older r2g keeps its bare
+  `number`, which the R2RML types as `xsd:decimal`: re-snapshot it, or write `number(38,0)`
+  for its integer columns. Regenerate committed R2RML to pick this up: every text column gains a
+  datatype, which Ontop reads the same as the natural mapping.
 - **A CSV source reads `\N` as NULL (#73, PRD P6.4).** `\N` is how PostgreSQL's
   text-format `COPY` and Snowflake's default unload write NULL. A single one made a numeric
   column text, and the missing values loaded as the two-character string `\N`, with no

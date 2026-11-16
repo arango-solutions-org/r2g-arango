@@ -17,6 +17,7 @@ from rdflib import RDF, Namespace  # noqa: E402
 from r2g.r2rml import (  # noqa: E402
     DEFAULT_CONCEPT_BASE,
     R2RMLError,
+    _xsd_datatype,
     mapping_to_r2rml,
 )
 from r2g.types import (  # noqa: E402
@@ -177,9 +178,122 @@ def test_datatype_mapping():
     assert str(g.value(poms["id"], RR.datatype)).endswith("integer")
     assert str(g.value(poms["total"], RR.datatype)).endswith("decimal")
     assert str(g.value(poms["created"], RR.datatype)).endswith("dateTime")
-    # varchar -> string-like -> no explicit datatype.
+    # Text columns carry an explicit xsd:string (r2g-arango#24), so a missing
+    # rr:datatype only ever means "r2g did not classify this column".
     user_poms = _poms(g, _triples_maps(g)["User"])
-    assert g.value(user_poms["email"], RR.datatype) is None
+    assert str(g.value(user_poms["email"], RR.datatype)).endswith("#string")
+    assert str(g.value(user_poms["name"], RR.datatype)).endswith("#string")
+
+
+XSD = "http://www.w3.org/2001/XMLSchema#"
+
+
+@pytest.mark.parametrize(
+    ("sql_type", "expected"),
+    [
+        # Text, from each dialect r2g introspects (r2g-arango#24 table, row 1).
+        ("varchar(40)", "xsd:string"),
+        ("character varying", "xsd:string"),
+        ("bpchar", "xsd:string"),
+        ("character", "xsd:string"),
+        ("text", "xsd:string"),
+        ("VARCHAR(16777216)", "xsd:string"),
+        ("TEXT", "xsd:string"),
+        ("STRING", "xsd:string"),
+        ("nvarchar", "xsd:string"),
+        ("longtext", "xsd:string"),
+        ("String", "xsd:string"),
+        ("FixedString(16)", "xsd:string"),
+        # Snowflake NUMBER/DECIMAL by scale; no scale -> decimal (row 2).
+        ("NUMBER(38,0)", "xsd:integer"),
+        ("number(10, 0)", "xsd:integer"),
+        ("number(38)", "xsd:integer"),
+        ("NUMBER(10,2)", "xsd:decimal"),
+        ("number", "xsd:decimal"),
+        ("DECIMAL(18,0)", "xsd:integer"),
+        ("decimal(18,4)", "xsd:decimal"),
+        ("numeric", "xsd:decimal"),
+        ("numeric(12,2)", "xsd:decimal"),
+        # ClickHouse wrappers are unwrapped before classifying (rows 3 and 4).
+        ("Nullable(Int32)", "xsd:integer"),
+        ("LowCardinality(String)", "xsd:string"),
+        ("LowCardinality(Nullable(String))", "xsd:string"),
+        ("Nullable(Float64)", "xsd:double"),
+        ("Nullable(DateTime)", "xsd:dateTime"),
+        # ClickHouse DecimalN(S): the one parameter is the scale.
+        ("Decimal32(0)", "xsd:integer"),
+        ("Decimal64(4)", "xsd:decimal"),
+        ("Decimal(9, 2)", "xsd:decimal"),
+        # Integers that were already typed stay typed; MySQL/SQL Server ones join.
+        ("integer", "xsd:integer"),
+        ("smallint", "xsd:integer"),
+        ("bigint", "xsd:integer"),
+        ("UInt64", "xsd:integer"),
+        ("tinyint", "xsd:integer"),
+        ("mediumint", "xsd:integer"),
+        ("tinyint(1)", "xsd:integer"),
+        ("int", "xsd:integer"),
+        ("int unsigned", "xsd:integer"),
+        ("Int256", "xsd:integer"),
+        # Other classified types are unchanged.
+        ("real", "xsd:double"),
+        ("boolean", "xsd:boolean"),
+        ("date", "xsd:date"),
+        ("timestamp_ntz", "xsd:dateTime"),
+        # Types r2g does not classify keep no datatype: "unknown" (row 5).
+        ("uuid", None),
+        ("json", None),
+        ("jsonb", None),
+        ("bytea", None),
+        ("ARRAY", None),
+        ("integer[]", None),
+        ("Array(Int32)", None),
+        ("variant", None),
+        ("USER-DEFINED", None),
+        # Start with "int" but are not integers.
+        ("interval", None),
+        ("int4range", None),
+        ("int8range", None),
+    ],
+)
+def test_xsd_datatype_classifies_each_sql_type(sql_type, expected):
+    assert _xsd_datatype(sql_type) == expected
+
+
+@pytest.mark.parametrize(
+    ("sql_type", "expected_iri"),
+    [
+        ("varchar(40)", XSD + "string"),
+        ("NUMBER(38,0)", XSD + "integer"),
+        ("number", XSD + "decimal"),
+        ("Nullable(Int32)", XSD + "integer"),
+        ("uuid", None),
+    ],
+)
+def test_emitted_object_map_carries_the_classified_datatype(sql_type, expected_iri):
+    """End to end: the classification reaches the object map, and an
+    unclassified column has no rr:datatype at all."""
+    config = MappingConfig(
+        source_schema="s",
+        collections={
+            "things": CollectionMapping(source_table="things", target_collection="Thing"),
+        },
+    )
+    schema = Schema(
+        tables={
+            "things": Table(
+                name="things",
+                columns=[
+                    Column(name="id", data_type="integer", is_primary_key=True),
+                    Column(name="value", data_type=sql_type, is_nullable=True),
+                ],
+                primary_key=["id"],
+            )
+        }
+    )
+    g = _parse(mapping_to_r2rml(config, schema))
+    declared = g.value(_poms(g, _triples_maps(g)["Thing"])["value"], RR.datatype)
+    assert (str(declared) if declared is not None else None) == expected_iri
 
 
 def test_fk_referencing_object_map():

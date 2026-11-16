@@ -15,6 +15,32 @@ def _fk_signature(fk: Any) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
     return (tuple(fk.columns), fk.foreign_table, tuple(fk.foreign_columns))
 
 
+#: Fixed-point type names that a snapshot may record with or without
+#: ``(precision,scale)``. r2g's Snowflake connector added the parameters in
+#: r2g-arango#24, so a snapshot written before then has the bare name.
+_FIXED_POINT_TYPES = frozenset({"number", "numeric", "decimal"})
+
+
+def _same_type(old: str, new: str) -> bool:
+    """Whether two recorded column types describe the same column type.
+
+    A bare fixed-point name and the same name with parameters
+    (``number`` / ``number(38,0)``) are the same type: the bare one comes from a
+    snapshot that did not record the parameters, not from a changed column. Two
+    different parameter lists are a change.
+    """
+    if old == new:
+        return True
+    old_base, _, old_params = old.lower().partition("(")
+    new_base, _, new_params = new.lower().partition("(")
+    old_base, new_base = old_base.strip(), new_base.strip()
+    return (
+        old_base == new_base
+        and old_base in _FIXED_POINT_TYPES
+        and (not old_params or not new_params)
+    )
+
+
 def diff_schemas(old: Schema, new: Schema) -> dict[str, Any]:
     """Return a structured diff between *old* and *new* schemas.
 
@@ -52,7 +78,7 @@ def diff_schemas(old: Schema, new: Schema) -> dict[str, Any]:
         for col_name in sorted(set(old_cols) & set(new_cols)):
             oc = old_cols[col_name]
             nc = new_cols[col_name]
-            if oc.data_type != nc.data_type:
+            if not _same_type(oc.data_type, nc.data_type):
                 type_changes.append({
                     "column": col_name,
                     "old_type": oc.data_type,
