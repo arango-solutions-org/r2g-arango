@@ -7,6 +7,21 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Snowflake change capture through standard streams (#65, PRD P6.16).** `r2g cdc-start --source
+  <snowflake source>` keeps an ArangoDB copy current from one Snowflake stream per mapped table,
+  view or dynamic table, with no full reload. Inserts, updates and deletes go through the same
+  mapping as a load. An update that changes no mapped column writes nothing. Each stream is read,
+  applied and advanced in one Snowflake transaction, which rolls back if any change fails to apply.
+  After each cycle r2g records, for every collection it feeds, the source time the collection is
+  current through, in `_cdf_ingest` (`ingested_at`), where contextual-data-fabric already reads it.
+  `--once` runs a single cycle for scheduled batches. Not yet: recovering a stream that can no
+  longer be read (the run stops and names it), soft deletes, an insert-only path and a `CHANGES`
+  fallback for objects without a stream grant.
+- **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
+  string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
+
 ### Fixed
 
 - **A CSV column of whole numbers too large for a 64-bit integer loads as text, as the snapshot
@@ -44,7 +59,6 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
     write chunked CSV (SQL dialects) or JSON lines (arango), a bulk loader per dialect
     (`\copy`, `FROM INFILE`, `PUT`/`COPY INTO`, batched `import_bulk`) and `forge.bulk.json`, a
     manifest with each file's row count and SHA-256. Memory does not grow with the rows.
-
 ### Changed
 
 - **The vendored CSI schema follows arangodb-schema-analyzer 0.20.0 (CSI 1.2).** An entity

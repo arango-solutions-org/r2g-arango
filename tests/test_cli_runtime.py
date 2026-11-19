@@ -269,6 +269,80 @@ class TestCdcStart:
         assert "CDC start failed" in plain_output(result)
 
 
+class TestCdcStartFromCatalogSource:
+    """``cdc-start --source``: PostgreSQL via its slot, Snowflake via streams (P6.16)."""
+
+    @pytest.fixture
+    def catalog(self, tmp_path, monkeypatch):
+        from r2g.catalog import CatalogManager
+
+        mgr = CatalogManager(str(tmp_path / "catalog"))
+        mgr.add_source("sf", "snowflake", "snowflake://svc:pw@acct/CRM/CORE?warehouse=WH")
+        mgr.add_source("pg", "postgresql", "postgresql://u:p@pg/db")
+        mgr.add_source("ms", "mssql", "mssql://u:p@ms/db")
+        monkeypatch.setattr("r2g.main._get_catalog", lambda: mgr)
+        return mgr
+
+    def test_both_or_neither_connection_is_refused(self, schema_file, config_file, catalog):
+        both = runner.invoke(app, CDC_ARGS + ["--source", "sf", schema_file, config_file])
+        neither = runner.invoke(app, ["cdc-start", schema_file, config_file], env={"PG_CONN": ""})
+        for result in (both, neither):
+            assert result.exit_code == 1
+            assert "exactly one of --pg-conn and --source" in plain_output(result)
+
+    def test_unsupported_source_type_is_refused(self, schema_file, config_file, catalog):
+        result = runner.invoke(app, ["cdc-start", "--source", "ms", schema_file, config_file])
+        assert result.exit_code == 1
+        assert "source 'ms' is sqlserver" in plain_output(result)
+
+    def test_snowflake_refuses_last_write_wins(self, schema_file, config_file, catalog):
+        result = runner.invoke(app, [
+            "cdc-start", "--source", "sf", schema_file, config_file,
+            "--conflict-policy", "last_write_wins",
+        ])
+        assert result.exit_code == 1
+        assert "Snowflake stream gives none" in plain_output(result)
+
+    def test_snowflake_runs_the_stream_listener(self, schema_file, config_file, catalog):
+        with patch("r2g.connectors.arango_writer.ArangoWriter"), \
+             patch("r2g.cdc.handler.CDCHandler") as handler_cls, \
+             patch("r2g.main._run_snowflake_cdc") as run_sf, \
+             patch("r2g.cdc.pg_listener.PGReplicationListener") as pg_cls:
+            handler_cls.return_value.stats.as_dict.return_value = {}
+            handler_cls.return_value.resolver.log.summary.return_value = {"total_conflicts": 0}
+            result = runner.invoke(app, [
+                "cdc-start", "--source", "sf", schema_file, config_file,
+                "--once", "--stream-schema", "R2G_CDC",
+            ])
+        assert result.exit_code == 0, plain_output(result)
+        pg_cls.assert_not_called()
+        assert handler_cls.call_args.kwargs["skip_noop_updates"] is True
+        args, kwargs = run_sf.call_args
+        assert args[0] == "snowflake://svc:pw@acct/CRM/CORE?warehouse=WH"
+        assert kwargs["once"] is True
+        assert kwargs["stream_schema"] == "R2G_CDC"
+        assert kwargs["poll_interval"] == 60.0
+
+    def test_source_wins_over_pg_conn_from_the_environment(self, schema_file, config_file, catalog):
+        with patch("r2g.connectors.arango_writer.ArangoWriter"), \
+             patch("r2g.cdc.pg_listener.PGReplicationListener") as pg_cls:
+            result = runner.invoke(
+                app, ["cdc-start", "--source", "pg", schema_file, config_file],
+                env={"PG_CONN": "postgresql://from-env/db"},
+            )
+        assert result.exit_code == 0, plain_output(result)
+        assert pg_cls.call_args.kwargs["pg_conn_string"] == "postgresql://u:p@pg/db"
+
+    def test_postgres_source_uses_its_connection_string(self, schema_file, config_file, catalog):
+        with patch("r2g.connectors.arango_writer.ArangoWriter"), \
+             patch("r2g.cdc.pg_listener.PGReplicationListener") as pg_cls:
+            result = runner.invoke(app, ["cdc-start", "--source", "pg", schema_file, config_file])
+        assert result.exit_code == 0, plain_output(result)
+        kwargs = pg_cls.call_args.kwargs
+        assert kwargs["pg_conn_string"] == "postgresql://u:p@pg/db"
+        assert kwargs["poll_interval"] == 1.0
+
+
 class TestKafkaStart:
     def test_invalid_conflict_policy_exits_1(self, schema_file, config_file):
         with patch("r2g.cdc.kafka_consumer.KafkaConsumer"):

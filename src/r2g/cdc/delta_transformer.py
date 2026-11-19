@@ -114,6 +114,21 @@ class DeltaTransformer:
         """Where an edge delta is written for this edge definition."""
         return self._lpg.edge_collection if self._lpg is not None else edge_def.edge_collection
 
+    def collections_for_table(self, table_name: str) -> set[str]:
+        """Every collection a change to *table_name* can write to.
+
+        The table's document collection plus the edge collections of edges
+        sourced from it, in the target layout (one shared pair under LPG).
+        Empty when the table is not mapped.
+        """
+        mapping_entry = self._cm_by_table.get(table_name)
+        if mapping_entry is None:
+            return set()
+        names = {self._node_collection(mapping_entry[1])}
+        for edge_def in self._edges_by_source.get(table_name, []):
+            names.add(self._edge_collection(edge_def))
+        return names
+
     def _document_key_from_row(
         self, table_name: str, row: dict[str, Any]
     ) -> str | None:

@@ -39,6 +39,7 @@ class CDCStats:
         self.deltas_applied: int = 0
         self.deltas_failed: int = 0
         self.deltas_skipped: int = 0
+        self.noop_updates_skipped: int = 0
         self.transactions_completed: int = 0
         self.last_lsn: str | None = None
 
@@ -48,6 +49,7 @@ class CDCStats:
             "deltas_applied": self.deltas_applied,
             "deltas_failed": self.deltas_failed,
             "deltas_skipped": self.deltas_skipped,
+            "noop_updates_skipped": self.noop_updates_skipped,
             "transactions_completed": self.transactions_completed,
             "last_lsn": self.last_lsn,
         }
@@ -67,6 +69,13 @@ class CDCHandler:
     - ``last_write_wins`` -- compare LSN; reject stale writes
     - ``log_and_skip`` -- log conflicts, skip writes
     - ``fail`` -- raise on any conflict
+
+    With ``skip_noop_updates`` an UPDATE that carries its old row is dropped
+    when the old and new rows map to the same deltas: an edit to a column no
+    mapping uses then writes nothing. It is opt-in because a source whose old
+    row holds only the key (PostgreSQL without ``REPLICA IDENTITY FULL``)
+    gains nothing from it, and because a skipped write no longer restores a
+    target document edited by hand.
     """
 
     def __init__(
@@ -78,8 +87,10 @@ class CDCHandler:
         conflict_policy: ConflictPolicy = ConflictPolicy.SOURCE_WINS,
         temporal: bool = False,
         temporal_config: "TemporalConfig | None" = None,
+        skip_noop_updates: bool = False,
     ) -> None:
         self.writer = writer
+        self.skip_noop_updates = skip_noop_updates
         self.transformer = DeltaTransformer(schema, config)
         self._on_progress = on_progress
         self.stats = CDCStats()
@@ -211,13 +222,33 @@ class CDCHandler:
             out["_to"] = f"{coll}ProxyIn/{key}"
         return out
 
+    def is_noop_update(self, event: ChangeEvent) -> bool:
+        """True when an UPDATE changes nothing the mapping writes.
+
+        The old and new rows are both put through the mapping and the
+        resulting deltas compared, so the check covers exactly what would be
+        written: mapped columns, expressions, keys and edge endpoints. An
+        UPDATE without an old row is never a no-op.
+        """
+        if not event.is_update or not event.old_row or event.new_row is None:
+            return False
+        before = self.transformer.transform(
+            event.model_copy(update={"new_row": event.old_row, "old_row": None})
+        )
+        after = self.transformer.transform(event)
+        return [d.model_dump() for d in before] == [d.model_dump() for d in after]
+
     def handle_event(self, event: ChangeEvent) -> list[ArangoDelta]:
         """Process a single change event end-to-end.
 
         Returns the list of deltas that were produced (whether or not
-        they were applied successfully).
+        they were applied successfully). A no-op update skipped under
+        ``skip_noop_updates`` produces none.
         """
         self.stats.events_received += 1
+        if self.skip_noop_updates and self.is_noop_update(event):
+            self.stats.noop_updates_skipped += 1
+            return []
         deltas = self.transformer.transform(event)
 
         for delta in deltas:
@@ -261,6 +292,9 @@ class CDCHandler:
         all_deltas: list[tuple[ArangoDelta, str | None]] = []
         for event in events:
             self.stats.events_received += 1
+            if self.skip_noop_updates and self.is_noop_update(event):
+                self.stats.noop_updates_skipped += 1
+                continue
             deltas = self.transformer.transform(event)
             for d in deltas:
                 all_deltas.append((d, event.lsn))

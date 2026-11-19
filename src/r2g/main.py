@@ -1569,10 +1569,69 @@ def _govern_cdc_mapping(schema, mapping, *, govern: bool, allow_sensitive: bool,
     return gated
 
 
+def _print_cdc_session(handler, policy) -> None:
+    """Session statistics and the conflict summary, printed when a CDC run ends."""
+    stats = handler.stats.as_dict()
+    console.print("\n[green]CDC listener stopped.[/green]")
+    stats_table = RichTable(title="CDC Session Statistics")
+    stats_table.add_column("Metric")
+    stats_table.add_column("Value", justify="right")
+    for k, v in stats.items():
+        stats_table.add_row(k, str(v))
+    console.print(stats_table)
+
+    conflict_summary = handler.resolver.log.summary()
+    if conflict_summary["total_conflicts"] > 0:
+        ct = RichTable(title=f"Conflicts (policy: {policy.value})")
+        ct.add_column("Type")
+        ct.add_column("Count", justify="right")
+        for ctype, count in conflict_summary["by_type"].items():
+            ct.add_row(ctype, str(count))
+        ct.add_row("[bold]Total[/bold]", f"[bold]{conflict_summary['total_conflicts']}[/bold]")
+        console.print(ct)
+
+
+def _run_snowflake_cdc(
+    connection_string, handler, schema, mapping, *,
+    namespace, stream_schema, stream_prefix, create_streams,
+    poll_interval, batch_size, once,
+) -> None:
+    """Drive the Snowflake stream listener for ``cdc-start --source``."""
+    from r2g.cdc.snowflake_streams import SnowflakeStreamListener
+
+    listener = SnowflakeStreamListener(
+        connection_string, handler, schema, mapping,
+        source_schema=namespace, stream_schema=stream_schema,
+        stream_prefix=stream_prefix, poll_interval=poll_interval,
+        fetch_size=batch_size,
+    )
+    targets = listener.discover()
+    outcome = listener.setup(create=create_streams)
+    for t in targets:
+        console.print(
+            f"  {t.kind.lower()} {t.source_object} -> stream {t.stream_name} "
+            f"[dim]({outcome.get(t.stream_name, '?')})[/dim]"
+        )
+    console.print(
+        f"[green]Snowflake CDC {'cycle' if once else 'listener'} starting[/green] "
+        f"({len(targets)} stream(s) in {listener.database}.{listener.stream_schema}"
+        + ("" if once else f", poll={poll_interval}s") + ")"
+    )
+    if not once:
+        console.print("[dim]Press Ctrl+C to stop.[/dim]")
+    listener.run(once=once)
+
+
 @app.command("cdc-start")
 def cdc_start(
-    pg_conn: str = typer.Option(
-        ..., "--pg-conn", help="PostgreSQL connection string", envvar="PG_CONN"
+    ctx: typer.Context,
+    pg_conn: Optional[str] = typer.Option(
+        None, "--pg-conn", help="PostgreSQL connection string", envvar="PG_CONN"
+    ),
+    source_name: Optional[str] = typer.Option(
+        None, "--source",
+        help="Catalog source to read changes from instead of --pg-conn "
+        "(postgresql: logical replication; snowflake: standard streams)",
     ),
     schema_file: str = typer.Argument(..., help="Path to schema JSON file"),
     config_path: str = typer.Argument(..., help="Path to mapping config YAML/JSON"),
@@ -1599,9 +1658,10 @@ def cdc_start(
         "test_decoding", "--plugin",
         help="Output plugin (test_decoding or wal2json)",
     ),
-    poll_interval: float = typer.Option(
-        1.0, "--poll-interval",
-        help="Seconds between polls when no changes are pending",
+    poll_interval: Optional[float] = typer.Option(
+        None, "--poll-interval",
+        help="Seconds between polls (default: 1 for PostgreSQL, 60 for Snowflake, "
+        "where every poll runs queries)",
     ),
     batch_size: int = typer.Option(
         1000, "--batch-size",
@@ -1639,8 +1699,35 @@ def cdc_start(
         "confidential", "--sensitivity-threshold",
         help="With --govern, exclude fields at/above this level: public|internal|confidential|restricted",
     ),
+    namespace: Optional[str] = typer.Option(
+        None, "--namespace",
+        help="Snowflake: schema holding the mapped objects (default: the connection string's)",
+    ),
+    stream_schema: Optional[str] = typer.Option(
+        None, "--stream-schema",
+        help="Snowflake: schema for r2g's streams and offset sink (default: --namespace)",
+    ),
+    stream_prefix: str = typer.Option(
+        "R2G_", "--stream-prefix",
+        help="Snowflake: stream name prefix; each stream is <prefix><object>",
+    ),
+    create_streams: bool = typer.Option(
+        True, "--create-streams/--no-create-streams",
+        help="Snowflake: create missing streams before reading",
+    ),
+    once: bool = typer.Option(
+        False, "--once",
+        help="Snowflake: run one cycle and exit (for scheduled batches)",
+    ),
 ) -> None:
-    """Start the CDC listener (continuous polling for PostgreSQL changes).
+    """Start the CDC listener (continuous polling for source changes).
+
+    With ``--pg-conn`` (or a PostgreSQL ``--source``) changes come from a
+    logical replication slot. With a Snowflake ``--source`` they come from one
+    standard stream per mapped table, view or dynamic table; after each cycle
+    the source time each collection is current through is written to
+    ``_cdf_ingest`` (``ingested_at``), and an update that changes no mapped
+    column writes nothing.
 
     Connects to PostgreSQL via a logical replication slot and ArangoDB
     via the HTTP API.  Polls for row-level changes, transforms them
@@ -1674,6 +1761,39 @@ def cdc_start(
         )
         raise typer.Exit(code=1)
 
+    if source_name and pg_conn and (
+        # By name: Typer may bundle its own click, whose enum is a different class.
+        getattr(ctx.get_parameter_source("pg_conn"), "name", None) == "ENVIRONMENT"
+    ):
+        pg_conn = None  # an explicit --source wins over PG_CONN in the environment
+    if bool(pg_conn) == bool(source_name):
+        console.print("[red]Give exactly one of --pg-conn and --source.[/red]")
+        raise typer.Exit(code=1)
+    source_type = "postgresql"
+    source_conn = pg_conn or ""
+    if source_name:
+        source = _get_catalog().get_source(source_name)
+        if source is None:
+            console.print(f"[red]Source '{source_name}' not found in catalog.[/red]")
+            raise typer.Exit(code=1)
+        source_type = (source.source_type or "postgresql").lower()
+        source_conn = source.connection_string
+        if source_type not in ("postgresql", "snowflake"):
+            console.print(
+                f"[red]cdc-start reads changes from PostgreSQL or Snowflake; "
+                f"source '{source_name}' is {source_type}.[/red]"
+            )
+            raise typer.Exit(code=1)
+    is_snowflake = source_type == "snowflake"
+    if is_snowflake and policy == ConflictPolicy.LAST_WRITE_WINS:
+        console.print(
+            "[red]last_write_wins needs a per-change position to compare, and a "
+            "Snowflake stream gives none.[/red] Use source_wins (the default)."
+        )
+        raise typer.Exit(code=1)
+    if poll_interval is None:
+        poll_interval = 60.0 if is_snowflake else 1.0
+
     temporal_config = (
         TemporalConfig(ttl_retain_seconds=ttl_seconds, smart_field=smart_field or None)
         if temporal else None
@@ -1700,6 +1820,7 @@ def cdc_start(
         handler = CDCHandler(
             writer, schema, mapping, conflict_policy=policy,
             temporal=temporal, temporal_config=temporal_config,
+            skip_noop_updates=is_snowflake,
         )
         if temporal:
             console.print(
@@ -1707,8 +1828,19 @@ def cdc_start(
                 f"(versioned writes, ttl={ttl_seconds}s"
                 + (f", smart_field={smart_field}" if smart_field else "") + ")"
             )
+        if is_snowflake:
+            _run_snowflake_cdc(
+                source_conn, handler, schema, mapping,
+                namespace=namespace, stream_schema=stream_schema,
+                stream_prefix=stream_prefix, create_streams=create_streams,
+                poll_interval=poll_interval, batch_size=batch_size, once=once,
+            )
+            _print_cdc_session(handler, policy)
+            writer.close()
+            return
+
         listener = PGReplicationListener(
-            pg_conn_string=pg_conn,
+            pg_conn_string=source_conn,
             handler=handler,
             slot_name=slot_name,
             plugin=plugin,
@@ -1728,27 +1860,11 @@ def cdc_start(
 
         listener.run()
 
-        stats = handler.stats.as_dict()
-        console.print("\n[green]CDC listener stopped.[/green]")
-        stats_table = RichTable(title="CDC Session Statistics")
-        stats_table.add_column("Metric")
-        stats_table.add_column("Value", justify="right")
-        for k, v in stats.items():
-            stats_table.add_row(k, str(v))
-        console.print(stats_table)
-
-        conflict_summary = handler.resolver.log.summary()
-        if conflict_summary["total_conflicts"] > 0:
-            ct = RichTable(title=f"Conflicts (policy: {policy.value})")
-            ct.add_column("Type")
-            ct.add_column("Count", justify="right")
-            for ctype, count in conflict_summary["by_type"].items():
-                ct.add_row(ctype, str(count))
-            ct.add_row("[bold]Total[/bold]", f"[bold]{conflict_summary['total_conflicts']}[/bold]")
-            console.print(ct)
-
+        _print_cdc_session(handler, policy)
         writer.close()
 
+    except typer.Exit:
+        raise
     except Exception as e:
         log.exception("cdc_start_failed")
         console.print(f"[red]CDC start failed:[/red] {e}")
