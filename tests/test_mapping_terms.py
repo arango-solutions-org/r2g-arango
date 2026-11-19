@@ -257,3 +257,63 @@ def test_the_editors_copy_of_the_mapping_carries_the_terms():
     assert data["collections"]["books"]["fieldTerms"] == {"title": TITLE}
     assert data["collections"]["authors"]["term"] is None
     assert [e["term"] for e in data["edges"]] == [WROTE]
+
+
+def _function(page: str, name: str) -> str:
+    """The source of one top-level function of the page, so a check cannot match elsewhere."""
+    start = page.index(f"\nfunction {name}(")
+    return page[start:page.index("\n}\n", start) + 3]
+
+
+class TestTheCanvasShowsTheTerms:
+    """Each source table shows the class it maps to, each source column the property, on the
+    canvas itself and not only in the inspector."""
+
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    def test_a_table_shows_the_class_of_every_collection_it_feeds(self):
+        pane = _function(self.page, "renderSourcePane")
+        # Every collection of the table, not only the first one found.
+        assert "_collKeysForTable(sourceTable)" in pane
+        assert "_collEntryForSourceTable" not in _function(self.page, "_termChips")
+        assert "_termChips(termKeys, (coll) => coll.term, CP.classes, 'class')" in pane
+
+    def test_a_column_shows_the_property_each_collection_names_for_that_source_column(self):
+        pane = _function(self.page, "renderSourcePane")
+        # Keyed by the source column, as the inspector writes them, not a target name.
+        assert ("_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], "
+                "CP.properties, 'property')") in pane
+
+    def test_the_chips_sit_clear_of_the_drag_handles(self):
+        pane = _function(self.page, "renderSourcePane")
+        header = pane[pane.index('class="table-name"'):pane.index('class="col-count"')]
+        assert "_termChips(" in header
+        row = pane[pane.index('field-badge fk'):pane.index('class="col-name"')]
+        assert "_termChips(" in row
+        assert pane.index("CP.properties") < pane.index('class="source-col-dot"')
+
+    def test_one_chip_per_distinct_term_naming_every_collection_that_uses_it(self):
+        chips = _function(self.page, "_termChips")
+        # Grouped by IRI, in the order the collections name them; different IRIs stay apart.
+        assert "for (const key of collKeys)" in chips
+        assert "byIri.get(iri).push(key)" in chips
+        assert "keys.join(', ')" in chips and "${iri}" in chips
+        assert "sort(" not in chips
+
+    def test_a_term_reads_as_its_label_else_its_local_name_else_the_iri(self):
+        text = _function(self.page, "_termText")
+        assert "_termLabel(uri, terms)" in text
+        assert "split(/[#/]/).pop()" in text
+        assert "return local || String(uri);" in text
+
+    def test_every_chip_value_is_escaped(self):
+        chips = _function(self.page, "_termChips")
+        assert 'title="${escHtml(' in chips
+        assert ">${escHtml(_termText(iri, terms))}</span>" in chips
+
+    def test_editing_a_table_or_column_term_redraws_the_cards(self):
+        for name in ("setCollectionTerm", "setFieldTerm"):
+            body = _function(self.page, name)
+            assert body.index("markDirty();") < body.index("renderMapper();"), name
+        # A relationship's term shows on no card, so its edit redraws nothing.
+        assert "renderMapper" not in _function(self.page, "setEdgeTerm")

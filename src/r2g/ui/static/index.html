@@ -368,6 +368,12 @@
   }
   .field-badge.pk { background: var(--yellow); color: #000; }
   .field-badge.fk { background: var(--accent); color: #000; }
+  /* The ontology term a source table or column maps to (P14.8). */
+  .term-chip {
+    font-size: 8px; padding: 0 4px; border-radius: 2px; font-weight: 700; flex-shrink: 0;
+    background: #f4fef2; color: var(--arango-green); border: 1px solid #006532;
+    max-width: 7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .field-type { margin-left: auto; font-size: 9px; color: var(--text-muted); flex-shrink: 0; }
 
   /* Target cards */
@@ -1434,6 +1440,31 @@ function _termLabel(uri, terms) {
   return found ? found.label : '';
 }
 
+// What a person reads for a term: the ontology's label, else the IRI's local name (after
+// the last '#' or '/'), else the IRI. Outside a control plane no labels are known.
+function _termText(uri, terms) {
+  const label = _termLabel(uri, terms);
+  if (label) return label;
+  const local = String(uri).split(/[#/]/).pop();
+  return local || String(uri);
+}
+
+// The terms a source table or column stands for, one chip per distinct IRI, in the order
+// its collections first name them (P14.8). A table can feed several collections, which can
+// name different terms; each chip's tooltip says which collections name it.
+function _termChips(collKeys, termOf, terms, kind) {
+  const byIri = new Map();
+  for (const key of collKeys) {
+    const iri = termOf(editState.collections[key]);
+    if (!iri) continue;
+    if (!byIri.has(iri)) byIri.set(iri, []);
+    byIri.get(iri).push(key);
+  }
+  return [...byIri].map(([iri, keys]) =>
+    `<span class="term-chip" title="${escHtml(`Ontology ${kind} of ${keys.join(', ')}: ${iri}`)}">${escHtml(_termText(iri, terms))}</span>`
+  ).join('');
+}
+
 function _termRow(label, value, list, onchange, column) {
   const known = _termLabel(value, list === 'cp-classes' ? CP.classes : CP.properties);
   const columnAttr = column === undefined ? '' : ` data-column="${escHtml(column)}"`;
@@ -1450,6 +1481,7 @@ function setCollectionTerm(collKey, value) {
   if (!coll) return;
   coll.term = String(value || '').trim() || null;
   markDirty();
+  renderMapper();
 }
 
 function setFieldTerm(collKey, column, value) {
@@ -1460,6 +1492,7 @@ function setFieldTerm(collKey, column, value) {
   if (term) terms[column] = term; else delete terms[column];
   coll.fieldTerms = terms;
   markDirty();
+  renderMapper();
 }
 
 function setEdgeTerm(idx, value) {
@@ -2779,12 +2812,14 @@ function renderSourcePane(tables) {
     const sourceTable = t.name;
     const collEntry = _collEntryForSourceTable(sourceTable);
     const excluded = new Set(collEntry ? (collEntry[1].excludeFields || []) : []);
+    const termKeys = _collKeysForTable(sourceTable);
 
     return `
       <div class="source-card${selectedCardKey === 'src:'+t.name ? ' selected' : ''}" data-table="${escHtml(t.name)}">
         <div class="source-card-header" onclick="onSourceCardClick(this.closest('.source-card').dataset.table)">
           <span class="expand-icon ${isCollapsed ? '' : 'open'}">&#9654;</span>
           <span class="table-name">${escHtml(t.name)}</span>
+          ${_termChips(termKeys, (coll) => coll.term, CP.classes, 'class')}
           <span class="col-count">${cols.length}</span>
           <button class="card-info-btn" title="Show table details" aria-label="Show details for ${escHtml(t.name)}" onclick="event.stopPropagation();inspectSource(this.closest('.source-card').dataset.table)">&#9432;</button>
           <div class="source-dot" data-table="${escHtml(t.name)}"></div>
@@ -2794,6 +2829,7 @@ function renderSourcePane(tables) {
             <div class="source-col-row${excluded.has(c.name) ? ' excluded' : ''}" data-table="${escHtml(t.name)}" data-col="${escHtml(c.name)}">
               ${c.isPk ? '<span class="field-badge pk">PK</span>' : ''}
               ${c.isFk ? '<span class="field-badge fk">FK</span>' : ''}
+              ${_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], CP.properties, 'property')}
               <span class="col-name">${escHtml(c.name)}</span>
               <span class="field-type">${escHtml(c.type)}</span>
               <div class="source-col-dot" data-table="${escHtml(t.name)}" data-col="${escHtml(c.name)}"></div>
