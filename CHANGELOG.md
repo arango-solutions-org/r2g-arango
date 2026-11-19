@@ -9,6 +9,15 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The catalog is no longer read half-written, and two changes at once both survive (PRD Phase 5d
+  notes).** `catalog.json` was emptied and then rewritten on every save. The Studio records a
+  load's result from a background thread while it answers requests, so a request arriving
+  mid-save failed reading an empty file (`Invalid JSON: EOF while parsing`), and two saves at
+  once each wrote back the catalog they had read, dropping the other's change. A save now writes
+  a temporary file and renames it over the catalog, and changes within one process take turns.
+  A save that fails, for example on a full disk, leaves the previous catalog in place. Two
+  separate processes, such as a CLI command run while the Studio writes, can still lose a change,
+  though neither can corrupt the file.
 - **A CSV column of whole numbers too large for a 64-bit integer loads as text, as the snapshot
   types it (PRD P5b.1.2, P6.4).** The snapshot called such a column text, but the load read it as
   numbers. ArangoDB stores a number above the 64-bit integer range as a double, so

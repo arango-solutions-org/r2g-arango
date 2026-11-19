@@ -4146,14 +4146,8 @@ def secrets_migrate() -> None:
     values are left alone; plaintext values are encrypted in place. Useful
     after upgrading from a version that predates at-rest encryption.
     """
-    mgr = _get_catalog()
-    catalog = mgr._load()
-    plaintext_sources = [s.name for s in catalog.sources.values() if s.connection_string]
-    plaintext_targets = [t.name for t in catalog.targets.values() if t.password]
-    mgr._save(catalog)
-    console.print(
-        f"[green]Re-encrypted {len(plaintext_sources)} sources and {len(plaintext_targets)} targets.[/green]"
-    )
+    sources, targets = _get_catalog().reencrypt_secrets()
+    console.print(f"[green]Re-encrypted {sources} sources and {targets} targets.[/green]")
 
 
 @secrets_app.command("status")
