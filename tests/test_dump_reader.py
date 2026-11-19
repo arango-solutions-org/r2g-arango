@@ -181,3 +181,15 @@ class TestWholeNumbersTooLargeFor64BitsAreText:
         path.write_bytes(b"id,name\n1,ok\n2,caf\xe9\n")
         with pytest.raises(pl.exceptions.ComputeError):
             DumpReader(str(path)).read_dataframe()
+
+    def test_the_smallest_64_bit_integer_is_still_a_number(self, tmp_path):
+        df = DumpReader(self._file(tmp_path, str(-(2**63)))).read_dataframe()
+        assert df.schema["code"] == pl.Int64
+        assert df["code"][149] == -(2**63)
+
+    def test_chunks_read_a_value_past_128_bits_as_text(self, tmp_path):
+        value = str(2**128)
+        path = self._file(tmp_path, value)
+        chunks = pl.concat(list(DumpReader(path).read_chunks(chunk_size=100)))
+        assert chunks.schema["code"] == pl.String
+        assert chunks["code"][149] == value
