@@ -28,6 +28,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The vendored CSI schema follows arangodb-schema-analyzer 0.20.0 (CSI 1.2).** An entity
+  property mapping may carry `multiValued` (boolean): the attribute holds a list and each
+  element is one value of the property. `csiVersion` admits `"1.2"`, and a `"1"` or `"1.1"`
+  document may not carry the key. r2g does not write `multiValued`; a CSI document that
+  carries it now validates against `csi_schema()` with or without the analyzer installed.
+  The drift test `test_vendored_csi_schema_matches_installed_analyzer` failed once 0.20.0
+  was published.
 - **ArangoDB projection skips an edge whose foreign key is NULL** (`project_documents` and the
   generated `forge.load.py`). No ontology generated one before self-links and `nullRate`.
 - `ColumnPlan` and `EdgePlan` gain `optional` (default `False`); `ColumnPlan.nullable` is true

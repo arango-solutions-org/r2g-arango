@@ -25,10 +25,29 @@
           }
         }
       }
+    },
+    {
+      "description": "`multiValued` needs csiVersion 1.2: a reader of version 1 or 1.1 would ignore it and read a whole list as one value, so a \"1\" or \"1.1\" document must not carry the key at all.",
+      "if": { "required": ["csiVersion"], "properties": { "csiVersion": { "enum": ["1", "1.1"] } } },
+      "then": {
+        "properties": {
+          "arangoPhysicalMapping": {
+            "properties": {
+              "entities": {
+                "additionalProperties": {
+                  "properties": {
+                    "properties": { "additionalProperties": { "not": { "required": ["multiValued"] } } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {
-    "csiVersion": { "type": "string", "enum": ["1", "1.1"] },
+    "csiVersion": { "type": "string", "enum": ["1", "1.1", "1.2"] },
 
     "conceptualModel": {
       "type": "object",
@@ -144,7 +163,7 @@
 
   "$defs": {
     "PropertyMapping": {
-      "description": "Where one entity property is stored. `field` is one literal attribute name, dots included (\"address.city\" is a single top-level attribute). `path` names a value inside a nested object, one name per level ([\"address\", \"city\"]) and needs csiVersion 1.1. At most one of the two; with neither, the property name is the attribute. Besides them, only the descriptive keys below or an ignorable `x-` key are allowed: a reader refuses anything else rather than ignore a key that might say where the value lives. Relationship property mappings keep the additive rule.",
+      "description": "Where one entity property is stored. `field` is one literal attribute name, dots included (\"address.city\" is a single top-level attribute). `path` names a value inside a nested object, one name per level ([\"address\", \"city\"]) and needs csiVersion 1.1. `multiValued` says the attribute holds a list, one value per element, and needs csiVersion 1.2. At most one of the two; with neither, the property name is the attribute. Besides them, only the descriptive keys below or an ignorable `x-` key are allowed: a reader refuses anything else rather than ignore a key that might say where the value lives. Relationship property mappings keep the additive rule.",
       "type": "object",
       "not": { "required": ["field", "path"] },
       "properties": {
@@ -165,7 +184,11 @@
         "role": { "type": "string" },
         "sentinelValues": { "type": "array" },
         "numericLike": { "type": "boolean" },
-        "sampleValues": { "type": "array" }
+        "sampleValues": { "type": "array" },
+        "multiValued": {
+          "type": "boolean",
+          "description": "True: the attribute holds a list, and each element is one value of the property (a triple per element). `type` names the type of one element. Needs csiVersion 1.2. Absent or false: the stored value, list or not, is one value."
+        }
       },
       "patternProperties": { "^x-": {} },
       "additionalProperties": false
