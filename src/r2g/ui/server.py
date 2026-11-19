@@ -1553,7 +1553,7 @@ def create_app(
                 "snapshot": {
                     "id": snap.id,
                     "capturedAt": snap.captured_at.isoformat(),
-                    "keepsUniqueConstraints": snap.schema_format_version >= 2,
+                    "keepsUniqueConstraints": snap.keeps_unique_constraints,
                 },
             }
         except Exception as e:
