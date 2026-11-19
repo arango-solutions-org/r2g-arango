@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Concatenate, Optional, ParamSpec, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator, model_serializer
@@ -238,6 +241,42 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+# One lock per catalog file, shared by every CatalogManager in the process that
+# points at it: the Studio keeps one manager, but the CLI and the MCP server make
+# their own, and a load's background thread writes while requests read.
+_FILE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.RLock:
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(os.path.realpath(path), threading.RLock())
+
+
+def _writes(
+    method: Callable[Concatenate[CatalogManager, _P], _R],
+) -> Callable[Concatenate[CatalogManager, _P], _R]:
+    """Run a load-change-save method while holding the catalog's lock.
+
+    Each change reads the whole catalog, edits its part and writes it all back;
+    without the lock, two changes at once each write back the catalog they read
+    and the later one drops the earlier one's change. Reads take no lock: a save
+    replaces the file in one step (``_save``), so a reader sees the old catalog
+    or the new one, never part of one. The lock is per process; a CLI command run
+    while the Studio is writing can still lose a change, though never corrupt the file.
+    """
+
+    @functools.wraps(method)
+    def locked(self: CatalogManager, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 class CatalogManager:
     def __init__(self, catalog_dir: str | Path | None = None):
         if catalog_dir is None:
@@ -249,6 +288,7 @@ class CatalogManager:
             self._dir = Path(catalog_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._path = self._dir / "catalog.json"
+        self._lock = _lock_for(self._path)
         self._cipher = CredentialCipher(load_secret_key(self._dir))
 
     @property
@@ -285,15 +325,36 @@ class CatalogManager:
             tok = cat.get("token", "")
             if tok and not self._cipher.is_encrypted(tok):
                 cat["token"] = self._cipher.encrypt(tok)
-        self._path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        # Catalog holds encrypted secrets; keep it owner-only readable.
+        self._replace(json.dumps(payload, indent=2, default=str))
+
+    def _replace(self, text: str) -> None:
+        """Replace ``catalog.json`` with ``text`` in one step.
+
+        Writing the file in place empties it first, so a reader that arrives
+        mid-write (the Studio reads on request threads while a load's thread
+        saves) parses an empty or partial file. The new catalog is written to a
+        temporary file in the same directory and renamed over the old one, which
+        a reader sees as either the old catalog or the new one. ``mkstemp``
+        creates the file owner-only, and the rename keeps that mode, so the
+        encrypted secrets are never readable by others, even for a moment.
+        """
+        fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=".catalog.", suffix=".tmp")
         try:
-            self._path.chmod(0o600)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # ── Source CRUD ───────────────────────────────────────────────────
 
+    @_writes
     def add_source(
         self,
         name: str,
@@ -357,6 +418,7 @@ class CatalogManager:
     def get_source(self, name: str) -> SourceConfig | None:
         return self._load().sources.get(name)
 
+    @_writes
     def update_source(self, name: str, **kwargs: Any) -> SourceConfig:
         """Update fields on an existing source. Accepts any SourceConfig field."""
         catalog = self._load()
@@ -371,6 +433,7 @@ class CatalogManager:
         logger.info("source_updated", name=name, fields=list(kwargs.keys()))
         return catalog.sources[name]
 
+    @_writes
     def remove_source(self, name: str, *, cascade: bool = False) -> bool:
         catalog = self._load()
         if name not in catalog.sources:
@@ -412,6 +475,7 @@ class CatalogManager:
 
     # ── External catalog providers (Phase 8) ─────────────────────────
 
+    @_writes
     def add_catalog(
         self,
         name: str,
@@ -455,6 +519,7 @@ class CatalogManager:
     def get_catalog(self, name: str) -> CatalogProviderConfig | None:
         return self._load().catalog_providers.get(name)
 
+    @_writes
     def remove_catalog(self, name: str) -> bool:
         catalog = self._load()
         if name not in catalog.catalog_providers:
@@ -466,6 +531,7 @@ class CatalogManager:
 
     # ── Snapshots ────────────────────────────────────────────────────
 
+    @_writes
     def create_snapshot(
         self,
         source_name: str,
@@ -494,6 +560,7 @@ class CatalogManager:
         self._save(catalog)
         return snap
 
+    @_writes
     def update_snapshot_schema(self, snapshot_id: str, schema: Schema) -> SchemaSnapshot:
         """Replace a snapshot's schema in place (used by classification re-sync)."""
         catalog = self._load()
@@ -531,6 +598,7 @@ class CatalogManager:
 
     # ── Projects ─────────────────────────────────────────────────────
 
+    @_writes
     def create_project(
         self,
         name: str,
@@ -570,6 +638,7 @@ class CatalogManager:
     def get_project(self, name: str) -> Project | None:
         return self._load().projects.get(name)
 
+    @_writes
     def update_project(self, name: str, /, **kwargs: Any) -> Project:
         """Update fields on an existing project and bump ``updated_at``.
 
@@ -590,6 +659,7 @@ class CatalogManager:
         logger.info("project_updated", name=name, fields=list(kwargs.keys()))
         return catalog.projects[name]
 
+    @_writes
     def touch_project(self, name: str) -> None:
         """Bump a project's ``updated_at`` timestamp (e.g. after a mapping save)."""
         catalog = self._load()
@@ -598,6 +668,7 @@ class CatalogManager:
         catalog.projects[name].updated_at = _now()
         self._save(catalog)
 
+    @_writes
     def delete_project(self, name: str) -> bool:
         """Delete a project and cascade-remove its load history.
 
@@ -618,6 +689,7 @@ class CatalogManager:
 
     # ── Load history ─────────────────────────────────────────────────
 
+    @_writes
     def start_load(self, project_name: str, load_type: str, mapping_hash: str = "") -> LoadRecord:
         catalog = self._load()
         record = LoadRecord(
@@ -631,6 +703,7 @@ class CatalogManager:
         self._save(catalog)
         return record
 
+    @_writes
     def complete_load(
         self,
         load_id: str,
@@ -657,6 +730,7 @@ class CatalogManager:
                 return record
         raise ValueError(f"Load record '{load_id}' not found")
 
+    @_writes
     def set_loaded_mapping(self, project_name: str, mapping: dict[str, Any]) -> None:
         """Record the mapping config that is now live in the target database.
 
@@ -681,6 +755,7 @@ class CatalogManager:
 
     # ── Target CRUD ──────────────────────────────────────────────────
 
+    @_writes
     def add_target(
         self,
         name: str,
@@ -715,6 +790,7 @@ class CatalogManager:
     def get_target(self, name: str) -> TargetConfig | None:
         return self._load().targets.get(name)
 
+    @_writes
     def update_target(self, name: str, **kwargs: Any) -> TargetConfig:
         """Update fields on an existing target. Accepts any TargetConfig field."""
         catalog = self._load()
@@ -729,6 +805,7 @@ class CatalogManager:
         logger.info("target_updated", name=name, fields=list(kwargs.keys()))
         return catalog.targets[name]
 
+    @_writes
     def remove_target(self, name: str) -> bool:
         catalog = self._load()
         if name not in catalog.targets:
@@ -737,3 +814,19 @@ class CatalogManager:
         self._save(catalog)
         logger.info("target_removed", name=name)
         return True
+
+    # ── Secrets ──────────────────────────────────────────────────────
+
+    @_writes
+    def reencrypt_secrets(self) -> tuple[int, int]:
+        """Write the catalog back so every secret is encrypted with the active key.
+
+        Saving encrypts any plaintext connection string, password or token, and
+        leaves values already encrypted as they are. Returns how many sources and
+        targets carry a secret (``r2g secrets migrate`` reports these).
+        """
+        catalog = self._load()
+        sources = sum(1 for s in catalog.sources.values() if s.connection_string)
+        targets = sum(1 for t in catalog.targets.values() if t.password)
+        self._save(catalog)
+        return sources, targets
