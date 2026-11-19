@@ -160,6 +160,15 @@ class SchemaSnapshot(BaseModel):
         return out
 
     @property
+    def keeps_unique_constraints(self) -> bool:
+        """True when this snapshot's format can hold UNIQUE keys (format 2 onwards).
+
+        At format 1 an empty ``unique_constraints`` says nothing; from format 2 it
+        says none was recorded, which is still not that none exists.
+        """
+        return self.schema_format_version >= 2
+
+    @property
     def lost_overlay_unique_keys(self) -> bool:
         """True when a reviewed overlay declared UNIQUE keys this snapshot dropped.
 
@@ -168,7 +177,7 @@ class SchemaSnapshot(BaseModel):
         those natural keys. The overlay summary records how many were declared,
         which is what makes the loss detectable. Re-capture to recover them.
         """
-        return self.schema_format_version < 2 and self.key_overlay_summary.get("uniqueConstraints", 0) > 0
+        return not self.keeps_unique_constraints and self.key_overlay_summary.get("uniqueConstraints", 0) > 0
 
 
 class Project(BaseModel):
