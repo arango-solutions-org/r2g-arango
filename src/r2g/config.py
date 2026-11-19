@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, Set
 
@@ -166,9 +167,40 @@ def _is_array_pg_type(pg_type: str) -> bool:
     return "[]" in s or s.startswith("array") or s.endswith("[]")
 
 
+#: Fixed-point types whose declared scale tells a whole number from a decimal.
+#: Every Snowflake integer is ``NUMBER(38,0)`` (recorded as ``number(38,0)``,
+#: r2g-arango#24), and ``numeric(10)`` has scale 0 by the SQL standard.
+_FIXED_POINT_TYPES = frozenset({"number", "numeric", "decimal", "fixed"})
+#: ClickHouse's sized decimals take the scale as their only argument.
+_SCALE_ONLY_DECIMALS = frozenset({"decimal32", "decimal64", "decimal128", "decimal256"})
+_SIZED_TYPE = re.compile(r"\s*([a-z0-9_ ]+?)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)\s*")
+
+
+def _declared_scale(pg_type: str) -> int | None:
+    """The scale a fixed-point type declares, or None when it declares none.
+
+    A bare ``number`` / ``numeric`` / ``decimal`` declares no scale, so its
+    values may carry a fraction and it stays a float.
+    """
+    m = _SIZED_TYPE.fullmatch(pg_type.lower())
+    if m is None:
+        return None
+    base, first, second = m.groups()
+    if base in _SCALE_ONLY_DECIMALS:
+        return int(first) if second is None else None
+    if base in _FIXED_POINT_TYPES:
+        return int(second) if second is not None else 0
+    return None
+
+
 def pg_type_to_json_type(pg_type: str) -> str:
     if _is_array_pg_type(pg_type):
         return "array"
+    # A fixed-point column with scale 0 holds whole numbers. Mapped to float, the
+    # load converted each value to a double, which cannot hold a whole number
+    # above 2**53: a 64-bit id silently lost its last digits.
+    if _declared_scale(pg_type) == 0:
+        return "integer"
     base = _base_pg_type_name(pg_type)
     if base in DEFAULT_TYPE_MAP:
         return DEFAULT_TYPE_MAP[base]
