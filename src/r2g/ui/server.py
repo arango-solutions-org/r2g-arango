@@ -1547,6 +1547,14 @@ def create_app(
                 "tables": viz._build_tables_data(),
                 "edges": viz._build_edges_data(),
                 "config": viz._build_config_data(),
+                # P14.15: which capture the tables are, and when it was taken. A snapshot
+                # older than UNIQUE-key persistence cannot hold its tables' UNIQUE keys, so
+                # their empty lists say nothing.
+                "snapshot": {
+                    "id": snap.id,
+                    "capturedAt": snap.captured_at.isoformat(),
+                    "keepsUniqueConstraints": snap.schema_format_version >= 2,
+                },
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))

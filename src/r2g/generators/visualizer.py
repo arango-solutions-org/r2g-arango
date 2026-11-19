@@ -150,6 +150,9 @@ class MappingVisualizer:
                 "columns": cols,
                 "pk": table.primary_key,
                 "foreignKeys": fks_out,
+                # Each UNIQUE key as its columns, as the snapshot recorded it. An empty list
+                # says none was recorded, not that none exists (see CURRENT_SCHEMA_FORMAT).
+                "uniqueConstraints": [list(u) for u in table.unique_constraints],
                 "targetCollection": mapping.target_collection if mapping else table_name,
                 "isJoinTable": mapping.is_join_table if mapping else False,
             })
