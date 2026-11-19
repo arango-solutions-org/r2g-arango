@@ -12,9 +12,11 @@ went wrong there (seen in CI as ``Invalid JSON: EOF while parsing`` from
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -98,3 +100,34 @@ def test_the_catalog_stays_owner_only_after_an_atomic_save(tmp_path):
     mgr.add_source("pg", "postgresql", "postgresql://u:p@host/db")
     mgr.update_source("pg", description="again")
     assert stat.S_IMODE((tmp_path / "catalog.json").stat().st_mode) == 0o600
+
+
+def test_reencrypt_secrets_encrypts_plaintext_and_counts_what_it_holds(tmp_path):
+    mgr = CatalogManager(catalog_dir=tmp_path)
+    mgr.add_source("pg", "postgresql", "postgresql://u:p@host/db")
+    mgr.add_target("arango", endpoint="http://localhost:8529", password="secret")
+    # A catalog written before encryption at rest holds plaintext.
+    path = tmp_path / "catalog.json"
+    raw = json.loads(path.read_text())
+    raw["sources"]["pg"]["connection_string"] = "postgresql://u:p@host/db"
+    path.write_text(json.dumps(raw))
+
+    assert mgr.reencrypt_secrets() == (1, 1)
+
+    stored = json.loads(path.read_text())
+    assert stored["sources"]["pg"]["connection_string"].startswith("enc:")
+    assert stored["targets"]["arango"]["password"].startswith("enc:")
+    assert mgr.get_source("pg").connection_string == "postgresql://u:p@host/db"
+
+
+def test_nothing_outside_the_catalog_manager_saves_the_catalog():
+    # A change made by calling _load/_save from outside skips the lock (@_writes).
+    package = Path(catalog_module.__file__).parent
+    offenders = [
+        f"{path.relative_to(package)}:{n}"
+        for path in package.rglob("*.py")
+        if path.name != "catalog.py"
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "._save(" in line
+    ]
+    assert not offenders, f"the catalog is saved outside CatalogManager at {offenders}"

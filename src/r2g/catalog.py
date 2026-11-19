@@ -814,3 +814,19 @@ class CatalogManager:
         self._save(catalog)
         logger.info("target_removed", name=name)
         return True
+
+    # ── Secrets ──────────────────────────────────────────────────────
+
+    @_writes
+    def reencrypt_secrets(self) -> tuple[int, int]:
+        """Write the catalog back so every secret is encrypted with the active key.
+
+        Saving encrypts any plaintext connection string, password or token, and
+        leaves values already encrypted as they are. Returns how many sources and
+        targets carry a secret (``r2g secrets migrate`` reports these).
+        """
+        catalog = self._load()
+        sources = sum(1 for s in catalog.sources.values() if s.connection_string)
+        targets = sum(1 for t in catalog.targets.values() if t.password)
+        self._save(catalog)
+        return sources, targets
