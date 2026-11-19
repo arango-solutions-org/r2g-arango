@@ -19,6 +19,17 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Snowflake integer column loads as an integer, every digit kept (PRD P12.1).** Snowflake
+  stores every integer column as `NUMBER(38,0)`. r2g typed it as a decimal, so a load converted
+  each value to a floating-point number: `7` was stored as `7.0`, and an id above 2^53 (such as
+  `9007199254740993`, or any 64-bit hash) silently lost its last digits. A fixed-point column
+  whose declared scale is 0 now loads as an integer: Snowflake's `NUMBER(38,0)` and ClickHouse's
+  `Decimal(18, 0)`, from the two connectors that record a scale. A whole `Decimal` value converts
+  exactly. **What changes for an existing load:** such columns reload as integers instead of
+  floating-point numbers; AQL compares them as equal,
+  but values above 2^53 now keep their digits. A column with a fractional scale, or one whose
+  type declares no scale (bare `numeric`, as PostgreSQL, MySQL and SQL Server report), is
+  unchanged. ArangoDB itself stores a whole number above the 64-bit range as a double.
 - **The catalog is no longer read half-written, and two changes at once both survive (PRD Phase 5d
   notes).** `catalog.json` was emptied and then rewritten on every save. The Studio records a
   load's result from a background thread while it answers requests, so a request arriving
