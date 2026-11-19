@@ -13,7 +13,7 @@ CSV has no notion of primary or foreign keys. We apply a small,
 documented heuristic so auto-mapping produces a usable ``_key``: the
 first of ``id`` / ``{table}_id`` / ``{singular(table)}_id`` /
 ``{table}id`` / ``{singular(table)}id`` (case-insensitive) that exists
-and is **unique and non-null across the whole file** is treated as the
+and is **unique, non-null and non-empty across the whole file** is treated as the
 primary key (e.g. ``customers.csv`` keyed on ``customer_id``). When the
 file has no data rows we fall back to a name-only match so introspection
 still proposes a key. Relationships can be recovered afterwards with FK
