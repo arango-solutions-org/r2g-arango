@@ -162,6 +162,15 @@ class CDCHandler:
                 raise
             return False
 
+    def apply_delta(self, delta: ArangoDelta) -> bool:
+        """Apply a delta that did not come from a change event.
+
+        Goes through the same conflict policy, temporal handling and stats
+        as event-driven deltas; used when a resync removes documents whose
+        source rows are gone. Returns True on success.
+        """
+        return self._apply_delta(delta)
+
     def _apply_delta_temporal(self, delta: ArangoDelta) -> bool:
         """Apply a delta using the immutable-proxy temporal strategy (P5.1).
 

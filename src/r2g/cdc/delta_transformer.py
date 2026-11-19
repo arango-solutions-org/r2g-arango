@@ -7,6 +7,7 @@ change events.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from r2g.cdc.models import (
@@ -28,6 +29,23 @@ _OP_MAP = {
     ChangeOperation.UPDATE: ArangoOperation.REPLACE,
     ChangeOperation.DELETE: ArangoOperation.DELETE,
 }
+
+
+@dataclass(frozen=True)
+class OwnedScope:
+    """The documents one source table writes into one collection.
+
+    ``match_field``/``match_value`` select them inside a shared (LPG)
+    collection; ``None`` means the whole collection is the table's.
+    ``shared_with`` lists other source tables that also write to the
+    collection without any field telling their documents apart.
+    """
+
+    collection: str
+    is_edge: bool
+    match_field: str | None = None
+    match_value: str | None = None
+    shared_with: tuple[str, ...] = ()
 
 
 class DeltaTransformer:
@@ -128,6 +146,46 @@ class DeltaTransformer:
         for edge_def in self._edges_by_source.get(table_name, []):
             names.add(self._edge_collection(edge_def))
         return names
+
+    def owned_scopes(self, table_name: str) -> list[OwnedScope]:
+        """Where the documents *table_name* produces live, and how to tell them apart.
+
+        Used to resync a table: every document in a scope that the table's
+        current rows no longer produce is one whose row is gone. Under LPG
+        each node and edge records its source table (``LpgConfig.source_field``),
+        so the shared collections are matched on it. Under the ``pg`` layout a
+        collection belongs to the table outright, unless the mapping has
+        another table writing to the same collection; ``shared_with`` names
+        those, and such a scope cannot be swept safely.
+        """
+        entry = self._cm_by_table.get(table_name)
+        if entry is None:
+            return []
+        _, cm = entry
+        edge_defs = self._edges_by_source.get(table_name, [])
+        if self._lpg is not None:
+            scopes = [OwnedScope(self._lpg.node_collection, False, self._lpg.source_field, table_name)]
+            if edge_defs:
+                scopes.append(
+                    OwnedScope(self._lpg.edge_collection, True, self._lpg.source_field, table_name)
+                )
+            return scopes
+
+        others = sorted(
+            c.source_table for c in self.config.collections.values()
+            if c.target_collection == cm.target_collection and c.source_table != table_name
+        )
+        scopes = [OwnedScope(cm.target_collection, False, shared_with=tuple(others))]
+        for coll in sorted({e.edge_collection for e in edge_defs}):
+            writers = {
+                e.from_collection for e in self.config.edges
+                if e.edge_collection == coll and e.from_collection != table_name
+            } | {
+                c.source_table for c in self.config.collections.values()
+                if c.is_join_table and c.target_collection == coll
+            }
+            scopes.append(OwnedScope(coll, True, shared_with=tuple(sorted(writers))))
+        return scopes
 
     def _document_key_from_row(
         self, table_name: str, row: dict[str, Any]

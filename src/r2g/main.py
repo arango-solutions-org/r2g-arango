@@ -1594,7 +1594,7 @@ def _print_cdc_session(handler, policy) -> None:
 def _run_snowflake_cdc(
     connection_string, handler, schema, mapping, *,
     namespace, stream_schema, stream_prefix, create_streams,
-    poll_interval, batch_size, once,
+    poll_interval, batch_size, once, recover_streams=True,
 ) -> None:
     """Drive the Snowflake stream listener for ``cdc-start --source``."""
     from r2g.cdc.snowflake_streams import SnowflakeStreamListener
@@ -1603,7 +1603,7 @@ def _run_snowflake_cdc(
         connection_string, handler, schema, mapping,
         source_schema=namespace, stream_schema=stream_schema,
         stream_prefix=stream_prefix, poll_interval=poll_interval,
-        fetch_size=batch_size,
+        fetch_size=batch_size, recover_streams=recover_streams,
     )
     targets = listener.discover()
     outcome = listener.setup(create=create_streams)
@@ -1715,6 +1715,12 @@ def cdc_start(
         True, "--create-streams/--no-create-streams",
         help="Snowflake: create missing streams before reading",
     ),
+    recover_streams: bool = typer.Option(
+        True, "--recover-streams/--no-recover-streams",
+        help="Snowflake: when a stream can no longer be read (stale, or its source "
+        "recreated), recreate it and resync the object, deleting documents whose "
+        "rows are gone; with --no-recover-streams the run stops and names it",
+    ),
     once: bool = typer.Option(
         False, "--once",
         help="Snowflake: run one cycle and exit (for scheduled batches)",
@@ -1727,7 +1733,8 @@ def cdc_start(
     standard stream per mapped table, view or dynamic table; after each cycle
     the source time each collection is current through is written to
     ``_cdf_ingest`` (``ingested_at``), and an update that changes no mapped
-    column writes nothing.
+    column writes nothing. A stream that can no longer be read is recreated
+    and its object resynced, unless ``--no-recover-streams``.
 
     Connects to PostgreSQL via a logical replication slot and ArangoDB
     via the HTTP API.  Polls for row-level changes, transforms them
@@ -1833,6 +1840,7 @@ def cdc_start(
                 source_conn, handler, schema, mapping,
                 namespace=namespace, stream_schema=stream_schema,
                 stream_prefix=stream_prefix, create_streams=create_streams,
+                recover_streams=recover_streams,
                 poll_interval=poll_interval, batch_size=batch_size, once=once,
             )
             _print_cdc_session(handler, policy)

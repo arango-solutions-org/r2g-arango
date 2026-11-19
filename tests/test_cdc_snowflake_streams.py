@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from r2g.cdc.delta_transformer import OwnedScope
 from r2g.cdc.handler import CDCHandler
 from r2g.cdc.models import ChangeEvent, ChangeOperation
 from r2g.cdc.snowflake_streams import (
@@ -134,6 +135,7 @@ class FakeConn:
         self.dropped: set[str] = set()
         self._tx_reads: dict[str, list[dict]] | None = None
         self._consumed: set[str] = set()
+        self.source_rows: dict[str, list[dict]] = {}  # object name -> current rows
 
     def cursor(self):
         return FakeCursor(self)
@@ -157,10 +159,15 @@ class FakeConn:
         if s.startswith("SHOW STREAMS"):
             return (["name", "table_name", "stale"],
                     [(n, t, "false") for n, t in self.streams.items()])
-        if s.startswith("CREATE STREAM"):
+        if s.startswith(("CREATE STREAM", "CREATE OR REPLACE STREAM")):
             name = s.split('"CORE".')[1].split('"')[1]
             obj = s.split(" ON ")[1].split('"')[-2]
             self.streams[name] = f"CRM.CORE.{obj}"
+            if s.startswith("CREATE OR REPLACE"):
+                # A new stream: readable again, offset at now, nothing pending.
+                self.stale.discard(name)
+                self.dropped.discard(name)
+                self.stream_rows[name] = []
             return [], []
         if s.startswith("CREATE TEMPORARY TABLE"):
             return [], []
@@ -182,6 +189,10 @@ class FakeConn:
         if s == "BEGIN":
             self._tx_reads = {}
             return [], []
+        if s.startswith("SELECT * FROM") and self._stream_of(s) in self.source_rows:
+            rows = list(self.source_rows[self._stream_of(s)])
+            cols = list(rows[0]) if rows else ["ID"]
+            return cols, [tuple(r.get(c) for c in cols) for r in rows]
         if s.startswith("SELECT * FROM"):
             name = self._stream_of(s)
             rows = list(self.stream_rows.get(name, []))
@@ -209,9 +220,21 @@ def _row(action: str, update: bool, row_id: str, **cols) -> dict:
 
 
 class FakeDB:
-    def __init__(self):
-        self.docs: dict[str, dict[str, dict]] = {}
+    def __init__(self, docs: dict[str, dict[str, dict]] | None = None):
+        self.docs: dict[str, dict[str, dict]] = docs or {}
         self.created: list[tuple[str, bool]] = []
+        self.queries: list[tuple[str, dict]] = []
+        db = self
+
+        class _Aql:
+            def execute(self, query, bind_vars, stream=False):
+                db.queries.append((query, bind_vars))
+                docs = db.docs.get(bind_vars["@c"], {})
+                if "f" in bind_vars:
+                    return iter(k for k, d in docs.items() if d.get(bind_vars["f"]) == bind_vars["v"])
+                return iter(list(docs))
+
+        self.aql = _Aql()
 
     def has_collection(self, name):
         return name in self.docs
@@ -228,6 +251,9 @@ class FakeDB:
                 assert overwrite and raise_on_document_error
                 for d in docs:
                     db.docs[name][d["_key"]] = d
+
+            def get(self, key):
+                return db.docs.get(name, {}).get(key)
 
         return _C()
 
@@ -469,7 +495,7 @@ class TestConsume:
     def test_stale_stream_is_reported_by_name(self, schema, mapping, writer):
         conn = _tables_conn()
         conn.stale = {"R2G_CASES"}
-        lst = _listener(schema, mapping, writer, conn)
+        lst = _listener(schema, mapping, writer, conn, recover_streams=False)
         with pytest.raises(StreamStaleError, match="R2G_CASES"):
             lst.poll_once()
 
@@ -479,7 +505,7 @@ class TestConsume:
         conn = _tables_conn()
         conn.dropped = {"R2G_CASES"}
         db = FakeDB()
-        lst = _listener(schema, mapping, writer, conn, db=db)
+        lst = _listener(schema, mapping, writer, conn, db=db, recover_streams=False)
         with pytest.raises(StreamStaleError, match="R2G_CASES"):
             lst.poll_once()
         # The readable stream's progress is still recorded; the broken one's
@@ -568,3 +594,194 @@ class TestCollectionsForTable:
 
     def test_unmapped_table(self, schema, mapping, writer):
         assert CDCHandler(writer, schema, mapping).transformer.collections_for_table("NOPE") == set()
+
+
+class TestOwnedScopes:
+    def test_pg_layout_owns_its_collections_outright(self, schema, mapping, writer):
+        scopes = CDCHandler(writer, schema, mapping).transformer.owned_scopes("CASES")
+        assert scopes == [
+            OwnedScope("Case", False),
+            OwnedScope("caseOf", True),
+        ]
+
+    def test_pg_layout_names_other_tables_sharing_a_collection(self, schema, mapping, writer):
+        shared = mapping.model_copy(update={"collections": {
+            **mapping.collections,
+            "ACCOUNT": CollectionMapping(source_table="ACCOUNT", target_collection="Case"),
+        }})
+        scopes = CDCHandler(writer, schema, shared).transformer.owned_scopes("CASES")
+        assert scopes[0] == OwnedScope("Case", False, shared_with=("ACCOUNT",))
+
+    def test_lpg_layout_matches_on_the_source_table_field(self, schema, mapping, writer):
+        lpg = mapping.model_copy(update={"graph_layout": "lpg"})
+        scopes = CDCHandler(writer, schema, lpg).transformer.owned_scopes("CASES")
+        field = lpg.lpg.source_field
+        assert scopes == [
+            OwnedScope(lpg.lpg.node_collection, False, field, "CASES"),
+            OwnedScope(lpg.lpg.edge_collection, True, field, "CASES"),
+        ]
+
+
+# ── recovery ────────────────────────────────────────────────────────────────
+
+
+def _broken_cases_conn() -> FakeConn:
+    """CASES was recreated under its stream; rows 1 and 2 exist now, 9 is gone."""
+    conn = _tables_conn()
+    conn.dropped = {"R2G_CASES"}
+    conn.source_rows = {"CASES": [
+        {"ID": 1, "ACCOUNT_ID": 10, "STATUS": "open"},
+        {"ID": 2, "ACCOUNT_ID": 20, "STATUS": "open"},
+    ]}
+    return conn
+
+
+def _arango_with_a_deleted_case() -> FakeDB:
+    return FakeDB({
+        "Case": {"1": {}, "2": {}, "9": {}},
+        "caseOf": {"1_10": {}, "2_20": {}, "9_90": {}},
+    })
+
+
+class TestRecovery:
+    def test_unreadable_stream_is_recreated_resynced_and_swept(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        state = FakeDB()
+        lst = _listener(schema, mapping, writer, conn, db=state)
+
+        result = lst.poll_once()
+
+        assert 'CREATE OR REPLACE STREAM "CRM"."CORE"."R2G_CASES" ON TABLE "CRM"."CORE"."CASES" ' \
+            "COMMENT = 'r2g change capture'" in conn.log
+        inserted = sorted(c.args[1]["_key"] for c in writer.insert_document.call_args_list
+                          if c.args[0] == "Case")
+        assert inserted == ["1", "2"]
+        deleted = sorted(c.args for c in writer.delete_document.call_args_list)
+        assert deleted == [("Case", "9"), ("caseOf", "9_90")]
+
+        wm = result.watermarks["R2G_CASES"]
+        assert (wm.resynced, wm.swept, wm.rows_read, wm.not_swept) == (True, 2, 2, [])
+        assert set(result.collections_stamped) == {"Account", "Case", "caseOf"}
+        doc = state.docs[STREAM_STATE_COLLECTION]["R2G_CASES"]
+        assert doc["last_resync_swept"] == 2 and "resync_pending" not in doc
+
+    def test_stream_is_recreated_before_the_watermark_and_the_read(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        _listener(schema, mapping, writer, conn).poll_once()
+        recreate = conn.log.index(next(s for s in conn.log if s.startswith("CREATE OR REPLACE")))
+        read = conn.log.index('SELECT * FROM "CRM"."CORE"."CASES"')
+        clock = max(i for i, s in enumerate(conn.log[:read]) if s == "SELECT CURRENT_TIMESTAMP()")
+        assert recreate < clock < read
+
+    def test_stale_stream_is_recovered_the_same_way(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        conn.dropped, conn.stale = set(), {"R2G_CASES"}
+        writer.db = _arango_with_a_deleted_case()
+        result = _listener(schema, mapping, writer, conn).poll_once()
+        assert result.watermarks["R2G_CASES"].resynced
+
+    def test_failed_resync_stays_pending_and_resumes_next_cycle(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        state = FakeDB()
+        lst = _listener(schema, mapping, writer, conn, db=state)
+
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        with pytest.raises(BatchNotAppliedError, match="stays pending"):
+            lst.poll_once()
+        assert state.docs[STREAM_STATE_COLLECTION]["R2G_CASES"]["resync_pending"] is True
+        assert "Case" not in state.docs[FRESHNESS_COLLECTION]
+        writer.delete_document.assert_not_called()  # no sweep after a failed resync
+
+        # The stream is readable now, but the copy is still missing changes:
+        # the next cycle resyncs instead of reading on.
+        writer.insert_document.side_effect = None
+        result = lst.poll_once()
+        assert result.watermarks["R2G_CASES"].resynced
+        assert "Case" in state.docs[FRESHNESS_COLLECTION]
+
+    def test_a_pending_resync_from_an_earlier_run_is_resumed(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        conn.dropped = set()
+        writer.db = _arango_with_a_deleted_case()
+        state = FakeDB({STREAM_STATE_COLLECTION: {
+            "R2G_CASES": {"_key": "R2G_CASES", "resync_pending": True},
+        }})
+        result = _listener(schema, mapping, writer, conn, db=state).poll_once()
+        assert result.watermarks["R2G_CASES"].resynced
+        assert not any("R2G_CASES" in s for s in conn.log if s.startswith("SELECT SYSTEM$"))
+
+    def test_a_pending_resync_without_recovery_stops_the_run(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        conn.dropped = set()
+        state = FakeDB({STREAM_STATE_COLLECTION: {
+            "R2G_CASES": {"_key": "R2G_CASES", "resync_pending": True},
+        }})
+        lst = _listener(schema, mapping, writer, conn, db=state, recover_streams=False)
+        with pytest.raises(StreamStaleError, match="unfinished"):
+            lst.poll_once()
+
+    def test_a_shared_collection_is_reported_not_swept(self, schema, mapping, writer):
+        shared = mapping.model_copy(update={"collections": {
+            **mapping.collections,
+            "ACCOUNT": CollectionMapping(source_table="ACCOUNT", target_collection="Case"),
+        }})
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        result = _listener(schema, shared, writer, conn).poll_once()
+        wm = result.watermarks["R2G_CASES"]
+        assert writer.delete_document.call_args_list == [(("caseOf", "9_90"),)]
+        assert wm.not_swept and wm.not_swept[0].startswith("Case: also written by ACCOUNT")
+
+    def test_lpg_sweep_only_touches_the_tables_own_documents(self, schema, mapping, writer):
+        lpg = mapping.model_copy(update={"graph_layout": "lpg"})
+        conn = _broken_cases_conn()
+        writer.db = FakeDB({"nodes": {
+            "Case_1": {"sourceTable": "CASES"},
+            "Case_9": {"sourceTable": "CASES"},
+            "Account_9": {"sourceTable": "ACCOUNT"},
+        }})
+        _listener(schema, lpg, writer, conn).poll_once()
+        assert writer.delete_document.call_args_list == [(("nodes", "Case_9"),)]
+
+    def test_temporal_mode_sweeps_nothing(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        lst = _listener(schema, mapping, writer, conn)
+        lst.handler.temporal = True
+        lst.handler._apply_delta = MagicMock(return_value=True)  # type: ignore[method-assign]
+        result = lst.poll_once()
+        assert all("temporal mode" in r for r in result.watermarks["R2G_CASES"].not_swept)
+        assert not any(c.args[0].operation.value == "delete"
+                       for c in lst.handler._apply_delta.call_args_list)
+
+    def test_rows_that_write_no_document_refuse_the_sweep(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        lst = _listener(schema, mapping, writer, conn)
+        lst.handler.handle_event = MagicMock(return_value=[])  # type: ignore[method-assign]
+        with pytest.raises(SnowflakeStreamError, match="refusing to delete"):
+            lst.poll_once()
+        writer.delete_document.assert_not_called()
+
+    def test_a_recreated_dynamic_table_must_still_refresh_incrementally(
+        self, schema, mapping, writer,
+    ):
+        conn = _broken_cases_conn()
+        lst = _listener(schema, mapping, writer, conn)
+        lst.discover()
+        conn.objects["CASES"] = ("BASE TABLE", "YES")
+        conn.dt_info = {"CASES": {"refresh_mode": "FULL"}}
+        with pytest.raises(SnowflakeStreamError, match="FULL mode"):
+            lst.poll_once()
+        assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
+
+    def test_run_stops_on_a_fault_recovery_cannot_fix(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        lst = _listener(schema, mapping, writer, conn, poll_interval=0)
+        lst.discover()
+        del conn.objects["CASES"]
+        with pytest.raises(SnowflakeStreamError, match="does not exist"):
+            lst.run()

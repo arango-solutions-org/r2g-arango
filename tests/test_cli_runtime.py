@@ -322,6 +322,20 @@ class TestCdcStartFromCatalogSource:
         assert kwargs["once"] is True
         assert kwargs["stream_schema"] == "R2G_CDC"
         assert kwargs["poll_interval"] == 60.0
+        assert kwargs["recover_streams"] is True
+
+    def test_snowflake_recovery_can_be_turned_off(self, schema_file, config_file, catalog):
+        with patch("r2g.connectors.arango_writer.ArangoWriter"), \
+             patch("r2g.cdc.handler.CDCHandler") as handler_cls, \
+             patch("r2g.main._run_snowflake_cdc") as run_sf:
+            handler_cls.return_value.stats.as_dict.return_value = {}
+            handler_cls.return_value.resolver.log.summary.return_value = {"total_conflicts": 0}
+            result = runner.invoke(app, [
+                "cdc-start", "--source", "sf", schema_file, config_file,
+                "--once", "--no-recover-streams",
+            ])
+        assert result.exit_code == 0, plain_output(result)
+        assert run_sf.call_args.kwargs["recover_streams"] is False
 
     def test_source_wins_over_pg_conn_from_the_environment(self, schema_file, config_file, catalog):
         with patch("r2g.connectors.arango_writer.ArangoWriter"), \

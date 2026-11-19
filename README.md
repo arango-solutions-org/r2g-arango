@@ -692,8 +692,18 @@ feed, how far the copy is current:
 `ingested_at` is the **oldest** watermark among the streams that write to that collection, and a
 lower bound: the Snowflake clock read before the stream was read, or a dynamic table's
 `data_timestamp` when older. contextual-data-fabric reads `_cdf_ingest` to cite how fresh an answer
-is. A stream that can no longer be read (stale, or its source dropped or recreated) stops the run
-naming the stream; recreate it and reload that object's collections.
+is.
+
+**A stream that can no longer be read** (stale, or its source dropped or recreated) has lost the
+changes since its last cycle. r2g then recreates the stream and resyncs the object: it reads every
+current row and applies it, then deletes the object's documents and edges that no current row
+produced, so rows deleted while the stream was broken leave the copy too. The resync is marked
+pending in `_r2g_cdc_streams` until it finishes, so a failure or restart resumes it rather than
+reading on, and the object's collections keep their previous stamp meanwhile. Two cases are not
+swept and are reported in `last_resync_not_swept`: a collection another mapped table also writes to
+(PG layout; under LPG each document's `sourceTable` tells them apart), and temporal mode, which keeps
+history. If rows come back but none maps to a document, r2g refuses to sweep rather than empty the
+collection. Pass `--no-recover-streams` to stop the run and name the stream instead.
 
 ### Kafka CDC
 

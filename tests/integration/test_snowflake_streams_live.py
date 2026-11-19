@@ -8,8 +8,10 @@ done-when list that a fake cursor cannot:
 * inserts, updates and deletes on a stream over a dynamic table reach
   ArangoDB through the mapping;
 * a change to an unmapped column writes nothing;
-* a stream that can no longer be read is detected (recovery is not
-  implemented yet);
+* a stream that can no longer be read is detected, and with recovery on
+  it is recreated and its object resynced: a row changed and a row removed
+  while the stream was broken both reach ArangoDB, and changes then flow
+  through the new stream;
 * the per-collection watermark is written, with the dynamic table's data
   timestamp as its basis (``SHOW DYNAMIC TABLES`` column names are checked
   here, not assumed).
@@ -253,17 +255,53 @@ class TestSnowflakeStreamsLive:
         # fails with 091901 "Base table ... dropped, cannot read from stream".
         # (A truly stale stream cannot be produced on demand; recreating a
         # view's base table, which the docs say breaks the view's streams, was
-        # observed to leave the stream readable.)
+        # observed to leave the stream readable.) The new definition leaves
+        # out account 2 and a source row changes first, so step 6 has both a
+        # lost update and a lost delete to recover.
+        cur.execute("UPDATE ACCOUNT_SRC SET NAME = 'Acme Inc' WHERE ID = 1")
         cur.execute(
             f"CREATE OR REPLACE DYNAMIC TABLE ACCOUNT TARGET_LAG = DOWNSTREAM "
             f"WAREHOUSE = {os.environ['SNOWFLAKE_WAREHOUSE']} REFRESH_MODE = INCREMENTAL "
-            "AS SELECT ID, NAME, NOTES FROM ACCOUNT_SRC"
+            "AS SELECT ID, NAME, NOTES FROM ACCOUNT_SRC WHERE ID <> 2"
         )
-        with pytest.raises(StreamStaleError, match="R2G_ACCOUNT"):
-            listener.poll_once()
+        listener.recover_streams = False
+        try:
+            with pytest.raises(StreamStaleError, match="R2G_ACCOUNT"):
+                listener.poll_once()
+        finally:
+            listener.recover_streams = True
         # The other stream still advanced; collections fed by the broken one
         # keep their last stamp rather than claiming a newer one.
         assert _docs(db, STREAM_STATE_COLLECTION)["R2G_CASES"]["applied_through"] > case_mark
         stamps = _docs(db, FRESHNESS_COLLECTION)
         account_mark = _docs(db, STREAM_STATE_COLLECTION)["R2G_ACCOUNT"]["applied_through"]
         assert stamps["Account"]["ingested_at"] == account_mark
+
+    def test_6_unreadable_stream_is_recovered(self, listener, sf, arango_db):
+        _, db = arango_db
+        before = _docs(db, STREAM_STATE_COLLECTION)["R2G_ACCOUNT"]["applied_through"]
+
+        result = listener.poll_once()
+
+        wm = result.watermarks["R2G_ACCOUNT"]
+        assert wm.resynced and wm.swept == 1 and wm.not_swept == []
+        accounts = _docs(db, "Account")
+        assert {k: d["NAME"] for k, d in accounts.items()} == {"1": "Acme Inc"}
+        state = _docs(db, STREAM_STATE_COLLECTION)["R2G_ACCOUNT"]
+        assert "resync_pending" not in state and state["last_resync_swept"] == 1
+        assert state["applied_through"] > before
+        stamps = _docs(db, FRESHNESS_COLLECTION)
+        assert datetime.fromisoformat(stamps["Account"]["ingested_at"]) == wm.applied_through
+        assert not result.watermarks["R2G_CASES"].resynced
+
+    def test_7_changes_flow_through_the_recreated_stream(self, listener, sf, arango_db):
+        cur, _ = sf
+        _, db = arango_db
+        cur.execute("INSERT INTO ACCOUNT_SRC VALUES (4,'Delta','n4')")
+        _refresh(cur)
+        result = listener.poll_once()
+        wm = result.watermarks["R2G_ACCOUNT"]
+        assert not wm.resynced and wm.events == 1
+        assert {k: d["NAME"] for k, d in _docs(db, "Account").items()} == {
+            "1": "Acme Inc", "4": "Delta",
+        }
