@@ -95,5 +95,16 @@ class ClickHouseDialect(SqlDialect):
         # After the two standard header lines ("-- Federation Forge…", "-- dialect…").
         return "\n".join(lines[:2] + header + lines[2:])
 
+    def bulk_header(self) -> List[str]:
+        return [
+            "-- FROM INFILE is read by clickhouse-client, not the server. Run from this",
+            "-- directory, after the DDL:",
+            "--   clickhouse-client --multiquery --queries-file forge.sql --queries-file forge.bulk.sql",
+            "-- \\N reads as NULL (format_csv_null_representation's default).",
+        ]
+
+    def bulk_load_statement(self, physical: str, columns: str, path: str) -> str:
+        return f"INSERT INTO {physical} ({columns}) FROM INFILE '{path}' FORMAT CSV;"
+
 
 __all__ = ["CLICKHOUSE_TYPE_FOR_JSON_TYPE", "ClickHouseDialect", "fk_intent_comment"]

@@ -7,6 +7,41 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-18
+
+### Added
+
+- **Forge at volume (PLAN F-9, F-10, F-11; contextual-data-fabric S5 and ADR-0011 D9).**
+  - *Self-links.* An ontology may link a class to itself (`Employee -> Employee`, type
+    `employeesToEmployees`). Each row points at an earlier row of its table or is a root (row 1
+    always is), so the links form a forest, load in order with the declared constraint, and
+    re-derive through Auto-Map as the declared relationship. The foreign-key column is nullable.
+    A cycle between two different classes is still refused.
+  - *Scale knobs.* `ForgeScale` (`r2g forge generate --scale scale.json`, and a `scale` argument on
+    `generate`, `plan_schema` and `synthesize_rows`): a row count per class, and per relationship a
+    fan-out distribution (`uniform`, or `zipf` with an `exponent`) and a `nullRate`. A knob naming
+    nothing in the ontology, or out of range, is refused by name. With no knob set the rows are
+    byte-identical to 0.10.0's for the same seed, so committed Forge suites do not move.
+  - *Streaming.* `stream_rows` yields `(table, row)` without holding any row; `synthesize_rows`
+    now collects it. `generate_bulk` / `BulkWriter` (`r2g forge generate --bulk --chunk-rows N`)
+    write chunked CSV (SQL dialects) or JSON lines (arango), a bulk loader per dialect
+    (`\copy`, `FROM INFILE`, `PUT`/`COPY INTO`, batched `import_bulk`) and `forge.bulk.json`, a
+    manifest with each file's row count and SHA-256. Memory does not grow with the rows.
+
+### Changed
+
+- **The vendored CSI schema follows arangodb-schema-analyzer 0.20.0 (CSI 1.2).** An entity
+  property mapping may carry `multiValued` (boolean): the attribute holds a list and each
+  element is one value of the property. `csiVersion` admits `"1.2"`, and a `"1"` or `"1.1"`
+  document may not carry the key. r2g does not write `multiValued`; a CSI document that
+  carries it now validates against `csi_schema()` with or without the analyzer installed.
+  The drift test `test_vendored_csi_schema_matches_installed_analyzer` failed once 0.20.0
+  was published.
+- **ArangoDB projection skips an edge whose foreign key is NULL** (`project_documents` and the
+  generated `forge.load.py`). No ontology generated one before self-links and `nullRate`.
+- `ColumnPlan` and `EdgePlan` gain `optional` (default `False`); `ColumnPlan.nullable` is true
+  for an optional foreign key.
+
 ### Fixed
 
 - **A CSV column of whole numbers too large for a 64-bit integer loads as text, as the snapshot
@@ -67,6 +102,29 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preamble: they need `ARANGO_PASSWORD` exported, and nothing checks `arangoimport`'s
   `warnings/errors:` line, which it leaves non-zero while still exiting 0 after dropping rows.
   A comment at the top of those views now says so; the full bundle does both.
+- **R2RML: a missing `rr:datatype` now means only "r2g did not classify this column"
+  (#24, PRD P12.1).** Text columns were emitted with no `rr:datatype`, leaning on R2RML's
+  natural mapping, and so were types r2g did not recognise, so a consumer could not tell
+  "this is text" from "unknown". Text columns (`char`, `varchar`, `character varying`,
+  `bpchar`, `text`, Snowflake `VARCHAR`/`TEXT`/`STRING`, ClickHouse `String`/`FixedString`,
+  and the MySQL and SQL Server text types) now carry an explicit `rr:datatype xsd:string`.
+  Some integer columns were left untyped and now carry `xsd:integer`: ClickHouse
+  `Nullable(…)` and `LowCardinality(…)` are unwrapped before classifying, `NUMBER`/`DECIMAL`/
+  `NUMERIC` with scale 0 (`NUMBER(38,0)`) is an integer, as are MySQL `tinyint` and
+  `mediumint`. A `NUMBER` whose type string carries no scale may hold fractions and is
+  `xsd:decimal` (it was untyped). `uuid`, `json`/`jsonb`, `bytea`, arrays and other
+  unclassified types still have no `rr:datatype`; so do `interval` and range types such as
+  `int4range`, which were wrongly `xsd:integer` because their names start with `int`.
+- **The Snowflake connector records a number column's precision and scale (#24).**
+  Snowflake's `INFORMATION_SCHEMA` reports every integer column (`INT`, `BIGINT`, …) as bare
+  `NUMBER`, so without the scale none of them could be typed as an integer. A snapshot now
+  records `number(38,0)` or `number(10,2)` from `NUMERIC_PRECISION` and `NUMERIC_SCALE`.
+  The JSON type is unchanged (still `float`), and `--compare-last`, `diff-schema` and the
+  MCP diff treat a snapshot's older bare `number` as the same type, so re-snapshotting
+  reports no change. A `schema.json` written by hand or by an older r2g keeps its bare
+  `number`, which the R2RML types as `xsd:decimal`: re-snapshot it, or write `number(38,0)`
+  for its integer columns. Regenerate committed R2RML to pick this up: every text column gains a
+  datatype, which Ontop reads the same as the natural mapping.
 - **A CSV source reads `\N` as NULL (#73, PRD P6.4).** `\N` is how PostgreSQL's
   text-format `COPY` and Snowflake's default unload write NULL. A single one made a numeric
   column text, and the missing values loaded as the two-character string `\N`, with no
@@ -1160,7 +1218,8 @@ Initial phased implementation (not yet published to PyPI):
   pipeline, `r2g source dump` CLI, pure-Python FK inference with
   optional value-overlap sampler.
 
-[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.1...v0.8.2
