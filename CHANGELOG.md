@@ -7,6 +7,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A project's mapping data carries each table's UNIQUE keys and the capture it comes from
+  (PRD P14.15).** `GET /api/projects/{name}/graph-data` gives each table a `uniqueConstraints`
+  list (each key as its columns) and adds a `snapshot` with its `id`, `capturedAt`, and
+  `keepsUniqueConstraints`, which is false for a snapshot saved before UNIQUE keys were kept,
+  whose empty lists say nothing. A consumer outside the Studio, such as a control plane's
+  workspace, can then show a source's keys and when its schema was captured. Additive: every
+  field already there is unchanged.
+
 ### Fixed
 
 - **The catalog is no longer read half-written, and two changes at once both survive (PRD Phase 5d

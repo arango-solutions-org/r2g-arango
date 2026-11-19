@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from r2g.catalog import CatalogManager
+from r2g.catalog import CatalogManager, SchemaSnapshot
 from r2g.config import ConfigManager
 from r2g.types import (
     CollectionMapping,
@@ -1070,6 +1070,46 @@ class TestMappingEndpoints:
         data = resp.json()
         assert "graph" in data
         assert "tables" in data
+
+    def test_graph_data_carries_unique_keys_and_the_capture(self, client, tmp_path, catalog_dir):
+        """P14.15: a reader outside the Studio sees each table's UNIQUE keys and which
+        capture the tables are, with when it was taken."""
+        self._setup_project(client, tmp_path, catalog_dir)
+        mgr = CatalogManager(catalog_dir)
+        snap = mgr.create_snapshot("src", Schema(tables={
+            "users": Table(name="users", columns=[
+                Column(name="id", data_type="integer", is_primary_key=True),
+                Column(name="email", data_type="text"),
+                Column(name="tenant", data_type="text"),
+                Column(name="handle", data_type="text"),
+            ], primary_key=["id"], unique_constraints=[["email"], ["tenant", "handle"]]),
+        }))
+        data = client.get("/api/projects/proj/graph-data").json()
+        users = next(t for t in data["tables"] if t["name"] == "users")
+        assert users["uniqueConstraints"] == [["email"], ["tenant", "handle"]]
+        assert data["snapshot"] == {
+            "id": snap.id,
+            "capturedAt": snap.captured_at.isoformat(),
+            "keepsUniqueConstraints": True,
+        }
+
+    def test_graph_data_says_an_old_capture_cannot_hold_unique_keys(
+            self, client, tmp_path, catalog_dir):
+        """A snapshot saved before UNIQUE keys were kept has none to give: its empty lists
+        are not "none", and the answer says so."""
+        self._setup_project(client, tmp_path, catalog_dir)
+        mgr = CatalogManager(catalog_dir)
+        legacy = mgr.get_latest_snapshot("src").model_dump(mode="json")
+        legacy.update(id="legacy", captured_at="2099-01-01T00:00:00Z")
+        legacy.pop("schema_format_version", None)
+        catalog = mgr._load()
+        catalog.snapshots["legacy"] = SchemaSnapshot.model_validate(legacy)
+        mgr._save(catalog)
+        data = client.get("/api/projects/proj/graph-data").json()
+        assert data["snapshot"]["id"] == "legacy"
+        assert data["snapshot"]["capturedAt"].startswith("2099-01-01T00:00:00")
+        assert data["snapshot"]["keepsUniqueConstraints"] is False
+        assert all(t["uniqueConstraints"] == [] for t in data["tables"])
 
     def test_diff_mapping(self, client, tmp_path, catalog_dir):
         self._setup_project(client, tmp_path, catalog_dir)
