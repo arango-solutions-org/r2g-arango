@@ -7,6 +7,23 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A CSV column of whole numbers too large for a 64-bit integer loads as text, as the snapshot
+  types it (PRD P5b.1.2, P6.4).** The snapshot called such a column text, but the load read it as
+  numbers. ArangoDB stores a number above the 64-bit integer range as a double, so
+  `10000000000000000001` was stored as `1e+19` and every value in a column of 20-digit identifiers
+  lost its low digits. A value of 40 digits or more failed both the snapshot and the load. The
+  load now reads the column as text, exactly as written in the file, leading zeros included.
+  **What changes for an existing source:** the values of such a column load as strings, not
+  numbers, and `--since` on such a column compares as text. A column whose values all fit a
+  64-bit integer is unchanged. **Needs Polars 1.41.1 or later**, the first release that reads
+  such a column as a 128-bit integer. An older Polars refuses the file at the snapshot and at
+  the load ("could not parse … as dtype i64"), as it did before this change.
+- **A CSV text column holding an empty value is not proposed as the primary key (PRD P5b.1.2).**
+  A quoted `""` is a value, not a missing one, so the column passed the unique and non-null check,
+  but an empty value cannot be a document key. The next `id`-like column is tried.
+
 ## [0.11.0] — 2026-11-18
 
 ### Added
