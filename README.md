@@ -705,11 +705,19 @@ changes since its last cycle. r2g then recreates the stream and resyncs the obje
 current row and applies it, then deletes the object's documents and edges that no current row
 produced, so rows deleted while the stream was broken leave the copy too. The resync is marked
 pending in `_r2g_cdc_streams` until it finishes, so a failure or restart resumes it rather than
-reading on, and the object's collections keep their previous stamp meanwhile. Two cases are not
-swept and are reported in `last_resync_not_swept`: a collection another mapped table also writes to
-(PG layout; under LPG each document's `sourceTable` tells them apart), and temporal mode, which keeps
-history. If rows come back but none maps to a document, r2g refuses to sweep rather than empty the
-collection. Pass `--no-recover-streams` to stop the run and name the stream instead.
+reading on, and the object's collections keep their previous stamp meanwhile. A collection another
+mapped table also writes to is not swept and is reported in `last_resync_not_swept` (PG layout; under
+LPG each document's `sourceTable` tells them apart). If rows come back but none maps to a document,
+r2g refuses to sweep rather than empty the collection. Pass `--no-recover-streams` to stop the run
+and name the stream instead.
+
+A resync has to replace what the copy holds, so in three cases r2g does not attempt one and stops the
+run naming the stream, as with `--no-recover-streams`:
+
+- with `--temporal`, where an insert never replaces an existing version;
+- under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
+  `fail` would stop at the first row the copy already holds;
+- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
 
 ### Kafka CDC
 

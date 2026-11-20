@@ -22,8 +22,10 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is stale, or its source was dropped or recreated, `cdc-start` recreates the stream, re-reads the
   whole object and deletes the documents and edges whose rows are gone, so the copy matches the
   source again. An unfinished resync is resumed on the next cycle or run. A collection another table
-  also writes to, and temporal mode, are not swept and are reported. `--no-recover-streams` stops
-  the run instead.
+  also writes to is not swept and is reported. Where a resync would not bring the copy up to date,
+  none is attempted and the run stops naming the stream: with `--temporal`, under a conflict policy
+  other than `source_wins`, and for an object with no primary key. `--no-recover-streams` stops the
+  run instead.
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 

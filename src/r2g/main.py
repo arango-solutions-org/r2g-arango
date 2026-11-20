@@ -1719,7 +1719,8 @@ def cdc_start(
         True, "--recover-streams/--no-recover-streams",
         help="Snowflake: when a stream can no longer be read (stale, or its source "
         "recreated), recreate it and resync the object, deleting documents whose "
-        "rows are gone; with --no-recover-streams the run stops and names it",
+        "rows are gone; with --no-recover-streams the run stops and names it, as it "
+        "does with --temporal, a policy other than source_wins, or an object without a key",
     ),
     once: bool = typer.Option(
         False, "--once",

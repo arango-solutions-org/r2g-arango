@@ -63,8 +63,12 @@ recreated: errno 091901) has lost the changes since its offset. With
    (:meth:`~r2g.cdc.delta_transformer.DeltaTransformer.owned_scopes`)
    that no current row produced is deleted through the handler, so rows
    deleted while the stream was unreadable leave the copy too. A collection
-   another table also writes to, or any collection in temporal mode, is not
-   swept and is reported instead.
+   another table also writes to is not swept and is reported instead.
+
+Recovery is refused, and the run stops naming the stream, where a resync
+would not bring the copy up to date: in temporal mode, under a conflict
+policy other than ``source_wins``, and for an object with no primary key
+(:meth:`SnowflakeStreamListener._why_not_recoverable`).
 
 The new stream is created before the object is read, so a change landing
 during the resync is in both the read and the stream. Replaying it next
@@ -82,6 +86,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, cast
 
+from r2g.cdc.conflict import ConflictPolicy
 from r2g.cdc.handler import CDCHandler
 from r2g.cdc.models import ArangoDelta, ArangoOperation, ChangeEvent, ChangeOperation
 from r2g.connectors.snowflake import (
@@ -160,14 +165,22 @@ class StreamStaleError(SnowflakeStreamError):
     recreate the stream and resync the object's collections.
     """
 
-    def __init__(self, stream: str, detail: str = "") -> None:
+    def __init__(self, stream: str, detail: str = "", *, not_recovered: str = "") -> None:
         self.stream = stream
         self.detail = detail
+        #: Why recovery was refused for this stream ("" when it was only off).
+        self.not_recovered = not_recovered
         super().__init__(
             f"Snowflake stream {stream} can no longer be read: it is stale, or "
             "its source was dropped or recreated, so the changes since the last "
-            "cycle are lost. Recovery recreates the stream and resyncs the "
-            "object; it is off with --no-recover-streams."
+            "cycle are lost. "
+            + (
+                f"It is not recovered: {not_recovered} Recreate the stream and "
+                "reload the object's collections."
+                if not_recovered else
+                "Recovery recreates the stream and resyncs the object; it is off "
+                "with --no-recover-streams."
+            )
             + (f" Snowflake said: {detail}" if detail else "")
         )
 
@@ -785,8 +798,13 @@ class SnowflakeStreamListener:
         """Recreate *target*'s stream and resync its object (see module docstring).
 
         Raises :class:`BatchNotAppliedError` if any write failed, leaving the
-        resync pending so the next cycle runs it again.
+        resync pending so the next cycle runs it again, and
+        :class:`StreamStaleError` before touching anything when a resync
+        would not bring the copy up to date (:meth:`_why_not_recoverable`).
         """
+        refusal = self._why_not_recoverable(target)
+        if refusal:
+            raise StreamStaleError(target.stream_name, reason, not_recovered=refusal)
         logger.warning(
             "snowflake_stream_recovering", stream=target.stream_name, reason=reason,
         )
@@ -813,6 +831,41 @@ class SnowflakeStreamListener:
             through, basis, events=rows_read, rows_read=rows_read,
             resynced=True, swept=swept, not_swept=not_swept,
         )
+
+    def _why_not_recoverable(self, target: StreamTarget) -> str:
+        """Why a resync of *target* would not bring the copy up to date ("" if it would).
+
+        A resync applies every current row as an insert, relies on that
+        insert replacing the document already there, and then deletes the
+        documents no row produced. Three configurations break that:
+
+        * **Temporal mode.** An insert writes version 0 and ignores a
+          duplicate, so it changes nothing for an entity the copy already
+          holds, and nothing is deleted either.
+        * **A conflict policy other than** ``source_wins``. ``log_and_skip``
+          skips the insert, leaving every changed row as it was, and
+          ``fail`` raises on the first row the copy holds.
+        * **An object with no primary key.** Its documents carry keys
+          ArangoDB generated, so each row would be inserted a second time
+          and no document could be matched to a row.
+        """
+        if self.handler.temporal:
+            return (
+                "in temporal mode an insert never replaces an existing version, "
+                "so a resync would leave every changed row as it was."
+            )
+        policy = self.handler.resolver.policy
+        if policy is not ConflictPolicy.SOURCE_WINS:
+            return (
+                "a resync writes every current row over the copy, which needs "
+                f"--conflict-policy source_wins (this run uses {policy.value})."
+            )
+        if not self.schema.tables[target.source_object].primary_key:
+            return (
+                f"{target.source_object} has no primary key in the schema, so its "
+                "documents cannot be matched to its rows."
+            )
+        return ""
 
     def _resync(self, target: StreamTarget) -> tuple[int, dict[str, set[str]]]:
         """Apply every current row of *target* as an insert.
@@ -861,11 +914,6 @@ class SnowflakeStreamListener:
         with its reason.
         """
         scopes = self.handler.transformer.owned_scopes(obj)
-        if self.handler.temporal:
-            return 0, [
-                f"{s.collection}: temporal mode keeps history, so a resync deletes nothing"
-                for s in scopes
-            ]
         node_scope = next((s for s in scopes if not s.is_edge), None)
         if rows_read and node_scope is not None and not written.get(node_scope.collection):
             # Rows came back but none mapped to a document: sweeping now would

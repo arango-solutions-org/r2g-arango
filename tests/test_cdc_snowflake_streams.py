@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 from arango.exceptions import DocumentInsertError
 
+from r2g.cdc.conflict import ConflictPolicy
 from r2g.cdc.delta_transformer import OwnedScope
 from r2g.cdc.handler import CDCHandler
 from r2g.cdc.models import ChangeEvent, ChangeOperation
@@ -278,8 +279,12 @@ class FakeDB:
         return _C()
 
 
-def _listener(schema, mapping, writer, conn, db=None, **kw):
-    handler = CDCHandler(writer, schema, mapping, skip_noop_updates=True)
+def _listener(
+    schema, mapping, writer, conn, db=None, conflict_policy=ConflictPolicy.SOURCE_WINS, **kw,
+):
+    handler = CDCHandler(
+        writer, schema, mapping, conflict_policy=conflict_policy, skip_noop_updates=True,
+    )
     lst = SnowflakeStreamListener(URL, handler, schema, mapping, connect=lambda **_: conn, **kw)
     lst.recorder.db = db or FakeDB()
     return lst
@@ -907,6 +912,66 @@ class TestRecovery:
         with pytest.raises(StreamStaleError, match="unfinished"):
             lst.poll_once()
 
+    @pytest.mark.parametrize("policy", [ConflictPolicy.LOG_AND_SKIP, ConflictPolicy.FAIL])
+    def test_policy_that_does_not_replace_is_not_recovered(self, schema, mapping, writer, policy):
+        # A resync applies each row as an insert. Only source_wins turns the
+        # insert of a document the copy already holds into a replace:
+        # log_and_skip skips it and fail raises. Against a real ArangoDB the
+        # first finished "resynced" with every changed row as it was, and the
+        # second raised a duplicate-key error on every cycle.
+        conn = _broken_cases_conn()
+        writer.db = _arango_with_a_deleted_case()
+        state = FakeDB()
+        lst = _listener(schema, mapping, writer, conn, db=state, conflict_policy=policy)
+
+        with pytest.raises(StreamStaleError, match="needs --conflict-policy source_wins") as caught:
+            lst.poll_once()
+
+        assert caught.value.stream == "R2G_CASES"
+        assert policy.value in caught.value.not_recovered
+        assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
+        writer.insert_document.assert_not_called()
+        writer.delete_document.assert_not_called()
+        # Nothing was started, so nothing is left pending; the readable
+        # stream's progress is still recorded.
+        assert set(state.docs[STREAM_STATE_COLLECTION]) == {"R2G_ACCOUNT"}
+
+    def test_run_stops_when_recovery_is_refused(self, schema, mapping, writer):
+        conn = _broken_cases_conn()
+        lst = _listener(
+            schema, mapping, writer, conn, conflict_policy=ConflictPolicy.FAIL, poll_interval=0,
+        )
+        cycles = 0
+        poll_once = lst.poll_once
+
+        def counted():
+            nonlocal cycles
+            cycles += 1
+            if cycles > 3:
+                lst.stop()  # without the refusal the loop would not end on its own
+            return poll_once()
+
+        lst.poll_once = counted  # type: ignore[method-assign]
+        with pytest.raises(StreamStaleError, match="It is not recovered"):
+            lst.run()
+        assert cycles == 1
+
+    def test_a_pending_resync_is_not_resumed_where_recovery_is_refused(
+        self, schema, mapping, writer,
+    ):
+        conn = _broken_cases_conn()
+        conn.dropped = set()
+        state = FakeDB({STREAM_STATE_COLLECTION: {
+            "R2G_CASES": {"_key": "R2G_CASES", "resync_pending": True},
+        }})
+        lst = _listener(
+            schema, mapping, writer, conn, db=state, conflict_policy=ConflictPolicy.LOG_AND_SKIP,
+        )
+        with pytest.raises(StreamStaleError, match="unfinished resync"):
+            lst.poll_once()
+        assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
+        assert state.docs[STREAM_STATE_COLLECTION]["R2G_CASES"]["resync_pending"] is True
+
     def test_a_shared_collection_is_reported_not_swept(self, schema, mapping, writer):
         shared = mapping.model_copy(update={"collections": {
             **mapping.collections,
@@ -930,16 +995,48 @@ class TestRecovery:
         _listener(schema, lpg, writer, conn).poll_once()
         assert writer.delete_document.call_args_list == [(("nodes", "Case_9"),)]
 
-    def test_temporal_mode_sweeps_nothing(self, schema, mapping, writer):
+    def test_temporal_mode_is_not_recovered(self, schema, mapping, writer):
+        # In temporal mode an insert writes version 0 and ignores a duplicate.
+        # Against a real ArangoDB a resync left the one existing version as it
+        # was, deleted nothing, and the collection was stamped as current.
         conn = _broken_cases_conn()
         writer.db = _arango_with_a_deleted_case()
-        lst = _listener(schema, mapping, writer, conn)
+        state = FakeDB()
+        lst = _listener(schema, mapping, writer, conn, db=state)
         lst.handler.temporal = True
         lst.handler._apply_delta = MagicMock(return_value=True)  # type: ignore[method-assign]
-        result = lst.poll_once()
-        assert all("temporal mode" in r for r in result.watermarks["R2G_CASES"].not_swept)
-        assert not any(c.args[0].operation.value == "delete"
-                       for c in lst.handler._apply_delta.call_args_list)
+
+        with pytest.raises(StreamStaleError, match="in temporal mode an insert never replaces"):
+            lst.poll_once()
+
+        assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
+        lst.handler._apply_delta.assert_not_called()
+        assert "Case" not in state.docs.get(FRESHNESS_COLLECTION, {})
+        assert set(state.docs[STREAM_STATE_COLLECTION]) == {"R2G_ACCOUNT"}
+
+    def test_object_without_a_primary_key_is_not_recovered(self, writer):
+        # Its documents carry keys ArangoDB generated. Against a real ArangoDB
+        # each attempt inserted every row again (2 documents, then 4, then 6)
+        # before the mapping-fault guard refused the sweep.
+        schema = Schema(tables={"EVENTS": Table(
+            name="EVENTS", columns=[Column(name="WHAT", data_type="TEXT")], primary_key=[],
+        )})
+        mapping = MappingConfig(collections={"EVENTS": CollectionMapping(
+            source_table="EVENTS", target_collection="Event",
+        )})
+        conn = FakeConn({"EVENTS": ("BASE TABLE", "NO")}, {"R2G_EVENTS": []})
+        conn.streams = {"R2G_EVENTS": "CRM.CORE.EVENTS"}
+        conn.dropped = {"R2G_EVENTS"}
+        conn.source_rows = {"EVENTS": [{"WHAT": "a"}, {"WHAT": "b"}]}
+        writer.db = FakeDB({"Event": {"101": {}, "102": {}}})
+
+        with pytest.raises(StreamStaleError, match="EVENTS has no primary key") as caught:
+            _listener(schema, mapping, writer, conn).poll_once()
+
+        assert caught.value.stream == "R2G_EVENTS"
+        assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
+        writer.insert_document.assert_not_called()
+        writer.delete_document.assert_not_called()
 
     def test_rows_that_write_no_document_refuse_the_sweep(self, schema, mapping, writer):
         conn = _broken_cases_conn()
