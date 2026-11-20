@@ -1059,6 +1059,22 @@ class TestRecovery:
             lst.poll_once()
         assert not any(s.startswith("CREATE OR REPLACE") for s in conn.log)
 
+    def test_fault_recovery_cannot_fix_is_reported_ahead_of_a_failing_batch(
+        self, schema, mapping, writer,
+    ):
+        # ACCOUNT's batch fails to apply and is read again next cycle; CASES
+        # is gone for good. The run loop retries on the first kind of error
+        # and stops on the second, so the second is the one it must be given.
+        conn = _broken_cases_conn()
+        conn.stream_rows["R2G_ACCOUNT"] = [_row("INSERT", False, "a", ID=1, NAME="Acme")]
+        lst = _listener(schema, mapping, writer, conn)
+        lst.discover()
+        del conn.objects["CASES"]
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        with pytest.raises(SnowflakeStreamError, match="CASES") as caught:
+            lst.poll_once()
+        assert not isinstance(caught.value, BatchNotAppliedError)
+
     def test_run_stops_on_a_fault_recovery_cannot_fix(self, schema, mapping, writer):
         conn = _broken_cases_conn()
         lst = _listener(schema, mapping, writer, conn, poll_interval=0)
