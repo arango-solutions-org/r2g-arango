@@ -48,6 +48,7 @@ the fabric's side.
 
 from __future__ import annotations
 
+import hashlib
 import signal
 import time
 from dataclasses import dataclass, field
@@ -61,6 +62,7 @@ from r2g.connectors.snowflake import (
     _parse_snowflake_url,
     _safe_connection_error,
 )
+from r2g.keys import sanitize_key_component
 from r2g.log import get_logger
 from r2g.types import MappingConfig, Schema
 
@@ -74,6 +76,9 @@ FRESHNESS_COLLECTION = "_cdf_ingest"
 
 #: Per-stream watermark and the counts of its last cycle.
 STREAM_STATE_COLLECTION = "_r2g_cdc_streams"
+
+#: The longest ``_key`` ArangoDB accepts, in bytes.
+ARANGO_MAX_KEY_LENGTH = 254
 
 #: Session-scoped table that consumes stream offsets (see module docstring).
 OFFSET_SINK = "R2G_OFFSET_SINK"
@@ -262,7 +267,7 @@ class FreshnessRecorder:
             if wm is None:
                 continue
             stream_docs.append({
-                "_key": t.stream_name.replace("$", "_"),
+                "_key": _state_key(t.stream_name),
                 "stream": t.stream_name,
                 "source_object": t.source_object,
                 "object_kind": t.kind,
@@ -306,6 +311,22 @@ class FreshnessRecorder:
                 raise_on_document_error=True,
             )
         return stamps
+
+
+def _state_key(stream_name: str) -> str:
+    """The ``_key`` of a stream's state document: legal in ArangoDB, one per stream.
+
+    A stream is named after its source object, and Snowflake allows any
+    character in a quoted identifier (``"Order Items"``); ArangoDB does not
+    in a key. Disallowed bytes are percent-encoded, which is one-to-one, so
+    two streams never share a document. A name whose encoding is too long
+    for a key keeps a readable start and ends in a digest of the whole name.
+    """
+    key = sanitize_key_component(stream_name)
+    if len(key) <= ARANGO_MAX_KEY_LENGTH:
+        return key
+    digest = hashlib.sha256(stream_name.encode("utf-8")).hexdigest()[:32]
+    return f"{key[: ARANGO_MAX_KEY_LENGTH - len(digest) - 1]}:{digest}"
 
 
 # ── Listener ────────────────────────────────────────────────────────────────

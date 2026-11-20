@@ -687,7 +687,7 @@ feed, how far the copy is current:
 | Collection | Document | Field |
 | :--- | :--- | :--- |
 | `_cdf_ingest` (system) | `_key` = the ArangoDB collection's name | `ingested_at`: ISO 8601 with offset, the source time the collection's changes are applied through |
-| `_r2g_cdc_streams` (system) | `_key` = the stream's name | `applied_through`, `basis`, and the last cycle's counts |
+| `_r2g_cdc_streams` (system) | `_key` = the stream's name, with any character ArangoDB does not allow in a key percent-encoded (`R2G_Order%20Items`) | `stream` (the name as Snowflake has it), `applied_through`, `basis`, and the last cycle's counts |
 
 `ingested_at` is the **oldest** watermark among the streams that write to that collection, and a
 lower bound: the Snowflake clock read before the stream was read, or a dynamic table's

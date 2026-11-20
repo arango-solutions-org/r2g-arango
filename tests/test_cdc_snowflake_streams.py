@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from arango.exceptions import DocumentInsertError
 
 from r2g.cdc.handler import CDCHandler
 from r2g.cdc.models import ChangeEvent, ChangeOperation
@@ -25,6 +27,7 @@ from r2g.cdc.snowflake_streams import (
     StreamStaleError,
     StreamTarget,
     StreamWatermark,
+    _state_key,
     rows_to_events,
 )
 from r2g.connectors.arango_writer import ArangoWriter
@@ -208,6 +211,18 @@ def _row(action: str, update: bool, row_id: str, **cols) -> dict:
     return {**cols, "METADATA$ACTION": action, "METADATA$ISUPDATE": update, "METADATA$ROW_ID": row_id}
 
 
+#: What ArangoDB accepts as a document key (checked against 3.12): these
+#: characters only, 1 to 254 of them. A space, ``/`` or a non-ASCII character
+#: is refused with error 1221, "illegal document key".
+_LEGAL_ARANGO_KEY = re.compile(r"[A-Za-z0-9_\-:.@()+,=;$!*'%]{1,254}")
+
+
+def _illegal_key_error() -> DocumentInsertError:
+    err = DocumentInsertError.__new__(DocumentInsertError)
+    err.error_code = 1221
+    return err
+
+
 class FakeDB:
     def __init__(self):
         self.docs: dict[str, dict[str, dict]] = {}
@@ -227,6 +242,8 @@ class FakeDB:
             def insert_many(self, docs, overwrite, raise_on_document_error):
                 assert overwrite and raise_on_document_error
                 for d in docs:
+                    if not _LEGAL_ARANGO_KEY.fullmatch(d["_key"]):
+                        raise _illegal_key_error()
                     db.docs[name][d["_key"]] = d
 
         return _C()
@@ -556,6 +573,55 @@ class TestFreshness:
         stamp = db.docs[FRESHNESS_COLLECTION]["Account"]["ingested_at"]
         assert datetime.fromisoformat(stamp) == T0
         assert datetime.fromisoformat(stamp).tzinfo is not None
+
+
+class TestStreamStateKey:
+    """A stream is named after its object, and a quoted Snowflake identifier
+    may hold characters an ArangoDB key may not."""
+
+    @pytest.mark.parametrize("stream", [
+        "R2G_ACCOUNT",
+        "R2G_Order Items",
+        "R2G_A/B",
+        "R2G_KÜNDEN",
+        "R2G_顧客",
+        "R2G_A$B",
+        "R2G_" + "X" * 400,
+        "R2G_" + "顧" * 200,
+    ])
+    def test_key_is_legal_in_arangodb(self, stream):
+        assert _LEGAL_ARANGO_KEY.fullmatch(_state_key(stream))
+
+    def test_a_plain_name_is_its_own_key(self):
+        assert _state_key("R2G_ACCOUNT") == "R2G_ACCOUNT"
+
+    @pytest.mark.parametrize(("one", "other"), [
+        ("R2G_A$B", "R2G_A_B"),
+        ("R2G_A B", "R2G_A%20B"),
+        ("R2G_" + "X" * 400, "R2G_" + "X" * 401),
+        ("R2G_" + "顧" * 200, "R2G_" + "顧" * 199 + "客"),
+    ])
+    def test_two_streams_never_share_a_key(self, one, other):
+        assert _state_key(one) != _state_key(other)
+
+    def test_object_whose_name_needs_quoting_is_recorded_and_stamped(self, writer):
+        # The state write comes after Snowflake has committed, so a key
+        # ArangoDB refuses would fail every cycle and stamp nothing.
+        schema = Schema(tables={"Order Items": Table(
+            name="Order Items",
+            columns=[Column(name="ID", data_type="NUMBER", is_primary_key=True)],
+            primary_key=["ID"],
+        )})
+        mapping = MappingConfig(collections={"Order Items": CollectionMapping(
+            source_table="Order Items", target_collection="OrderItem",
+        )})
+        conn = FakeConn({"Order Items": ("BASE TABLE", "NO")}, {})
+        db = FakeDB()
+        result = _listener(schema, mapping, writer, conn, db=db).poll_once()
+        assert result.collections_stamped == {"OrderItem": "2026-11-14T12:00:00+00:00"}
+        (doc,) = db.docs[STREAM_STATE_COLLECTION].values()
+        assert doc["stream"] == "R2G_Order Items"
+        assert doc["_key"] == "R2G_Order%20Items"
 
 
 class TestCollectionsForTable:
