@@ -719,6 +719,11 @@ run naming the stream, as with `--no-recover-streams`:
   `fail` would stop at the first row the copy already holds;
 - for an object with no primary key in the schema, whose documents cannot be matched to its rows.
 
+One case a resync does not correct. The stream is recreated and the object is read a moment later. A
+row that changes between the two and changes back before the next cycle, or is inserted and then
+deleted, shows no net change in the stream, so the copy keeps what the read saw until that row
+changes again.
+
 ### Kafka CDC
 
 Consume change events from Kafka instead of PostgreSQL logical replication. Requires the optional dependency:

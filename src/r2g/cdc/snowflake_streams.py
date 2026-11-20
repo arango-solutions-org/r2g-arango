@@ -74,6 +74,12 @@ The new stream is created before the object is read, so a change landing
 during the resync is in both the read and the stream. Replaying it next
 cycle is harmless: a stream returns each row's net change up to the read,
 so applying it after the snapshot leaves the copy at the source's state.
+
+One case is not corrected. The stream's offset is the moment it was created,
+and the object is read a moment later. A row that changes between the two
+and changes back before the next cycle, or is inserted and then deleted,
+shows no net change in the stream, so the copy keeps what the read saw
+until that row changes again.
 """
 
 from __future__ import annotations
