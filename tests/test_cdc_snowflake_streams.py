@@ -706,12 +706,22 @@ class TestStreamStateKey:
     def test_key_is_legal_in_arangodb(self, stream):
         assert _LEGAL_ARANGO_KEY.fullmatch(_state_key(stream))
 
+    @pytest.mark.parametrize("stream", ["R2G_Order Items", "R2G_A%20B", "R2G_顧客", "R2G_50%"])
+    def test_key_holds_no_percent_sign(self, stream):
+        # ArangoDB accepts "%" in a key, but python-arango (8.3.7) sends a key
+        # in the request path as it is and the server reads "%20" there as a
+        # space: get("a%20b") finds nothing, replace says not found, and
+        # delete removes nothing. A state document must be reachable by key.
+        assert "%" not in _state_key(stream)
+
     def test_a_plain_name_is_its_own_key(self):
         assert _state_key("R2G_ACCOUNT") == "R2G_ACCOUNT"
 
     @pytest.mark.parametrize(("one", "other"), [
         ("R2G_A$B", "R2G_A_B"),
         ("R2G_A B", "R2G_A%20B"),
+        ("R2G_Order Items", "R2G_Order_Items"),
+        ("R2G_A B", "R2G_A/B"),
         ("R2G_" + "X" * 400, "R2G_" + "X" * 401),
         ("R2G_" + "顧" * 200, "R2G_" + "顧" * 199 + "客"),
     ])
@@ -728,7 +738,8 @@ class TestStreamStateKey:
         assert result.collections_stamped == {"OrderItem": "2026-11-14T12:00:00+00:00"}
         (doc,) = db.docs[STREAM_STATE_COLLECTION].values()
         assert doc["stream"] == "R2G_Order Items"
-        assert doc["_key"] == "R2G_Order%20Items"
+        assert doc["_key"] == _state_key("R2G_Order Items")
+        assert doc["_key"].startswith("R2G_Order_Items.")
 
 
 class TestCollectionsForTable:

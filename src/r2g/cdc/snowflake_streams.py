@@ -63,7 +63,6 @@ from r2g.connectors.snowflake import (
     _parse_snowflake_url,
     _safe_connection_error,
 )
-from r2g.keys import sanitize_key_component
 from r2g.log import get_logger
 from r2g.types import MappingConfig, Schema
 
@@ -80,6 +79,16 @@ STREAM_STATE_COLLECTION = "_r2g_cdc_streams"
 
 #: The longest ``_key`` ArangoDB accepts, in bytes.
 ARANGO_MAX_KEY_LENGTH = 254
+
+#: The characters a stream's state key keeps from the stream's name: those
+#: ArangoDB accepts in a key, less ``%``. python-arango puts a key into the
+#: request path as it is, and the server reads ``%20`` there as a space, so a
+#: document with a percent-encoded key can be written but not then read,
+#: replaced or deleted by that key.
+_STATE_KEY_KEEPS = "A-Za-z0-9_\\-:.@()+,=;$!*'"
+_STATE_KEY_PLAIN = re.compile(f"[{_STATE_KEY_KEEPS}]+")
+_STATE_KEY_OTHER = re.compile(f"[^{_STATE_KEY_KEEPS}]")
+_STATE_KEY_DIGEST_LENGTH = 16
 
 #: Session-scoped table that consumes stream offsets (see module docstring).
 OFFSET_SINK = "R2G_OFFSET_SINK"
@@ -343,15 +352,16 @@ def _state_key(stream_name: str) -> str:
 
     A stream is named after its source object, and Snowflake allows any
     character in a quoted identifier (``"Order Items"``); ArangoDB does not
-    in a key. Disallowed bytes are percent-encoded, which is one-to-one, so
-    two streams never share a document. A name whose encoding is too long
-    for a key keeps a readable start and ends in a digest of the whole name.
+    in a key. A name that is already a legal key is the key. Any other keeps
+    a readable form, each other character as ``_``, and ends in a digest of
+    the whole name, so ``Order Items`` and ``Order_Items`` do not share a
+    document. The same holds for a name too long to be a key.
     """
-    key = sanitize_key_component(stream_name)
-    if len(key) <= ARANGO_MAX_KEY_LENGTH:
-        return key
-    digest = hashlib.sha256(stream_name.encode("utf-8")).hexdigest()[:32]
-    return f"{key[: ARANGO_MAX_KEY_LENGTH - len(digest) - 1]}:{digest}"
+    if len(stream_name) <= ARANGO_MAX_KEY_LENGTH and _STATE_KEY_PLAIN.fullmatch(stream_name):
+        return stream_name
+    digest = hashlib.sha256(stream_name.encode("utf-8")).hexdigest()[:_STATE_KEY_DIGEST_LENGTH]
+    readable = _STATE_KEY_OTHER.sub("_", stream_name)
+    return f"{readable[: ARANGO_MAX_KEY_LENGTH - len(digest) - 1]}.{digest}"
 
 
 # ── Listener ────────────────────────────────────────────────────────────────
