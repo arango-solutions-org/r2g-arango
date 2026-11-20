@@ -108,11 +108,11 @@ class TestTheControlPlanesOwnReads:
     the project ontology to where its data lives, and reads nothing else with it."""
 
     def test_its_service_token_reads_a_projects_mapping(self, governed):
-        # Past the gate: the route answers (400, the fixture's source has no snapshot),
+        # Past the gate: the route answers (409, the fixture's pinned snapshot is absent),
         # where a forged token is refused at the gate.
         for name in ("customer-360", "someone-elses"):
             path = f"/api/projects/{name}/graph-data"
-            assert governed.get(path, headers=bearer(SERVICE)).status_code == 400
+            assert governed.get(path, headers=bearer(SERVICE)).status_code == 409
             assert governed.get(path, headers=bearer("forged")).status_code == 401
 
     def test_its_service_token_reads_nothing_else(self, governed):
@@ -124,7 +124,7 @@ class TestTheControlPlanesOwnReads:
 
     def test_a_users_context_still_reads_only_the_project_it_opens(self, governed):
         assert governed.get("/api/projects/customer-360/graph-data",
-                            headers=bearer()).status_code == 400
+                            headers=bearer()).status_code == 409
         assert governed.get("/api/projects/someone-elses/graph-data",
                             headers=bearer()).status_code == 404
 
@@ -428,7 +428,7 @@ def test_the_page_renews_its_context_for_r2g():
 def test_api_fetch_keeps_the_auth_header_when_a_caller_passes_headers():
     """Spreading opts after headers used to let a caller's headers drop the token."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    assert "{ ...opts, headers: _authHeaders(opts.headers) }" in html
+    assert "{ ...opts, headers: _authHeaders(opts.headers, includeJson) }" in html
     assert "{ headers: _authHeaders(opts.headers), ...opts }" not in html
 
 

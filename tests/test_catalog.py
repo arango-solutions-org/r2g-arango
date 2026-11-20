@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from r2g.catalog import CatalogManager
+from r2g.catalog import (
+    CURRENT_SCHEMA_FORMAT,
+    CatalogManager,
+    OntologyArtifact,
+    OntologyDependencyError,
+)
+from r2g.types import Column, Schema, Table
 
 
 class TestSourceCRUD:
@@ -77,6 +83,15 @@ class TestSnapshots:
         mgr = CatalogManager(catalog_dir=tmp_path)
         assert mgr.get_latest_snapshot("pg1") is None
 
+    def test_get_snapshot_returns_exact_snapshot(self, tmp_path, sample_schema):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("pg1", "postgresql", "conn")
+        first = mgr.create_snapshot("pg1", sample_schema)
+        mgr.create_snapshot("pg1", sample_schema)
+
+        assert mgr.get_snapshot(first.id) == first
+        assert mgr.get_snapshot("missing") is None
+
     def test_list_snapshots(self, tmp_path, sample_schema):
         mgr = CatalogManager(catalog_dir=tmp_path)
         mgr.add_source("pg1", "postgresql", "conn")
@@ -94,6 +109,25 @@ class TestSnapshots:
         mgr.create_snapshot("pg2", sample_schema)
         assert len(mgr.list_snapshots("pg1")) == 1
         assert len(mgr.list_snapshots("pg2")) == 1
+
+    def test_view_identity_survives_snapshot_reload(self, tmp_path):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("snow", "snowflake", "snowflake://example")
+        schema = Schema(
+            tables={
+                "CUSTOMER_VIEW": Table(
+                    name="CUSTOMER_VIEW",
+                    columns=[Column(name="ID", data_type="NUMBER")],
+                    is_view=True,
+                )
+            }
+        )
+        created = mgr.create_snapshot("snow", schema, pg_schema="ANALYTICS")
+
+        loaded = CatalogManager(catalog_dir=tmp_path).get_snapshot(created.id)
+        assert loaded is not None
+        assert loaded.schema_format_version == CURRENT_SCHEMA_FORMAT
+        assert loaded.schema_data.tables["CUSTOMER_VIEW"].is_view is True
 
 
 class TestProjectCRUD:
@@ -239,6 +273,113 @@ class TestProjectCRUD:
         )
         assert proj.arango_endpoint == "http://arango:8529"
         assert proj.arango_database == "mydb"
+
+    def test_create_project_binds_registered_target_and_snapshot(self, tmp_path, sample_schema):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("pg1", "postgresql", "conn")
+        pinned = mgr.create_snapshot("pg1", sample_schema)
+        mgr.create_snapshot("pg1", sample_schema)
+        mgr.add_target(
+            "graph",
+            endpoint="http://arango.internal:8529",
+            database="customer360",
+            username="operator",
+        )
+
+        project = mgr.create_project(
+            "proj",
+            "pg1",
+            "mapping.yaml",
+            target_name="graph",
+            schema_snapshot_id=pinned.id,
+        )
+
+        assert project.target_name == "graph"
+        assert project.schema_snapshot_id == pinned.id
+        assert project.arango_endpoint == "http://arango.internal:8529"
+        assert project.arango_database == "customer360"
+        assert project.arango_username == "operator"
+
+    def test_create_project_rejects_system_target(self, tmp_path):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("pg1", "postgresql", "conn")
+        mgr.add_target("system", database="_system")
+
+        with pytest.raises(ValueError, match="dedicated target database"):
+            mgr.create_project("proj", "pg1", "mapping.yaml", target_name="system")
+
+    def test_create_project_rejects_snapshot_from_another_source(
+        self, tmp_path, sample_schema
+    ):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("pg1", "postgresql", "conn")
+        mgr.add_source("pg2", "postgresql", "conn")
+        wrong = mgr.create_snapshot("pg2", sample_schema)
+
+        with pytest.raises(ValueError, match="does not belong"):
+            mgr.create_project(
+                "proj",
+                "pg1",
+                "mapping.yaml",
+                schema_snapshot_id=wrong.id,
+            )
+
+
+class TestOntologyCatalog:
+    @staticmethod
+    def _artifact() -> OntologyArtifact:
+        return OntologyArtifact(
+            filename="specific.ttl",
+            ontology_iri="https://example.test/specific",
+            serialization="turtle",
+            sha256="a" * 64,
+            size_bytes=123,
+        )
+
+    def test_add_list_get_and_remove_ontology(self, tmp_path):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        record = mgr.add_ontology(
+            name="Customer ontology",
+            root_ontology_iri="https://example.test/specific",
+            canonical_graph_digest="sha256:" + "b" * 64,
+            mapping_digest="sha256:" + "c" * 64,
+            artifacts=[self._artifact()],
+            ontology_id="customer",
+            equivalent_serializations=True,
+        )
+
+        assert record.id == "customer"
+        assert mgr.get_ontology("customer") == record
+        assert mgr.list_ontologies() == [record]
+        assert mgr.remove_ontology("customer") is True
+        assert mgr.get_ontology("customer") is None
+
+    def test_project_records_ontology_fingerprint_and_blocks_removal(
+        self, tmp_path, sample_schema
+    ):
+        mgr = CatalogManager(catalog_dir=tmp_path)
+        mgr.add_source("pg1", "postgresql", "conn")
+        mgr.create_snapshot("pg1", sample_schema)
+        ontology = mgr.add_ontology(
+            name="Customer ontology",
+            root_ontology_iri="https://example.test/specific",
+            canonical_graph_digest="sha256:" + "b" * 64,
+            mapping_digest="sha256:" + "c" * 64,
+            artifacts=[self._artifact()],
+            ontology_id="customer",
+        )
+
+        project = mgr.create_project(
+            "proj",
+            "pg1",
+            "mapping.yaml",
+            ontology_id=ontology.id,
+        )
+
+        assert project.ontology_id == ontology.id
+        assert project.ontology_fingerprint == ontology.canonical_graph_digest
+        with pytest.raises(OntologyDependencyError, match="depend"):
+            mgr.remove_ontology(ontology.id)
 
 
 class TestLoadHistory:

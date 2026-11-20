@@ -538,3 +538,28 @@ class TestIncludeViews:
     def test_the_flag_must_be_a_boolean_word(self):
         with pytest.raises(ValueError, match="include_views must be true or false"):
             SnowflakeConnector("snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=maybe")
+
+    def test_explicit_catalog_setting_enables_views_without_url_flag(self, monkeypatch):
+        scripted = self._scripted()
+        holder: dict = {}
+
+        def fake_connect(**kwargs):
+            holder["conn"] = _RecordingConnection(scripted)
+            return holder["conn"]
+
+        _install_fake_snowflake(monkeypatch, fake_connect)
+        connector = SnowflakeConnector(
+            "snowflake://svc:xxx@xy12345/ANALYTICS/CORE",
+            include_views=True,
+        )
+        schema = connector.get_schema()
+
+        assert "ACCOUNT_VW" in schema.tables
+        assert schema.tables["ACCOUNT_VW"].is_view is True
+
+    def test_explicit_catalog_setting_overrides_url_flag(self):
+        connector = SnowflakeConnector(
+            "snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=true",
+            include_views=False,
+        )
+        assert connector.include_views is False

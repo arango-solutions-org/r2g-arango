@@ -92,8 +92,10 @@ class Table(_RsaTable):
     """Physical table: the shared RSA table narrowed to r2g's :class:`Column`.
 
     Serializes to r2g's historical key set (dropping RSA's ``comment`` /
-    ``is_view`` / constraint / index enrichment and the ``extra`` passthrough)
-    for byte-stable snapshots. ``schema_name`` is kept only outside
+    constraint / index enrichment and the ``extra`` passthrough) for byte-stable
+    snapshots. ``is_view`` is written only when true so curated ontology
+    reconciliation can distinguish a view from a table after reload without
+    changing old table-only snapshots. ``schema_name`` is kept only outside
     :data:`DEFAULT_SQL_SCHEMA` (see :meth:`qualified_name`).
     """
 
@@ -125,6 +127,8 @@ class Table(_RsaTable):
         # snapshot persisted before this -- stays byte-identical.
         if full.get("schema_name") not in (None, DEFAULT_SQL_SCHEMA):
             out["schema_name"] = full["schema_name"]
+        if full.get("is_view"):
+            out["is_view"] = True
         return out
 
     def qualified_name(self) -> str:

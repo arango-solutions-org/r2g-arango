@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -13,7 +14,15 @@ from typing import Any, List, Literal, Optional, cast
 from urllib.parse import unquote_plus
 
 import yaml
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +32,11 @@ from starlette.concurrency import run_in_threadpool
 
 from r2g import control_plane
 from r2g import governed as governing
-from r2g.catalog import CatalogManager, validate_project_name
+from r2g.catalog import (
+    CatalogManager,
+    OntologyDependencyError,
+    validate_project_name,
+)
 from r2g.config import ConfigManager, validate_config
 from r2g.connectors.arango_writer import ArangoWriter
 from r2g.generators.arangoimport import (
@@ -32,6 +45,15 @@ from r2g.generators.arangoimport import (
     ImportCommandSpec,
 )
 from r2g.log import get_logger
+from r2g.ontology_import import (
+    MAX_ONTOLOGY_FILE_BYTES,
+    OntologyImportError,
+    UploadedOntology,
+    compile_ontology_mapping,
+    import_ontology_bundle,
+    load_normalized_ontology,
+    remove_ontology_bundle,
+)
 from r2g.security import redact_source_dump as _redact_source
 from r2g.security import redact_target_dump as _redact_target
 from r2g.streaming.pipeline import StreamingPipeline
@@ -341,6 +363,28 @@ def create_app(
             os.environ.get("ARANGO_PASSWORD", ""),
         )
 
+    def _snapshot_for_project(project: Any) -> Any:
+        """Return the exact source snapshot a project was reviewed against."""
+        snapshot_id = str(getattr(project, "schema_snapshot_id", "") or "")
+        if not snapshot_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Project is not pinned to a source snapshot; rebase it to "
+                    "the latest snapshot before continuing"
+                ),
+            )
+        snapshot = catalog.get_snapshot(snapshot_id)
+        if snapshot is None or snapshot.source_name != project.source_name:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Pinned snapshot '{snapshot_id}' is unavailable or does not "
+                    f"belong to source '{project.source_name}'"
+                ),
+            )
+        return snapshot
+
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
@@ -567,6 +611,7 @@ def create_app(
                 mapping_config_path=str(mapping_path),
                 arango_endpoint=target.endpoint,
                 arango_database=target.database,
+                arango_username=target.username,
                 mapping_name="Snowflake Customer 360",
                 mapping_description=(
                     "Synthetic account health graph with reviewed, non-enforced Snowflake keys."
@@ -590,6 +635,7 @@ def create_app(
             target_name=target.name,
             arango_endpoint=target.endpoint,
             arango_database=target.database,
+            arango_username=target.username,
         )
         try:
             existing = (
@@ -1028,6 +1074,174 @@ def create_app(
             logger.warning("preview_table_failed", source=name, table=table, error=str(e))
             raise HTTPException(status_code=500, detail="Failed to preview table data")
 
+    @app.put("/api/sources/{name}/key-overlay")
+    async def set_source_key_overlay(name: str, body: KeyOverlayRequest):
+        """Attach an explicitly reviewed RSA key overlay to a source."""
+        source = catalog.get_source(name)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"Source '{name}' not found")
+        description = str(body.overlay.get("description") or "")
+        if description.lstrip().upper().startswith("DRAFT") and not body.reviewed:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This key overlay is still marked DRAFT. Review it and "
+                    "explicitly confirm the decision before attaching it."
+                ),
+            )
+        snap = catalog.get_latest_snapshot(name)
+        if snap is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Snapshot the source before validating a key overlay",
+            )
+        try:
+            from relational_schema_analyzer import apply_key_overlay, overlay_summary
+
+            overlaid = apply_key_overlay(snap.schema_data, body.overlay)
+            summary = overlay_summary(overlaid)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid key overlay: {_safe_detail(exc)}",
+            )
+        digest = hashlib.sha256(
+            json.dumps(
+                body.overlay,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        catalog.update_source(
+            name,
+            key_overlay=body.overlay,
+            key_overlay_source=f"studio:sha256:{digest}",
+        )
+        return {
+            "source": name,
+            "fingerprint": f"sha256:{digest}",
+            "summary": summary,
+            "next": "Snapshot the source again to apply the reviewed keys",
+        }
+
+    @app.post("/api/sources/{name}/key-overlay-file")
+    async def upload_source_key_overlay(
+        name: str,
+        overlay_file: UploadFile = File(...),
+        reviewed: bool = Form(False),
+    ):
+        raw = await overlay_file.read(5 * 1024 * 1024 + 1)
+        if len(raw) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Key overlay file is too large")
+        try:
+            overlay = yaml.safe_load(raw.decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid JSON/YAML: {exc}")
+        if not isinstance(overlay, dict):
+            raise HTTPException(status_code=422, detail="Key overlay must be an object")
+        return await set_source_key_overlay(
+            name,
+            KeyOverlayRequest(overlay=overlay, reviewed=reviewed),
+        )
+
+    # ── Curated ontology endpoints ───────────────────────────────────
+
+    async def _uploaded(upload: UploadFile) -> UploadedOntology:
+        content = await upload.read(MAX_ONTOLOGY_FILE_BYTES + 1)
+        if len(content) > MAX_ONTOLOGY_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Ontology file '{upload.filename}' is too large",
+            )
+        return UploadedOntology(upload.filename or "ontology.rdf", content)
+
+    @app.get("/api/ontologies")
+    async def list_ontologies():
+        return [ontology.model_dump(mode="json") for ontology in catalog.list_ontologies()]
+
+    @app.post("/api/ontologies/import", status_code=201)
+    async def import_ontology(
+        name: str = Form(...),
+        root: UploadFile = File(...),
+        imports: list[UploadFile] = File(default=[]),
+        equivalent_root: UploadFile | None = File(default=None),
+        equivalent_imports: list[UploadFile] = File(default=[]),
+    ):
+        try:
+            imported = await _uploaded(root)
+            local_imports = [await _uploaded(upload) for upload in imports]
+            alternate = (
+                await _uploaded(equivalent_root)
+                if equivalent_root is not None
+                else None
+            )
+            alternate_imports = [
+                await _uploaded(upload) for upload in equivalent_imports
+            ]
+            result = await run_in_threadpool(
+                import_ontology_bundle,
+                catalog,
+                name=name,
+                root=imported,
+                imports=local_imports,
+                equivalent_root=alternate,
+                equivalent_imports=alternate_imports,
+            )
+            return result.record.model_dump(mode="json")
+        except OntologyImportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    @app.delete("/api/ontologies/{ontology_id}")
+    async def delete_ontology(ontology_id: str):
+        try:
+            removed = remove_ontology_bundle(catalog, ontology_id)
+        except OntologyDependencyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(exc), "projects": exc.projects},
+            )
+        if not removed:
+            raise HTTPException(
+                status_code=404, detail=f"Ontology '{ontology_id}' not found"
+            )
+        return {"removed": True, "id": ontology_id}
+
+    @app.post("/api/ontologies/{ontology_id}/reconcile")
+    async def reconcile_ontology(
+        ontology_id: str,
+        body: OntologyReconcileRequest,
+    ):
+        source = catalog.get_source(body.source_name)
+        if source is None:
+            raise HTTPException(
+                status_code=404, detail=f"Source '{body.source_name}' not found"
+            )
+        snap = (
+            catalog.get_snapshot(body.snapshot_id)
+            if body.snapshot_id
+            else catalog.get_latest_snapshot(body.source_name)
+        )
+        if snap is None or snap.source_name != body.source_name:
+            raise HTTPException(status_code=404, detail="Source snapshot not found")
+        try:
+            bundle = load_normalized_ontology(catalog, ontology_id)
+            mapping, report = compile_ontology_mapping(
+                bundle,
+                snap.schema_data,
+                source_schema=snap.pg_schema,
+                ontology_id=ontology_id,
+                snapshot_id=snap.id,
+            )
+        except OntologyImportError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return {
+            "mapping": mapping.model_dump(),
+            "report": report.model_dump(),
+            "executable": report.executable,
+            "snapshot_id": snap.id,
+        }
+
     # ── Project endpoints ─────────────────────────────────────────────
 
     @app.get("/api/projects")
@@ -1044,6 +1258,80 @@ def create_app(
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
         return project.model_dump()
+
+    @app.post("/api/projects/{name}/rebase-snapshot")
+    async def rebase_project_snapshot(
+        name: str,
+        body: ProjectRebaseRequest,
+        request: Request,
+        background: BackgroundTasks,
+    ):
+        """Preview or apply an explicit move to the source's latest snapshot."""
+        project = catalog.get_project(name)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+        latest = catalog.get_latest_snapshot(project.source_name)
+        if latest is None:
+            raise HTTPException(status_code=409, detail="No source snapshot is available")
+        if project.ontology_id:
+            try:
+                bundle = load_normalized_ontology(catalog, project.ontology_id)
+                _mapping, report = compile_ontology_mapping(
+                    bundle,
+                    latest.schema_data,
+                    source_schema=latest.pg_schema,
+                    ontology_id=project.ontology_id,
+                    snapshot_id=latest.id,
+                )
+            except OntologyImportError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            issues: Any = report.model_dump()
+            valid = report.executable
+        else:
+            try:
+                mapping = ConfigManager.load_config(project.mapping_config_path)
+                validation = validate_config(latest.schema_data, mapping)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=_safe_detail(exc))
+            issues = validation
+            valid = not validation
+        if body.apply:
+            if not valid:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "The latest snapshot does not reconcile",
+                        "issues": issues,
+                    },
+                )
+            detail = governing.Item("project", (None,), ("schema_snapshot_id",))
+            governed_change = (
+                await _govern(
+                    request,
+                    name,
+                    "transformation.update",
+                    [detail],
+                )
+                if governed
+                else None
+            )
+            project = catalog.update_project(
+                name,
+                schema_snapshot_id=latest.id,
+                loaded_mapping=None,
+                loaded_at=None,
+            )
+            if governed_change is not None:
+                governed_change.record(detail, background=background)
+        return {
+            "project": name,
+            "current_snapshot_id": project.schema_snapshot_id,
+            "latest_snapshot_id": latest.id,
+            "valid": valid,
+            "issues": issues,
+            "applied": body.apply,
+            "approval_invalidated": bool(body.apply),
+        }
 
     @app.post("/api/projects", status_code=201)
     async def create_project(body: ProjectCreateRequest, request: Request,
@@ -1079,6 +1367,47 @@ def create_app(
                 seed = ConfigManager.load_config(safe_path)
             except Exception:
                 seed = MappingConfig()
+        reconciliation = None
+        selected_snapshot_id = body.schema_snapshot_id
+        if body.ontology_id:
+            if not body.target_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A registered ArangoDB target is required for an ontology project",
+                )
+            snapshot = (
+                catalog.get_snapshot(body.schema_snapshot_id)
+                if body.schema_snapshot_id
+                else catalog.get_latest_snapshot(body.source_name)
+            )
+            if snapshot is None or snapshot.source_name != body.source_name:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A snapshot of the selected source is required",
+                )
+            selected_snapshot_id = snapshot.id
+            try:
+                bundle = load_normalized_ontology(catalog, body.ontology_id)
+                seed, reconciliation = compile_ontology_mapping(
+                    bundle,
+                    snapshot.schema_data,
+                    source_schema=snapshot.pg_schema,
+                    ontology_id=body.ontology_id,
+                    snapshot_id=snapshot.id,
+                )
+            except OntologyImportError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            if not reconciliation.executable:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": (
+                            "The ontology does not reconcile with the selected "
+                            "source snapshot"
+                        ),
+                        "report": reconciliation.model_dump(),
+                    },
+                )
         details = governing.Item("project", (None,), ("added",))
         g = seeded = None
         seed_items: list[Any] = []
@@ -1098,14 +1427,29 @@ def create_app(
                 arango_database=body.arango_database,
                 mapping_name=body.mapping_name,
                 mapping_description=body.mapping_description,
+                target_name=body.target_name,
+                ontology_id=body.ontology_id,
+                schema_snapshot_id=selected_snapshot_id,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        if not safe_path.exists():
+        if body.ontology_id or not safe_path.exists():
             try:
                 ConfigManager.save_config(seed, str(safe_path))
             except Exception as e:
                 raise HTTPException(status_code=500, detail=_safe_detail(e))
+        if reconciliation is not None:
+            report_path = safe_path.parent / "ontology-reconciliation.json"
+            report_path.write_text(
+                json.dumps(
+                    reconciliation.model_dump(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         if g is not None:
             g.record(details, background=background)
         if seeded is not None:
@@ -1124,6 +1468,23 @@ def create_app(
         fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
         if not fields:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
+        if "target_name" in fields:
+            target = catalog.get_target(fields["target_name"])
+            if target is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Target '{fields['target_name']}' not found",
+                )
+            if target.database.lower() == "_system":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Projects require a dedicated target database, not '_system'",
+                )
+            fields.update(
+                arango_endpoint=target.endpoint,
+                arango_database=target.database,
+                arango_username=target.username,
+            )
         details = governing.Item("project", (None,), tuple(sorted(fields)))
         g = await _govern(request, name, "transformation.update", [details]) \
             if governed else None
@@ -1239,11 +1600,7 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"Project '{name}' not found"
             )
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(
-                status_code=400, detail="No schema snapshot available"
-            )
+        snap = _snapshot_for_project(project)
         try:
             if body.mapping is None:
                 config = ConfigManager.load_config(
@@ -1359,9 +1716,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             config = ConfigManager.load_config(project.mapping_config_path)
             issues = validate_config(snap.schema_data, config)
@@ -1378,9 +1733,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             draft_config = MappingConfig.model_validate(body)
             issues = validate_config(snap.schema_data, draft_config)
@@ -1395,9 +1748,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             from r2g.mapping_diff import diff_mappings
 
@@ -1419,9 +1770,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
 
         loaded = getattr(project, "loaded_mapping", None)
         if not loaded:
@@ -1449,9 +1798,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         loaded = getattr(project, "loaded_mapping", None)
         if not loaded:
             raise HTTPException(
@@ -1534,9 +1881,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot")
+        snap = _snapshot_for_project(project)
         try:
             from r2g.generators.visualizer import MappingVisualizer
 
@@ -1581,9 +1926,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             config = ConfigManager.load_config(project.mapping_config_path)
         except Exception as e:
@@ -1621,9 +1964,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             config = ConfigManager.load_config(project.mapping_config_path)
         except Exception as e:
@@ -1711,9 +2052,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             current = ConfigManager.load_config(project.mapping_config_path)
         except Exception as e:
@@ -1892,9 +2231,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
         try:
             current = ConfigManager.load_config(project.mapping_config_path)
         except Exception as e:
@@ -1928,9 +2265,7 @@ def create_app(
         if source is None:
             raise HTTPException(status_code=400, detail=f"Source '{project.source_name}' not found")
 
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot available")
+        snap = _snapshot_for_project(project)
 
         try:
             config = ConfigManager.load_config(project.mapping_config_path)
@@ -2200,9 +2535,7 @@ def create_app(
         project = catalog.get_project(name)
         if project is None:
             raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
-        snap = catalog.get_latest_snapshot(project.source_name)
-        if snap is None:
-            raise HTTPException(status_code=400, detail="No schema snapshot")
+        snap = _snapshot_for_project(project)
         config = ConfigManager.generate_default_config(snap.schema_data, source_schema=snap.pg_schema)
         return config.model_dump()
 
@@ -2223,14 +2556,14 @@ def create_app(
             config = ConfigManager.load_config(project.mapping_config_path)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-        snap = catalog.get_latest_snapshot(project.source_name)
+        snap = _snapshot_for_project(project)
         convention = NamingConvention(
             collections=body.collections,
             properties=body.properties,
             edges=body.edges,
         )
         new_config = apply_naming_convention(
-            config, convention, snap.schema_data if snap else None
+            config, convention, snap.schema_data
         )
         return new_config.model_dump()
 
@@ -2386,6 +2719,20 @@ class SourceCreateRequest(BaseModel):
     source_params: dict[str, Any] = {}
 
 
+class KeyOverlayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    overlay: dict[str, Any]
+    reviewed: bool = False
+
+
+class OntologyReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_name: str
+    snapshot_id: str | None = None
+
+
 class DemoPresetInstallRequest(BaseModel):
     target_name: str | None = None
 
@@ -2400,6 +2747,13 @@ class ProjectCreateRequest(BaseModel):
     arango_database: str = "_system"
     mapping_name: str = ""
     mapping_description: str = ""
+    target_name: str | None = None
+    ontology_id: str | None = None
+    schema_snapshot_id: str | None = None
+
+
+class ProjectRebaseRequest(BaseModel):
+    apply: bool = False
 
 
 class ProjectUpdateRequest(BaseModel):
