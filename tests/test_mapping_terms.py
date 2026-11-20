@@ -8,6 +8,11 @@ user's context; without one nothing reads them. Each refusal has a positive cont
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
+import subprocess
+from html import unescape
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -338,6 +343,56 @@ class TestTheCanvasShowsTheTerms:
         chips = _function(self.page, "_termChips")
         assert 'title="${escHtml(' in chips
         assert ">${escHtml(_termText(iri, terms))}</span>" in chips
+
+    def _chips(self, cp_on: bool, collections: dict[str, Any], kind: str = "class",
+               terms: list[dict[str, str]] | None = None) -> tuple[str, list[tuple[str, str]]]:
+        """Run the page's own _termChips under node: its HTML, and each chip's tooltip and text."""
+        node = shutil.which("node")
+        assert node, "node is required: this test runs the canvas's JavaScript"
+        script = "".join(_function(self.page, name) for name in
+                         ("_htmlEscape", "escHtml", "_termLabel", "_termText", "_termChips"))
+        script += f"""
+const CP = {{ on: {json.dumps(cp_on)} }};
+const editState = {{ collections: {json.dumps(collections)} }};
+const termOf = {json.dumps(kind)} === 'class' ? (c) => c.term : (c) => (c.fieldTerms || {{}}).id;
+process.stdout.write(_termChips(Object.keys(editState.collections), termOf,
+                                {json.dumps(terms or [])}, {json.dumps(kind)}));
+"""
+        out = subprocess.run([node, "-"], input=script, capture_output=True, text=True,
+                             check=True, timeout=30).stdout
+        chips = re.findall(r'<span class="term-chip" title="([^"]*)">([^<]*)</span>', out)
+        return out, [(unescape(title), unescape(text)) for title, text in chips]
+
+    def test_the_canvas_names_terms_only_under_a_control_plane(self):
+        books = {"books": {"term": BOOK}}
+        assert self._chips(False, books, terms=ONTOLOGY["classes"]) == ("", [])
+        assert self._chips(True, books, terms=ONTOLOGY["classes"])[1] == [
+            (f"Ontology class of books: Book ({BOOK})", "Book")]
+
+    def test_the_chips_as_the_canvas_draws_them(self):
+        bare = "https://ex.org/lending/"
+        hashed = "https://ex.org/lending#"
+        collections = {
+            "authors": {"term": AUTHOR}, "books": {"term": BOOK}, "novels": {"term": BOOK},
+            "untyped": {}, "nulled": {"term": None},
+            "shelves": {"term": "https://ex.org/lending#Shelf"}, "slash": {"term": bare},
+            "hash": {"term": hashed}, "a<b": {"term": "https://ex.org/x#T"},
+        }
+        risky = "<i>&\"'"
+        terms = [{"uri": BOOK, "label": "Book"}, {"uri": AUTHOR, "label": ""},
+                 {"uri": "https://ex.org/x#T", "label": risky}]
+        html, chips = self._chips(True, collections, terms=terms)
+        assert chips == [
+            (f"Ontology class of authors: Author ({AUTHOR})", "Author"),  # empty label
+            (f"Ontology class of books, novels: Book ({BOOK})", "Book"),  # grouped, first seen
+            ("Ontology class of shelves: Shelf (https://ex.org/lending#Shelf)", "Shelf"),
+            (f"Ontology class of slash: {bare} ({bare})", bare),
+            (f"Ontology class of hash: {hashed} ({hashed})", hashed),
+            (f"Ontology class of a<b: {risky} (https://ex.org/x#T)", risky),
+        ]
+        assert "<i>" not in html and "a<b" not in html and "'" not in html
+        assert self._chips(True, {"books": {"fieldTerms": {"id": TITLE}}, "authors": {}},
+                           kind="property")[1] == [(f"Ontology property of books: title ({TITLE})", "title")]
 
     def test_editing_a_table_or_column_term_redraws_the_cards(self):
         for name in ("setCollectionTerm", "setFieldTerm"):

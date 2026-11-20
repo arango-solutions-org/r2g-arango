@@ -1441,7 +1441,7 @@ function _termLabel(uri, terms) {
 }
 
 // What a person reads for a term: the ontology's label, else the IRI's local name (after
-// the last '#' or '/'), else the IRI. Outside a control plane no labels are known.
+// the last '#' or '/'), else the IRI. The canvas uses it only under a control plane.
 function _termText(uri, terms) {
   const label = _termLabel(uri, terms);
   if (label) return label;
@@ -1453,6 +1453,7 @@ function _termText(uri, terms) {
 // its collections first name them (P14.8). A table can feed several collections, which can
 // name different terms; each chip's tooltip says which collections name it.
 function _termChips(collKeys, termOf, terms, kind) {
+  if (!CP.on) return '';
   const byIri = new Map();
   for (const key of collKeys) {
     const iri = termOf(editState.collections[key]);
