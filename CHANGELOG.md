@@ -9,6 +9,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
+  `r2g source add --offline` registers a source with no connection string, and
+  `r2g source snapshot NAME --from-file schema.json` takes its snapshot from RSA `PhysicalSchema`
+  JSON through the same key-overlay and classification steps as introspection. The snapshot records
+  the file's path and SHA-256. Commands that would read from an offline source refuse with the
+  reason instead of failing in a driver. Not yet: offline registration in the Studio and MCP, and
+  reading raw DDL (convert it to `PhysicalSchema` JSON first).
 - **Snowflake change capture through standard streams (#65, PRD P6.16).** `r2g cdc-start --source
   <snowflake source>` keeps an ArangoDB copy current from one Snowflake stream per mapped table,
   view or dynamic table, with no full reload. Inserts, updates and deletes go through the same

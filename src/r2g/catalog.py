@@ -138,6 +138,11 @@ class SchemaSnapshot(BaseModel):
     #: ``enforced=False``; this keeps what a ``ForeignKey`` has no field for.
     #: Written only when non-empty, so every other snapshot re-saves byte-identically.
     inferred_keys: list[dict[str, Any]] = Field(default_factory=list)
+    #: The schema file this snapshot was read from instead of a connection
+    #: (``source snapshot --from-file``) and the SHA-256 of its bytes. Written
+    #: only when set, so introspected snapshots re-save byte-identically.
+    schema_file_source: str | None = None
+    schema_file_fingerprint: str | None = None
     # Defaults to the legacy format so anything not deliberately stamped by
     # create_snapshot is treated as unable to hold UNIQUE keys -- the safe reading.
     schema_format_version: int = 1
@@ -157,6 +162,9 @@ class SchemaSnapshot(BaseModel):
             out.pop("schema_format_version")
         if not out.get("inferred_keys"):
             out.pop("inferred_keys", None)
+        for name in ("schema_file_source", "schema_file_fingerprint"):
+            if out.get(name) is None:
+                out.pop(name, None)
         return out
 
     @property
@@ -551,6 +559,8 @@ class CatalogManager:
         key_overlay_source: str | None = None,
         key_overlay_fingerprint: str | None = None,
         inferred_keys: list[dict[str, Any]] | None = None,
+        schema_file_source: str | None = None,
+        schema_file_fingerprint: str | None = None,
     ) -> SchemaSnapshot:
         catalog = self._load()
         snap = SchemaSnapshot(
@@ -563,6 +573,8 @@ class CatalogManager:
             key_overlay_source=key_overlay_source,
             key_overlay_fingerprint=key_overlay_fingerprint,
             inferred_keys=list(inferred_keys or []),
+            schema_file_source=schema_file_source,
+            schema_file_fingerprint=schema_file_fingerprint,
             schema_format_version=CURRENT_SCHEMA_FORMAT,
         )
         catalog.snapshots[snap.id] = snap

@@ -311,6 +311,23 @@ each snapshot. r2g never invents those keys. Name-based FK suggestions work for
 Snowflake, but value-overlap sampling is not yet implemented for Snowflake and
 falls back to name-only evidence.
 
+### A source you cannot connect to
+
+When a partner hands over its schema rather than a connection, register the
+source offline and take its snapshot from a schema file:
+
+```bash
+r2g source add --name partner --type snowflake --offline --key-overlay ./keys.overlay.json
+r2g source snapshot partner --pg-schema SCHEMA --from-file ./schema.json
+```
+
+The file is RSA `PhysicalSchema` JSON, the format `r2g ingest-schema` writes. It
+goes through the same key-overlay and classification steps as an introspected
+schema, and the snapshot records the file's path and SHA-256. An offline source
+stores no connection string, so anything that would read from it directly
+(`source dump`, `source suggest-keys`, `stream`, `cdc-start`, value sampling) refuses with that reason. Raw
+DDL is not read here: convert it to `PhysicalSchema` JSON first.
+
 Export CSV files or stream directly from the registered source:
 
 ```bash
@@ -538,10 +555,10 @@ r2g stream --dry-run \
 
 | Command | Description |
 |---|---|
-| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic) |
+| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic); `--offline` registers one with no connection |
 | `source list` | List all registered data sources |
 | `source remove` | Remove a registered data source |
-| `source snapshot` | Introspect the schema from a source and save a snapshot |
+| `source snapshot` | Introspect the schema from a source and save a snapshot (`--from-file` reads it from a schema file instead; required for an `--offline` source) |
 | `source dump` | Dump every table in a cataloged source to CSV files (source-agnostic replacement for `dump-tables`) |
 | `source infer-fks` | Propose foreign keys for a source's latest schema snapshot (`--sample` for value-overlap scoring, `--accept` to write back) |
 | `source analyze-denorm` | Detect denormalization smells (repeating column groups; embedded lookups via `--sample`) and recommend graph remedies — advisory, read-only (`--min-confidence`, `--no-sample-columns`, `--json`) |
