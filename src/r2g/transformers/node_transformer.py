@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 from r2g.config import pg_type_to_json_type
@@ -134,6 +135,9 @@ class NodeTransformer:
             if isinstance(value, int):
                 return value
             if isinstance(value, float):
+                return int(value)
+            if isinstance(value, Decimal) and value == value.to_integral_value():
+                # Exact at any size; str() would give "1E+3", which int() refuses.
                 return int(value)
             return int(str(value).strip())
 

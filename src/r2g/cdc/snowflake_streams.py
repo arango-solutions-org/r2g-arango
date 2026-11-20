@@ -74,6 +74,8 @@ so applying it after the snapshot leaves the copy at the source's state.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -101,6 +103,19 @@ FRESHNESS_COLLECTION = "_cdf_ingest"
 #: Per-stream watermark and the counts of its last cycle.
 STREAM_STATE_COLLECTION = "_r2g_cdc_streams"
 
+#: The longest ``_key`` ArangoDB accepts, in bytes.
+ARANGO_MAX_KEY_LENGTH = 254
+
+#: The characters a stream's state key keeps from the stream's name: those
+#: ArangoDB accepts in a key, less ``%``. python-arango puts a key into the
+#: request path as it is, and the server reads ``%20`` there as a space, so a
+#: document with a percent-encoded key can be written but not then read,
+#: replaced or deleted by that key.
+_STATE_KEY_KEEPS = "A-Za-z0-9_\\-:.@()+,=;$!*'"
+_STATE_KEY_PLAIN = re.compile(f"[{_STATE_KEY_KEEPS}]+")
+_STATE_KEY_OTHER = re.compile(f"[^{_STATE_KEY_KEEPS}]")
+_STATE_KEY_DIGEST_LENGTH = 16
+
 #: Session-scoped table that consumes stream offsets (see module docstring).
 OFFSET_SINK = "R2G_OFFSET_SINK"
 
@@ -118,6 +133,14 @@ _METADATA_PREFIX = "METADATA$"
 #: "Base table '…' dropped, cannot read from stream '…'" — the source was
 #: dropped or recreated (``CREATE OR REPLACE``) under the stream.
 _ERR_STREAM_SOURCE_DROPPED = 91901
+
+#: Wording that marks a failed read as an unreadable stream when the error
+#: carries no number r2g knows.
+_UNREADABLE_WORDING = ("stale", "cannot read from stream")
+_UNREADABLE_WORDS = frozenset(word for phrase in _UNREADABLE_WORDING for word in phrase.split())
+
+#: A quoted span of an error message: Snowflake quotes the names it reports.
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 BASIS_SERVER_TIME = "server_time_before_read"
 BASIS_DT_DATA_TIMESTAMP = "dynamic_table_data_timestamp"
@@ -151,6 +174,22 @@ class StreamStaleError(SnowflakeStreamError):
 
 class BatchNotAppliedError(SnowflakeStreamError):
     """Some deltas of a stream's batch failed; the offset was not advanced."""
+
+
+def _wording_without_names(message: str, names: Iterable[str]) -> str:
+    """*message* in lower case, without quoted spans or the identifiers in *names*.
+
+    What is left is Snowflake's own wording, so a test of it cannot be
+    answered by what an object happens to be called (``STALE_LEADS``). A name
+    is removed only as a whole identifier, and never when it is itself one of
+    the words being tested for.
+    """
+    text = _QUOTED_SPAN.sub(" ", message).lower()
+    for name in sorted({n.lower() for n in names if n}, key=len, reverse=True):
+        if name in _UNREADABLE_WORDS:
+            continue
+        text = re.sub(rf"(?<![\w$]){re.escape(name)}(?![\w$])", " ", text)
+    return text
 
 
 def quote_ident(name: str) -> str:
@@ -381,7 +420,20 @@ class FreshnessRecorder:
 
 
 def _state_key(stream_name: str) -> str:
-    return stream_name.replace("$", "_")
+    """The ``_key`` of a stream's state document: legal in ArangoDB, one per stream.
+
+    A stream is named after its source object, and Snowflake allows any
+    character in a quoted identifier (``"Order Items"``); ArangoDB does not
+    in a key. A name that is already a legal key is the key. Any other keeps
+    a readable form, each other character as ``_``, and ends in a digest of
+    the whole name, so ``Order Items`` and ``Order_Items`` do not share a
+    document. The same holds for a name too long to be a key.
+    """
+    if len(stream_name) <= ARANGO_MAX_KEY_LENGTH and _STATE_KEY_PLAIN.fullmatch(stream_name):
+        return stream_name
+    digest = hashlib.sha256(stream_name.encode("utf-8")).hexdigest()[:_STATE_KEY_DIGEST_LENGTH]
+    readable = _STATE_KEY_OTHER.sub("_", stream_name)
+    return f"{readable[: ARANGO_MAX_KEY_LENGTH - len(digest) - 1]}.{digest}"
 
 
 # ── Listener ────────────────────────────────────────────────────────────────
@@ -646,14 +698,20 @@ class SnowflakeStreamListener:
         Detection is by the read failing, never by ``SHOW STREAMS``: its
         ``stale`` column means "may be stale" and is ``true`` for a stream
         that still reads normally (observed on a table with zero retention).
+
+        The error number decides when it is the one r2g knows. Otherwise the
+        message's wording does, read without the names in it: an object
+        called ``STALE_LEADS`` that is merely missing or not granted is not
+        an unreadable stream.
         """
-        message = str(err).lower()
-        if (
-            getattr(err, "errno", None) == _ERR_STREAM_SOURCE_DROPPED
-            or "stale" in message
-            or "cannot read from stream" in message
-        ):
-            raise StreamStaleError(target.stream_name, str(err)) from err
+        if getattr(err, "errno", None) != _ERR_STREAM_SOURCE_DROPPED:
+            wording = _wording_without_names(str(err), (
+                self.database, self.source_schema, self.stream_schema,
+                target.source_object, target.stream_name,
+            ))
+            if not any(marker in wording for marker in _UNREADABLE_WORDING):
+                return
+        raise StreamStaleError(target.stream_name, str(err)) from err
 
     def consume(self, target: StreamTarget) -> StreamWatermark:
         """Apply one stream's pending changes; return its new watermark."""
@@ -879,8 +937,13 @@ class SnowflakeStreamListener:
                 errors.append(err)
         result.collections_stamped = self.recorder.record(self.targets, result.watermarks)
         if errors:
-            # Other streams' progress is recorded above; report the first failure.
-            raise errors[0]
+            # Other streams' progress is recorded above. A batch that failed to
+            # apply is read again next cycle, so it is reported only when
+            # nothing else went wrong: the caller retries on it, and must not
+            # miss a stream that no retry can read.
+            raise next(
+                (e for e in errors if not isinstance(e, BatchNotAppliedError)), errors[0],
+            )
         return result
 
     def _cycle(self, target: StreamTarget) -> StreamWatermark:

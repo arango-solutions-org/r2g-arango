@@ -676,6 +676,12 @@ so the role needs `CREATE STREAM` there and `SELECT` on the mapped objects. Crea
 on a table without change tracking needs the table's owner, and a stream on a view needs change
 tracking on the view's tables (`ALTER TABLE … SET CHANGE_TRACKING = TRUE`).
 
+A stream begins at the moment it is created. A change made after the load read an object and before
+its stream existed is never delivered, so the copy keeps the older row until that row changes again.
+To leave no such gap, the streams must exist before the load starts: `cdc-start` reuses a stream
+named `R2G_<object>` that already reads the object, and the first cycle after the load then applies
+each row's net change since the stream was created.
+
 Each cycle reads, applies and advances every stream inside one Snowflake transaction. If any change
 fails to apply in ArangoDB the transaction rolls back, and the same changes are read again next
 cycle. An update that changes no mapped column writes nothing (`noop_updates_skipped` in the
@@ -687,7 +693,7 @@ feed, how far the copy is current:
 | Collection | Document | Field |
 | :--- | :--- | :--- |
 | `_cdf_ingest` (system) | `_key` = the ArangoDB collection's name | `ingested_at`: ISO 8601 with offset, the source time the collection's changes are applied through |
-| `_r2g_cdc_streams` (system) | `_key` = the stream's name | `applied_through`, `basis`, and the last cycle's counts |
+| `_r2g_cdc_streams` (system) | `_key` = the stream's name when that is a legal ArangoDB key; otherwise a readable form of it ending in a digest (`R2G_Order_Items.<16 hex digits>`) | `stream` (the name as Snowflake has it), `applied_through`, `basis`, and the last cycle's counts |
 
 `ingested_at` is the **oldest** watermark among the streams that write to that collection, and a
 lower bound: the Snowflake clock read before the stream was read, or a dynamic table's

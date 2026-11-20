@@ -27,8 +27,31 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+## [0.11.1] — 2026-11-19
+
+### Added
+
+- **A project's mapping data carries each table's UNIQUE keys and the capture it comes from
+  (PRD P14.15).** `GET /api/projects/{name}/graph-data` gives each table a `uniqueConstraints`
+  list (each key as its columns) and adds a `snapshot` with its `id`, `capturedAt`, and
+  `keepsUniqueConstraints`, which is false for a snapshot saved before UNIQUE keys were kept,
+  whose empty lists say nothing. A consumer outside the Studio, such as a control plane's
+  workspace, can then show a source's keys and when its schema was captured. Additive: every
+  field already there is unchanged.
+
 ### Fixed
 
+- **A Snowflake integer column loads as an integer, every digit kept (PRD P12.1).** Snowflake
+  stores every integer column as `NUMBER(38,0)`. r2g typed it as a decimal, so a load converted
+  each value to a floating-point number: `7` was stored as `7.0`, and an id above 2^53 (such as
+  `9007199254740993`, or any 64-bit hash) silently lost its last digits. A fixed-point column
+  whose declared scale is 0 now loads as an integer: Snowflake's `NUMBER(38,0)` and ClickHouse's
+  `Decimal(18, 0)`, from the two connectors that record a scale. A whole `Decimal` value converts
+  exactly. **What changes for an existing load:** such columns reload as integers instead of
+  floating-point numbers; AQL compares them as equal,
+  but values above 2^53 now keep their digits. A column with a fractional scale, or one whose
+  type declares no scale (bare `numeric`, as PostgreSQL, MySQL and SQL Server report), is
+  unchanged. ArangoDB itself stores a whole number above the 64-bit range as a double.
 - **The catalog is no longer read half-written, and two changes at once both survive (PRD Phase 5d
   notes).** `catalog.json` was emptied and then rewritten on every save. The Studio records a
   load's result from a background thread while it answers requests, so a request arriving
@@ -73,6 +96,7 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
     write chunked CSV (SQL dialects) or JSON lines (arango), a bulk loader per dialect
     (`\copy`, `FROM INFILE`, `PUT`/`COPY INTO`, batched `import_bulk`) and `forge.bulk.json`, a
     manifest with each file's row count and SHA-256. Memory does not grow with the rows.
+
 ### Changed
 
 - **The vendored CSI schema follows arangodb-schema-analyzer 0.20.0 (CSI 1.2).** An entity
@@ -1251,7 +1275,8 @@ Initial phased implementation (not yet published to PyPI):
   pipeline, `r2g source dump` CLI, pure-Python FK inference with
   optional value-overlap sampler.
 
-[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.8.2...v0.9.0

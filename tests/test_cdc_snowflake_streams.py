@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from arango.exceptions import DocumentInsertError
 
 from r2g.cdc.delta_transformer import OwnedScope
 from r2g.cdc.handler import CDCHandler
@@ -26,6 +28,7 @@ from r2g.cdc.snowflake_streams import (
     StreamStaleError,
     StreamTarget,
     StreamWatermark,
+    _state_key,
     rows_to_events,
 )
 from r2g.connectors.arango_writer import ArangoWriter
@@ -133,6 +136,7 @@ class FakeConn:
         self.dt_info: dict[str, dict] = {}
         self.stale: set[str] = set()
         self.dropped: set[str] = set()
+        self.read_errors: dict[str, Exception] = {}  # stream name -> what reading it raises
         self._tx_reads: dict[str, list[dict]] | None = None
         self._consumed: set[str] = set()
         self.source_rows: dict[str, list[dict]] = {}  # object name -> current rows
@@ -175,6 +179,8 @@ class FakeConn:
             return ["CURRENT_TIMESTAMP()"], [(self.now,)]
         if s.startswith("SELECT SYSTEM$STREAM_HAS_DATA"):
             name = params[0].split(".")[-1].strip('"')
+            if name in self.read_errors:
+                raise self.read_errors[name]
             if name in self.stale:
                 raise RuntimeError(f"Stream {name} is stale")
             if name in self.dropped:
@@ -219,6 +225,18 @@ def _row(action: str, update: bool, row_id: str, **cols) -> dict:
     return {**cols, "METADATA$ACTION": action, "METADATA$ISUPDATE": update, "METADATA$ROW_ID": row_id}
 
 
+#: What ArangoDB accepts as a document key (checked against 3.12): these
+#: characters only, 1 to 254 of them. A space, ``/`` or a non-ASCII character
+#: is refused with error 1221, "illegal document key".
+_LEGAL_ARANGO_KEY = re.compile(r"[A-Za-z0-9_\-:.@()+,=;$!*'%]{1,254}")
+
+
+def _illegal_key_error() -> DocumentInsertError:
+    err = DocumentInsertError.__new__(DocumentInsertError)
+    err.error_code = 1221
+    return err
+
+
 class FakeDB:
     def __init__(self, docs: dict[str, dict[str, dict]] | None = None):
         self.docs: dict[str, dict[str, dict]] = docs or {}
@@ -250,6 +268,8 @@ class FakeDB:
             def insert_many(self, docs, overwrite, raise_on_document_error):
                 assert overwrite and raise_on_document_error
                 for d in docs:
+                    if not _LEGAL_ARANGO_KEY.fullmatch(d["_key"]):
+                        raise _illegal_key_error()
                     db.docs[name][d["_key"]] = d
 
             def get(self, key):
@@ -263,6 +283,19 @@ def _listener(schema, mapping, writer, conn, db=None, **kw):
     lst = SnowflakeStreamListener(URL, handler, schema, mapping, connect=lambda **_: conn, **kw)
     lst.recorder.db = db or FakeDB()
     return lst
+
+
+def _one_object(name: str, collection: str) -> tuple[Schema, MappingConfig]:
+    """A schema and mapping with a single keyed object called *name*."""
+    schema = Schema(tables={name: Table(
+        name=name,
+        columns=[Column(name="ID", data_type="NUMBER", is_primary_key=True)],
+        primary_key=["ID"],
+    )})
+    mapping = MappingConfig(collections={name: CollectionMapping(
+        source_table=name, target_collection=collection,
+    )})
+    return schema, mapping
 
 
 # ── rows_to_events ──────────────────────────────────────────────────────────
@@ -512,6 +545,104 @@ class TestConsume:
         # collections are not stamped.
         assert set(db.docs[FRESHNESS_COLLECTION]) == {"Account"}
 
+    @pytest.mark.parametrize("named", [
+        "'CRM.CORE.R2G_STALE_LEADS'",
+        '"CRM"."CORE"."R2G_STALE_LEADS"',
+        "CRM.CORE.R2G_STALE_LEADS",
+        "R2G_STALE_LEADS",
+    ])
+    def test_error_naming_an_object_called_stale_is_not_an_unreadable_stream(self, writer, named):
+        # Snowflake's messages carry object names; a name is not a diagnosis.
+        schema, mapping = _one_object("STALE_LEADS", "Lead")
+        conn = FakeConn({"STALE_LEADS": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE_LEADS"] = RuntimeError(
+            f"002003 (42S02): SQL compilation error:\nObject {named} does not exist or not authorized."
+        )
+        with pytest.raises(RuntimeError, match="does not exist or not authorized") as caught:
+            _listener(schema, mapping, writer, conn).poll_once()
+        assert not isinstance(caught.value, StreamStaleError)
+
+    @pytest.mark.parametrize("message", [
+        "Stream R2G_STALE_LEADS is stale",
+        "Stream 'CRM.CORE.R2G_STALE_LEADS' is stale",
+        "Base table 'CRM.CORE.STALE_LEADS' dropped, cannot read from stream 'R2G_STALE_LEADS'",
+    ])
+    def test_object_called_stale_whose_stream_is_unreadable_is_still_reported(
+        self, writer, message,
+    ):
+        schema, mapping = _one_object("STALE_LEADS", "Lead")
+        conn = FakeConn({"STALE_LEADS": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE_LEADS"] = RuntimeError(message)
+        with pytest.raises(StreamStaleError, match="R2G_STALE_LEADS"):
+            _listener(schema, mapping, writer, conn, recover_streams=False).poll_once()
+
+    @pytest.mark.parametrize(("message", "unreadable"), [
+        ("Stream 'CRM.CORE.R2G_STALE' is stale", True),
+        ("Stream R2G_STALE is stale", True),
+        ("Object 'CRM.CORE.STALE' does not exist or not authorized.", False),
+    ])
+    def test_object_named_exactly_stale(self, writer, message, unreadable):
+        schema, mapping = _one_object("STALE", "Thing")
+        conn = FakeConn({"STALE": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE"] = RuntimeError(message)
+        with pytest.raises(RuntimeError) as caught:
+            _listener(schema, mapping, writer, conn, recover_streams=False).poll_once()
+        assert isinstance(caught.value, StreamStaleError) is unreadable
+
+    def test_object_named_like_a_word_of_the_wording_does_not_hide_it(self, writer):
+        schema, mapping = _one_object("STREAM", "Thing")
+        conn = FakeConn({"STREAM": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STREAM"] = RuntimeError(
+            "Base table CRM.CORE.STREAM dropped, cannot read from stream R2G_STREAM"
+        )
+        with pytest.raises(StreamStaleError, match="R2G_STREAM"):
+            _listener(schema, mapping, writer, conn, recover_streams=False).poll_once()
+
+    def test_known_error_number_decides_whatever_the_wording(self, writer):
+        schema, mapping = _one_object("ACCOUNT", "Account")
+        conn = FakeConn({"ACCOUNT": ("BASE TABLE", "NO")}, {})
+        err = RuntimeError("091901 (01000): wording r2g has never seen")
+        err.errno = 91901  # type: ignore[attr-defined]
+        conn.read_errors["R2G_ACCOUNT"] = err
+        with pytest.raises(StreamStaleError, match="R2G_ACCOUNT"):
+            _listener(schema, mapping, writer, conn, recover_streams=False).poll_once()
+
+    def test_unreadable_stream_is_reported_ahead_of_a_batch_that_will_be_retried(
+        self, schema, mapping, writer,
+    ):
+        # ACCOUNT is read first and fails to apply; CASES cannot be read at
+        # all. The run loop retries on the first and stops on the second, so
+        # the second is the one it must be told about.
+        conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
+        conn.dropped = {"R2G_CASES"}
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        lst = _listener(schema, mapping, writer, conn, recover_streams=False)
+        with pytest.raises(StreamStaleError, match="R2G_CASES"):
+            lst.poll_once()
+        assert conn.stream_rows["R2G_ACCOUNT"], "the failed batch stays in its stream"
+
+    def test_run_stops_on_an_unreadable_stream_behind_a_failing_batch(
+        self, schema, mapping, writer,
+    ):
+        conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
+        conn.dropped = {"R2G_CASES"}
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        lst = _listener(schema, mapping, writer, conn, poll_interval=0.0, recover_streams=False)
+        cycles = 0
+        poll_once = lst.poll_once
+
+        def counted():
+            nonlocal cycles
+            cycles += 1
+            if cycles > 3:
+                lst.stop()  # without the fix the loop never ends on its own
+            return poll_once()
+
+        lst.poll_once = counted  # type: ignore[method-assign]
+        with pytest.raises(StreamStaleError, match="R2G_CASES"):
+            lst.run()
+        assert cycles == 1
+
     def test_watermark_is_read_before_the_stream(self, schema, mapping, writer):
         conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
         _listener(schema, mapping, writer, conn).poll_once()
@@ -582,6 +713,59 @@ class TestFreshness:
         stamp = db.docs[FRESHNESS_COLLECTION]["Account"]["ingested_at"]
         assert datetime.fromisoformat(stamp) == T0
         assert datetime.fromisoformat(stamp).tzinfo is not None
+
+
+class TestStreamStateKey:
+    """A stream is named after its object, and a quoted Snowflake identifier
+    may hold characters an ArangoDB key may not."""
+
+    @pytest.mark.parametrize("stream", [
+        "R2G_ACCOUNT",
+        "R2G_Order Items",
+        "R2G_A/B",
+        "R2G_KÜNDEN",
+        "R2G_顧客",
+        "R2G_A$B",
+        "R2G_" + "X" * 400,
+        "R2G_" + "顧" * 200,
+    ])
+    def test_key_is_legal_in_arangodb(self, stream):
+        assert _LEGAL_ARANGO_KEY.fullmatch(_state_key(stream))
+
+    @pytest.mark.parametrize("stream", ["R2G_Order Items", "R2G_A%20B", "R2G_顧客", "R2G_50%"])
+    def test_key_holds_no_percent_sign(self, stream):
+        # ArangoDB accepts "%" in a key, but python-arango (8.3.7) sends a key
+        # in the request path as it is and the server reads "%20" there as a
+        # space: get("a%20b") finds nothing, replace says not found, and
+        # delete removes nothing. A state document must be reachable by key.
+        assert "%" not in _state_key(stream)
+
+    def test_a_plain_name_is_its_own_key(self):
+        assert _state_key("R2G_ACCOUNT") == "R2G_ACCOUNT"
+
+    @pytest.mark.parametrize(("one", "other"), [
+        ("R2G_A$B", "R2G_A_B"),
+        ("R2G_A B", "R2G_A%20B"),
+        ("R2G_Order Items", "R2G_Order_Items"),
+        ("R2G_A B", "R2G_A/B"),
+        ("R2G_" + "X" * 400, "R2G_" + "X" * 401),
+        ("R2G_" + "顧" * 200, "R2G_" + "顧" * 199 + "客"),
+    ])
+    def test_two_streams_never_share_a_key(self, one, other):
+        assert _state_key(one) != _state_key(other)
+
+    def test_object_whose_name_needs_quoting_is_recorded_and_stamped(self, writer):
+        # The state write comes after Snowflake has committed, so a key
+        # ArangoDB refuses would fail every cycle and stamp nothing.
+        schema, mapping = _one_object("Order Items", "OrderItem")
+        conn = FakeConn({"Order Items": ("BASE TABLE", "NO")}, {})
+        db = FakeDB()
+        result = _listener(schema, mapping, writer, conn, db=db).poll_once()
+        assert result.collections_stamped == {"OrderItem": "2026-11-14T12:00:00+00:00"}
+        (doc,) = db.docs[STREAM_STATE_COLLECTION].values()
+        assert doc["stream"] == "R2G_Order Items"
+        assert doc["_key"] == _state_key("R2G_Order Items")
+        assert doc["_key"].startswith("R2G_Order_Items.")
 
 
 class TestCollectionsForTable:
