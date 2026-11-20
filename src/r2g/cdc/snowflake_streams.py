@@ -698,8 +698,13 @@ class SnowflakeStreamListener:
                 errors.append(err)
         result.collections_stamped = self.recorder.record(targets, result.watermarks)
         if errors:
-            # Other streams' progress is recorded above; report the first failure.
-            raise errors[0]
+            # Other streams' progress is recorded above. A batch that failed to
+            # apply is read again next cycle, so it is reported only when
+            # nothing else went wrong: the caller retries on it, and must not
+            # miss a stream that no retry can read.
+            raise next(
+                (e for e in errors if not isinstance(e, BatchNotAppliedError)), errors[0],
+            )
         return result
 
     # -- loop ---------------------------------------------------------------

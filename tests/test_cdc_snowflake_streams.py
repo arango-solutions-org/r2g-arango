@@ -581,6 +581,42 @@ class TestConsume:
         with pytest.raises(StreamStaleError, match="R2G_ACCOUNT"):
             _listener(schema, mapping, writer, conn).poll_once()
 
+    def test_unreadable_stream_is_reported_ahead_of_a_batch_that_will_be_retried(
+        self, schema, mapping, writer,
+    ):
+        # ACCOUNT is read first and fails to apply; CASES cannot be read at
+        # all. The run loop retries on the first and stops on the second, so
+        # the second is the one it must be told about.
+        conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
+        conn.dropped = {"R2G_CASES"}
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        lst = _listener(schema, mapping, writer, conn)
+        with pytest.raises(StreamStaleError, match="R2G_CASES"):
+            lst.poll_once()
+        assert conn.stream_rows["R2G_ACCOUNT"], "the failed batch stays in its stream"
+
+    def test_run_stops_on_an_unreadable_stream_behind_a_failing_batch(
+        self, schema, mapping, writer,
+    ):
+        conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
+        conn.dropped = {"R2G_CASES"}
+        writer.insert_document.side_effect = RuntimeError("arango down")
+        lst = _listener(schema, mapping, writer, conn, poll_interval=0.0)
+        cycles = 0
+        poll_once = lst.poll_once
+
+        def counted():
+            nonlocal cycles
+            cycles += 1
+            if cycles > 3:
+                lst.stop()  # without the fix the loop never ends on its own
+            return poll_once()
+
+        lst.poll_once = counted  # type: ignore[method-assign]
+        with pytest.raises(StreamStaleError, match="R2G_CASES"):
+            lst.run()
+        assert cycles == 1
+
     def test_watermark_is_read_before_the_stream(self, schema, mapping, writer):
         conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
         _listener(schema, mapping, writer, conn).poll_once()
