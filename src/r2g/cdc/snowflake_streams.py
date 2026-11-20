@@ -44,6 +44,42 @@ name, holding ``ingested_at``). That collection and field are the ones the
 contextual-data-fabric's ArangoDB executor reads to cite how fresh an
 answer is, so a copy kept by this listener is cited without any change on
 the fabric's side.
+
+Recovery
+--------
+
+A stream that can no longer be read (stale, or its source dropped or
+recreated: errno 091901) has lost the changes since its offset. With
+``recover_streams`` (the default) the listener then:
+
+1. Marks the stream's state ``resync_pending`` in ArangoDB, so a failure
+   or restart anywhere below resumes the resync instead of reading on from
+   a copy that is missing changes.
+2. Re-resolves the object (a recreated dynamic table must still refresh
+   incrementally) and recreates the stream with ``CREATE OR REPLACE``.
+3. Takes the watermark's lower bound, then reads the whole object and
+   applies every row as an insert (an upsert under ``source_wins``).
+4. Sweeps: every document and edge the object owns
+   (:meth:`~r2g.cdc.delta_transformer.DeltaTransformer.owned_scopes`)
+   that no current row produced is deleted through the handler, so rows
+   deleted while the stream was unreadable leave the copy too. A collection
+   another table also writes to is not swept and is reported instead.
+
+Recovery is refused, and the run stops naming the stream, where a resync
+would not bring the copy up to date: in temporal mode, under a conflict
+policy other than ``source_wins``, and for an object with no primary key
+(:meth:`SnowflakeStreamListener._why_not_recoverable`).
+
+The new stream is created before the object is read, so a change landing
+during the resync is in both the read and the stream. Replaying it next
+cycle is harmless: a stream returns each row's net change up to the read,
+so applying it after the snapshot leaves the copy at the source's state.
+
+One case is not corrected. The stream's offset is the moment it was created,
+and the object is read a moment later. A row that changes between the two
+and changes back before the next cycle, or is inserted and then deleted,
+shows no net change in the stream, so the copy keeps what the read saw
+until that row changes again.
 """
 
 from __future__ import annotations
@@ -54,10 +90,11 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
+from r2g.cdc.conflict import ConflictPolicy
 from r2g.cdc.handler import CDCHandler
-from r2g.cdc.models import ChangeEvent, ChangeOperation
+from r2g.cdc.models import ArangoDelta, ArangoOperation, ChangeEvent, ChangeOperation
 from r2g.connectors.snowflake import (
     _load_snowflake_connector,
     _parse_snowflake_url,
@@ -134,13 +171,22 @@ class StreamStaleError(SnowflakeStreamError):
     recreate the stream and resync the object's collections.
     """
 
-    def __init__(self, stream: str, detail: str = "") -> None:
+    def __init__(self, stream: str, detail: str = "", *, not_recovered: str = "") -> None:
         self.stream = stream
+        self.detail = detail
+        #: Why recovery was refused for this stream ("" when it was only off).
+        self.not_recovered = not_recovered
         super().__init__(
             f"Snowflake stream {stream} can no longer be read: it is stale, or "
             "its source was dropped or recreated, so the changes since the last "
-            "cycle are lost. Recreate the stream and reload the object's "
-            "collections (automatic recovery is not implemented yet)."
+            "cycle are lost. "
+            + (
+                f"It is not recovered: {not_recovered} Recreate the stream and "
+                "reload the object's collections."
+                if not_recovered else
+                "Recovery recreates the stream and resyncs the object; it is off "
+                "with --no-recover-streams."
+            )
             + (f" Snowflake said: {detail}" if detail else "")
         )
 
@@ -189,6 +235,12 @@ class StreamWatermark:
     basis: str
     events: int = 0
     rows_read: int = 0
+    #: This cycle recreated the stream and resynced the object.
+    resynced: bool = False
+    #: Documents and edges the resync deleted because their rows are gone.
+    swept: int = 0
+    #: Collections the resync could not sweep, each with the reason.
+    not_swept: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -312,6 +364,12 @@ class FreshnessRecorder:
                 "collections": sorted(self.collections_by_object.get(t.source_object, ())),
                 "updated_at": now,
             })
+            if wm.resynced:
+                stream_docs[-1].update({
+                    "last_resync_at": now,
+                    "last_resync_swept": wm.swept,
+                    "last_resync_not_swept": list(wm.not_swept),
+                })
         if stream_docs:
             self._ensure(STREAM_STATE_COLLECTION).insert_many(
                 stream_docs, overwrite=True, raise_on_document_error=True,
@@ -345,6 +403,39 @@ class FreshnessRecorder:
                 raise_on_document_error=True,
             )
         return stamps
+
+    def mark_resync_pending(self, target: StreamTarget, reason: str) -> None:
+        """Record that *target* must be resynced before its stream is read again.
+
+        Replaces the stream's state document, so its old watermark is gone
+        too: until the resync finishes the stream has none, and the
+        collections it feeds are not stamped.
+        """
+        self._ensure(STREAM_STATE_COLLECTION).insert_many(
+            [{
+                "_key": _state_key(target.stream_name),
+                "stream": target.stream_name,
+                "source_object": target.source_object,
+                "object_kind": target.kind,
+                "resync_pending": True,
+                "resync_reason": reason,
+                "updated_at": _iso_utc(datetime.now(timezone.utc)),
+            }],
+            overwrite=True,
+            raise_on_document_error=True,
+        )
+
+    def pending_resyncs(self, targets: list[StreamTarget]) -> set[str]:
+        """Streams among *targets* whose resync an earlier run left unfinished."""
+        if not self.db.has_collection(STREAM_STATE_COLLECTION):
+            return set()
+        coll = self.db.collection(STREAM_STATE_COLLECTION)
+        pending = set()
+        for t in targets:
+            doc = coll.get(_state_key(t.stream_name))
+            if doc and doc.get("resync_pending"):
+                pending.add(t.stream_name)
+        return pending
 
 
 def _state_key(stream_name: str) -> str:
@@ -391,6 +482,7 @@ class SnowflakeStreamListener:
         fetch_size: int = 10_000,
         recorder: FreshnessRecorder | None = None,
         connect: Callable[..., Any] | None = None,
+        recover_streams: bool = True,
     ) -> None:
         params = _parse_snowflake_url(connection_string)
         url_schema = params.pop("_url_schema", None)
@@ -409,6 +501,9 @@ class SnowflakeStreamListener:
         self.stream_prefix = stream_prefix
         self.poll_interval = poll_interval
         self.fetch_size = max(1, fetch_size)
+        self.recover_streams = recover_streams
+        #: Streams whose resync is unfinished; loaded from ArangoDB on first poll.
+        self._pending: set[str] | None = None
 
         self.objects = sorted({
             cm.source_table
@@ -481,16 +576,21 @@ class SnowflakeStreamListener:
                 "The mapping has no collection whose source table is in the schema; "
                 "there is nothing to read changes from."
             )
-        placeholders = ", ".join("%s" for _ in self.objects)
+        self.targets = self._resolve(self.objects)
+        return self.targets
+
+    def _resolve(self, objects: list[str]) -> list[StreamTarget]:
+        """Look up each object's kind; refuse a missing or unreadable one."""
+        placeholders = ", ".join("%s" for _ in objects)
         rows = self._execute(
             f"SELECT TABLE_NAME, TABLE_TYPE, IS_DYNAMIC "  # noqa: S608
             f"FROM {quote_ident(self.database)}.INFORMATION_SCHEMA.TABLES "
             f"WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN ({placeholders})",
-            (self.source_schema, *self.objects),
+            (self.source_schema, *objects),
         )
         found = {r["TABLE_NAME"]: r for r in rows}
         targets = []
-        for obj in self.objects:
+        for obj in objects:
             row = found.get(obj)
             if row is None:
                 raise SnowflakeStreamError(
@@ -510,7 +610,6 @@ class SnowflakeStreamListener:
                     f"{obj} is a {table_type.lower()}; Snowflake streams cannot read it."
                 )
             targets.append(StreamTarget(obj, kind, stream_name_for(obj, self.stream_prefix)))
-        self.targets = targets
         return targets
 
     def _dynamic_table_info(self, obj: str) -> dict[str, Any]:
@@ -569,14 +668,18 @@ class SnowflakeStreamListener:
                 raise SnowflakeStreamError(
                     f"Stream {t.stream_name} does not exist (run without --no-create-streams)."
                 )
-            self._execute(
-                f"CREATE STREAM IF NOT EXISTS {self._stream_fqn(t.stream_name)} "
-                f"ON {t.kind} {self._source_fqn(t.source_object)} "
-                f"COMMENT = 'r2g change capture'"
-            )
+            self._create_stream(t)
             outcome[t.stream_name] = "created"
             logger.info("snowflake_stream_created", stream=t.stream_name, kind=t.kind)
         return outcome
+
+    def _create_stream(self, target: StreamTarget, *, replace: bool = False) -> None:
+        verb = "CREATE OR REPLACE STREAM" if replace else "CREATE STREAM IF NOT EXISTS"
+        self._execute(
+            f"{verb} {self._stream_fqn(target.stream_name)} "
+            f"ON {target.kind} {self._source_fqn(target.source_object)} "
+            f"COMMENT = 'r2g change capture'"
+        )
 
     # -- one cycle ----------------------------------------------------------
 
@@ -695,18 +798,198 @@ class SnowflakeStreamListener:
         )
         return StreamWatermark(through, basis, events=len(events), rows_read=len(rows))
 
+    # -- recovery -----------------------------------------------------------
+
+    def recover(self, target: StreamTarget, reason: str = "") -> StreamWatermark:
+        """Recreate *target*'s stream and resync its object (see module docstring).
+
+        Raises :class:`BatchNotAppliedError` if any write failed, leaving the
+        resync pending so the next cycle runs it again, and
+        :class:`StreamStaleError` before touching anything when a resync
+        would not bring the copy up to date (:meth:`_why_not_recoverable`).
+        """
+        refusal = self._why_not_recoverable(target)
+        if refusal:
+            raise StreamStaleError(target.stream_name, reason, not_recovered=refusal)
+        logger.warning(
+            "snowflake_stream_recovering", stream=target.stream_name, reason=reason,
+        )
+        if self._pending is None:
+            self._pending = set()
+        self.recorder.mark_resync_pending(target, reason)
+        self._pending.add(target.stream_name)
+
+        fresh = self._resolve([target.source_object])[0]
+        self._create_stream(fresh, replace=True)
+        self.targets = [fresh if t.stream_name == fresh.stream_name else t for t in self.targets]
+
+        through, basis = self._lower_bound(fresh)
+        rows_read, written = self._resync(fresh)
+        swept, not_swept = self._sweep(fresh.source_object, written, rows_read)
+
+        self._pending.discard(fresh.stream_name)
+        logger.info(
+            "snowflake_stream_recovered",
+            stream=fresh.stream_name, rows=rows_read, swept=swept,
+            not_swept=not_swept, applied_through=_iso_utc(through),
+        )
+        return StreamWatermark(
+            through, basis, events=rows_read, rows_read=rows_read,
+            resynced=True, swept=swept, not_swept=not_swept,
+        )
+
+    def _why_not_recoverable(self, target: StreamTarget) -> str:
+        """Why a resync of *target* would not bring the copy up to date ("" if it would).
+
+        A resync applies every current row as an insert, relies on that
+        insert replacing the document already there, and then deletes the
+        documents no row produced. Three configurations break that:
+
+        * **Temporal mode.** An insert writes version 0 and ignores a
+          duplicate, so it changes nothing for an entity the copy already
+          holds, and nothing is deleted either.
+        * **A conflict policy other than** ``source_wins``. ``log_and_skip``
+          skips the insert, leaving every changed row as it was, and
+          ``fail`` raises on the first row the copy holds.
+        * **An object with no primary key.** Its documents carry keys
+          ArangoDB generated, so each row would be inserted a second time
+          and no document could be matched to a row.
+        """
+        if self.handler.temporal:
+            return (
+                "in temporal mode an insert never replaces an existing version, "
+                "so a resync would leave every changed row as it was."
+            )
+        policy = self.handler.resolver.policy
+        if policy is not ConflictPolicy.SOURCE_WINS:
+            return (
+                "a resync writes every current row over the copy, which needs "
+                f"--conflict-policy source_wins (this run uses {policy.value})."
+            )
+        if not self.schema.tables[target.source_object].primary_key:
+            return (
+                f"{target.source_object} has no primary key in the schema, so its "
+                "documents cannot be matched to its rows."
+            )
+        return ""
+
+    def _resync(self, target: StreamTarget) -> tuple[int, dict[str, set[str]]]:
+        """Apply every current row of *target* as an insert.
+
+        Returns the rows read and, per collection, the keys written.
+        """
+        obj = target.source_object
+        written: dict[str, set[str]] = {}
+        rows_read = 0
+        failed_before = self.handler.stats.deltas_failed
+        cur = self.connection.cursor()
+        try:
+            cur.execute(f"SELECT * FROM {self._source_fqn(obj)}")  # noqa: S608
+            cols = [d[0] for d in (cur.description or [])]
+            while True:
+                chunk = cur.fetchmany(self.fetch_size)
+                if not chunk:
+                    break
+                for values in chunk:
+                    rows_read += 1
+                    deltas = self.handler.handle_event(ChangeEvent(
+                        operation=ChangeOperation.INSERT,
+                        schema_name=self.source_schema,
+                        table_name=obj,
+                        new_row=dict(zip(cols, values)),
+                    ))
+                    for d in deltas:
+                        if d.effective_key:
+                            written.setdefault(d.collection, set()).add(d.effective_key)
+        finally:
+            cur.close()
+        failed = self.handler.stats.deltas_failed - failed_before
+        if failed:
+            raise BatchNotAppliedError(
+                f"{failed} write(s) failed resyncing {obj} after recreating "
+                f"{target.stream_name}; the resync stays pending and runs again next cycle."
+            )
+        return rows_read, written
+
+    def _sweep(
+        self, obj: str, written: dict[str, set[str]], rows_read: int,
+    ) -> tuple[int, list[str]]:
+        """Delete what *obj* owns but its current rows no longer produce.
+
+        Returns the number deleted and the collections left unswept, each
+        with its reason.
+        """
+        scopes = self.handler.transformer.owned_scopes(obj)
+        node_scope = next((s for s in scopes if not s.is_edge), None)
+        if rows_read and node_scope is not None and not written.get(node_scope.collection):
+            # Rows came back but none mapped to a document: sweeping now would
+            # empty the collection because of a mapping fault, not a delete.
+            raise SnowflakeStreamError(
+                f"Resyncing {obj} read {rows_read} row(s) but wrote no document to "
+                f"{node_scope.collection}; refusing to delete what the copy holds. "
+                "Check that the schema and mapping still match the object."
+            )
+
+        db = self.handler.writer.db
+        failed_before = self.handler.stats.deltas_failed
+        swept = 0
+        not_swept: list[str] = []
+        for scope in scopes:
+            if scope.shared_with:
+                reason = (
+                    f"{scope.collection}: also written by {', '.join(scope.shared_with)}, "
+                    "so documents whose rows are gone cannot be told apart"
+                )
+                logger.warning("snowflake_resync_not_swept", object=obj, reason=reason)
+                not_swept.append(reason)
+                continue
+            if not db.has_collection(scope.collection):
+                continue
+            if scope.match_field is not None:
+                query = "FOR d IN @@c FILTER d[@f] == @v RETURN d._key"
+                bind: dict[str, Any] = {
+                    "@c": scope.collection, "f": scope.match_field, "v": scope.match_value,
+                }
+            else:
+                query = "FOR d IN @@c RETURN d._key"
+                bind = {"@c": scope.collection}
+            present = set(cast("Iterable[str]", db.aql.execute(query, bind_vars=bind, stream=True)))
+            keep = written.get(scope.collection, set())
+            for key in sorted(present - keep):
+                self.handler.apply_delta(ArangoDelta(
+                    operation=ArangoOperation.DELETE,
+                    collection=scope.collection,
+                    key=key,
+                    is_edge=scope.is_edge,
+                ))
+                swept += 1
+        failed = self.handler.stats.deltas_failed - failed_before
+        if failed:
+            raise BatchNotAppliedError(
+                f"{failed} delete(s) failed sweeping {obj}; the resync stays pending "
+                "and runs again next cycle."
+            )
+        return swept, not_swept
+
     def poll_once(self) -> CycleResult:
-        """Consume every stream once, then record watermarks and freshness."""
+        """Consume every stream once, then record watermarks and freshness.
+
+        A stream that can no longer be read is recovered when
+        ``recover_streams`` is on; a resync left unfinished by an earlier
+        cycle or run is resumed before the stream is read again.
+        """
         targets = self.targets or self.discover()
+        if self._pending is None:
+            self._pending = self.recorder.pending_resyncs(targets)
         result = CycleResult()
         errors: list[Exception] = []
-        for t in targets:
+        for t in list(targets):
             try:
-                result.watermarks[t.stream_name] = self.consume(t)
-            except (StreamStaleError, BatchNotAppliedError) as err:
+                result.watermarks[t.stream_name] = self._cycle(t)
+            except SnowflakeStreamError as err:
                 logger.error("snowflake_stream_cycle_failed", stream=t.stream_name, error=str(err))
                 errors.append(err)
-        result.collections_stamped = self.recorder.record(targets, result.watermarks)
+        result.collections_stamped = self.recorder.record(self.targets, result.watermarks)
         if errors:
             # Other streams' progress is recorded above. A batch that failed to
             # apply is read again next cycle, so it is reported only when
@@ -716,6 +999,21 @@ class SnowflakeStreamListener:
                 (e for e in errors if not isinstance(e, BatchNotAppliedError)), errors[0],
             )
         return result
+
+    def _cycle(self, target: StreamTarget) -> StreamWatermark:
+        assert self._pending is not None
+        if target.stream_name in self._pending:
+            if not self.recover_streams:
+                raise StreamStaleError(
+                    target.stream_name, "an earlier run left its resync unfinished",
+                )
+            return self.recover(target, "resuming an unfinished resync")
+        try:
+            return self.consume(target)
+        except StreamStaleError as err:
+            if not self.recover_streams:
+                raise
+            return self.recover(target, err.detail or str(err))
 
     # -- loop ---------------------------------------------------------------
 
@@ -743,10 +1041,10 @@ class SnowflakeStreamListener:
                 started = time.monotonic()
                 try:
                     self.poll_once()
-                except StreamStaleError:
-                    raise
                 except BatchNotAppliedError:
-                    pass  # logged; retried next cycle
+                    pass  # logged; retried next cycle (a pending resync included)
+                except SnowflakeStreamError:
+                    raise  # unreadable without recovery, or a setup fault: stop
                 except Exception as err:
                     logger.error("snowflake_cdc_cycle_error", error=str(err))
                     self.close()  # reconnect next cycle

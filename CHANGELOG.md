@@ -16,9 +16,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applied and advanced in one Snowflake transaction, which rolls back if any change fails to apply.
   After each cycle r2g records, for every collection it feeds, the source time the collection is
   current through, in `_cdf_ingest` (`ingested_at`), where contextual-data-fabric already reads it.
-  `--once` runs a single cycle for scheduled batches. Not yet: recovering a stream that can no
-  longer be read (the run stops and names it), soft deletes, an insert-only path and a `CHANGES`
-  fallback for objects without a stream grant.
+  `--once` runs a single cycle for scheduled batches. Not yet: soft deletes, an insert-only path
+  and a `CHANGES` fallback for objects without a stream grant.
+- **Snowflake CDC recovers a stream that can no longer be read (#65, PRD P6.16).** When a stream
+  is stale, or its source was dropped or recreated, `cdc-start` recreates the stream, re-reads the
+  whole object and deletes the documents and edges whose rows are gone, so the copy matches the
+  source again. An unfinished resync is resumed on the next cycle or run. A collection another table
+  also writes to is not swept and is reported. Where a resync would not bring the copy up to date,
+  none is attempted and the run stops naming the stream: with `--temporal`, under a conflict policy
+  other than `source_wins`, and for an object with no primary key. `--no-recover-streams` stops the
+  run instead.
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 

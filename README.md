@@ -698,8 +698,31 @@ feed, how far the copy is current:
 `ingested_at` is the **oldest** watermark among the streams that write to that collection, and a
 lower bound: the Snowflake clock read before the stream was read, or a dynamic table's
 `data_timestamp` when older. contextual-data-fabric reads `_cdf_ingest` to cite how fresh an answer
-is. A stream that can no longer be read (stale, or its source dropped or recreated) stops the run
-naming the stream; recreate it and reload that object's collections.
+is.
+
+**A stream that can no longer be read** (stale, or its source dropped or recreated) has lost the
+changes since its last cycle. r2g then recreates the stream and resyncs the object: it reads every
+current row and applies it, then deletes the object's documents and edges that no current row
+produced, so rows deleted while the stream was broken leave the copy too. The resync is marked
+pending in `_r2g_cdc_streams` until it finishes, so a failure or restart resumes it rather than
+reading on, and the object's collections keep their previous stamp meanwhile. A collection another
+mapped table also writes to is not swept and is reported in `last_resync_not_swept` (PG layout; under
+LPG each document's `sourceTable` tells them apart). If rows come back but none maps to a document,
+r2g refuses to sweep rather than empty the collection. Pass `--no-recover-streams` to stop the run
+and name the stream instead.
+
+A resync has to replace what the copy holds, so in three cases r2g does not attempt one and stops the
+run naming the stream, as with `--no-recover-streams`:
+
+- with `--temporal`, where an insert never replaces an existing version;
+- under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
+  `fail` would stop at the first row the copy already holds;
+- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
+
+One case a resync does not correct. The stream is recreated and the object is read a moment later. A
+row that changes between the two and changes back before the next cycle, or is inserted and then
+deleted, shows no net change in the stream, so the copy keeps what the read saw until that row
+changes again.
 
 ### Kafka CDC
 
