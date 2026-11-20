@@ -363,7 +363,8 @@ class TestIntrospection:
         created_at = next(c for c in users.columns if c.name == "CREATED_AT")
         assert pg_type_to_json_type(created_at.data_type) == "string"
         id_col = next(c for c in users.columns if c.name == "ID")
-        assert pg_type_to_json_type(id_col.data_type) == "float"
+        # NUMBER(38,0): an integer, so the load keeps every digit.
+        assert pg_type_to_json_type(id_col.data_type) == "integer"
 
 
 class TestNumericScale:
@@ -425,13 +426,18 @@ class TestNumericScale:
         assert column.data_type == recorded
         assert _xsd_datatype(column.data_type) == xsd
 
-    def test_scaled_number_keeps_its_json_type(self, monkeypatch):
-        """Everything that reads the JSON type strips the parameters, so recording
-        the scale changes nothing outside the R2RML datatype."""
+    def test_scale_decides_the_json_type_the_load_uses(self, monkeypatch):
+        """Scale 0 is an integer, so a NUMBER(38,0) value loads with every digit
+        instead of as a double (which loses digits above 2**53); a scale above 0
+        stays a float. Until this, the JSON type ignored the scale and only the
+        R2RML datatype used it."""
         from r2g.config import pg_type_to_json_type
 
-        schema = self._schema_with_columns(monkeypatch, [("ID", "NUMBER", "NO", 38, 0)])
-        assert pg_type_to_json_type(schema.tables["USERS"].columns[0].data_type) == "float"
+        schema = self._schema_with_columns(
+            monkeypatch, [("ID", "NUMBER", "NO", 38, 0), ("VALUE", "NUMBER", "YES", 10, 2)]
+        )
+        types = {c.name: pg_type_to_json_type(c.data_type) for c in schema.tables["USERS"].columns}
+        assert types == {"ID": "integer", "VALUE": "float"}
 
 
 def test_emulated_snowflake_types_integer_columns_by_scale():

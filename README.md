@@ -523,7 +523,7 @@ r2g stream --dry-run \
 | `cdc-setup` | Create a PostgreSQL logical replication slot for CDC (`--slot`, `--plugin test_decoding\|wal2json`) |
 | `cdc-teardown` | Drop a logical replication slot |
 | `cdc-status` | Show replication slot metadata (active, LSN positions) |
-| `cdc-start` | Start the CDC listener: polls for changes, transforms via mapping config, applies deltas to ArangoDB in near real-time (`--poll-interval`, `--batch-size`, `--create-slot/--no-create-slot`, `--conflict-policy`, `--temporal`; `--govern` applies the Phase 9 sensitivity gate so changed rows carry classification policy — `--allow-sensitive`, `--sensitivity-threshold`) |
+| `cdc-start` | Start the CDC listener: polls for changes, transforms via mapping config, applies deltas to ArangoDB in near real-time (`--pg-conn`, or `--source` for a PostgreSQL or Snowflake catalog source — Snowflake reads standard streams: `--stream-schema`, `--stream-prefix`, `--no-create-streams`, `--once`; `--poll-interval`, `--batch-size`, `--create-slot/--no-create-slot`, `--conflict-policy`, `--temporal`; `--govern` applies the Phase 9 sensitivity gate so changed rows carry classification policy — `--allow-sensitive`, `--sensitivity-threshold`) |
 | `kafka-start` | Start Kafka CDC consumer: consumes Debezium or flat JSON messages from Kafka topics, transforms via mapping config, applies deltas to ArangoDB (`--brokers`, `--topics`, `--group-id`, `--format`, `--offset-reset`, `--conflict-policy`, `--temporal`, `--govern`) |
 | `stream` | Stream data directly from PostgreSQL to ArangoDB via HTTP API (no intermediate files); supports `--dry-run`, `--pg-schema`, `--drop-collections`, `--workers`, `--include-tables`, `--exclude-tables`, `--skip-existing`, `--on-duplicate`, `--since`, and `--since-column` |
 | `mapping-diff` | Compare two mapping configs and show what ArangoDB changes are needed |
@@ -652,6 +652,77 @@ For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to captur
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;
 ```
+
+### Snowflake CDC (streams)
+
+`cdc-start --source <name>` with a Snowflake catalog source keeps the copy current from Snowflake
+**standard streams**, one per mapped table, view or dynamic table (a dynamic table must refresh
+incrementally). Load the copy first (`r2g stream --source <name>`), then:
+
+```bash
+# Continuous: one cycle per minute (the default for Snowflake), Ctrl+C to stop
+r2g cdc-start --source crm schema.json mapping.yaml --database crm
+
+# Scheduled batches (cron, Airflow): one cycle, then exit
+r2g cdc-start --source crm schema.json mapping.yaml --database crm --once
+
+# Streams in their own schema, so the reading role needs no CREATE rights on the data
+r2g cdc-start --source crm schema.json mapping.yaml --stream-schema R2G_CDC
+```
+
+r2g creates any missing stream (`R2G_<object>`; change the prefix with `--stream-prefix`, or pass
+`--no-create-streams`). r2g creates the streams and one session temporary table in the stream schema,
+so the role needs `CREATE STREAM` there and `SELECT` on the mapped objects. Creating the first stream
+on a table without change tracking needs the table's owner, and a stream on a view needs change
+tracking on the view's tables (`ALTER TABLE … SET CHANGE_TRACKING = TRUE`).
+
+A stream begins at the moment it is created. A change made after the load read an object and before
+its stream existed is never delivered, so the copy keeps the older row until that row changes again.
+To leave no such gap, the streams must exist before the load starts: `cdc-start` reuses a stream
+named `R2G_<object>` that already reads the object, and the first cycle after the load then applies
+each row's net change since the stream was created.
+
+Each cycle reads, applies and advances every stream inside one Snowflake transaction. If any change
+fails to apply in ArangoDB the transaction rolls back, and the same changes are read again next
+cycle. An update that changes no mapped column writes nothing (`noop_updates_skipped` in the
+session statistics). `last_write_wins` is refused; use `source_wins`.
+
+**Freshness, as part of r2g's output.** After each cycle r2g writes, for every collection the streams
+feed, how far the copy is current:
+
+| Collection | Document | Field |
+| :--- | :--- | :--- |
+| `_cdf_ingest` (system) | `_key` = the ArangoDB collection's name | `ingested_at`: ISO 8601 with offset, the source time the collection's changes are applied through |
+| `_r2g_cdc_streams` (system) | `_key` = the stream's name when that is a legal ArangoDB key; otherwise a readable form of it ending in a digest (`R2G_Order_Items.<16 hex digits>`) | `stream` (the name as Snowflake has it), `applied_through`, `basis`, and the last cycle's counts |
+
+`ingested_at` is the **oldest** watermark among the streams that write to that collection, and a
+lower bound: the Snowflake clock read before the stream was read, or a dynamic table's
+`data_timestamp` when older. contextual-data-fabric reads `_cdf_ingest` to cite how fresh an answer
+is.
+
+**A stream that can no longer be read** (stale, or its source dropped or recreated) has lost the
+changes since its last cycle. r2g then recreates the stream and resyncs the object: it reads every
+current row and applies it, then deletes the object's documents and edges that no current row
+produced, so rows deleted while the stream was broken leave the copy too. The resync is marked
+pending in `_r2g_cdc_streams` until it finishes, so a failure or restart resumes it rather than
+reading on, and the object's collections keep their previous stamp meanwhile. A collection another
+mapped table also writes to is not swept and is reported in `last_resync_not_swept` (PG layout; under
+LPG each document's `sourceTable` tells them apart). If rows come back but none maps to a document,
+r2g refuses to sweep rather than empty the collection. Pass `--no-recover-streams` to stop the run
+and name the stream instead.
+
+A resync has to replace what the copy holds, so in three cases r2g does not attempt one and stops the
+run naming the stream, as with `--no-recover-streams`:
+
+- with `--temporal`, where an insert never replaces an existing version;
+- under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
+  `fail` would stop at the first row the copy already holds;
+- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
+
+One case a resync does not correct. The stream is recreated and the object is read a moment later. A
+row that changes between the two and changes back before the next cycle, or is inserted and then
+deleted, shows no net change in the stream, so the copy keeps what the read saw until that row
+changes again.
 
 ### Kafka CDC
 
