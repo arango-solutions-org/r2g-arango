@@ -1370,17 +1370,25 @@ class TestMappingEndpoints:
 
     def test_graph_data_carries_unique_keys_and_the_capture(self, client, tmp_path, catalog_dir):
         """P14.15: a reader outside the Studio sees each table's UNIQUE keys and which
-        capture the tables are, with when it was taken."""
+        capture the tables are, with when it was taken.
+
+        A project is pinned to its snapshot (P6.12), so the newer capture is read
+        only after the project is explicitly rebased onto it."""
         self._setup_project(client, tmp_path, catalog_dir)
         mgr = CatalogManager(catalog_dir)
         snap = mgr.create_snapshot("src", Schema(tables={
             "users": Table(name="users", columns=[
                 Column(name="id", data_type="integer", is_primary_key=True),
+                Column(name="name", data_type="text"),
                 Column(name="email", data_type="text"),
                 Column(name="tenant", data_type="text"),
                 Column(name="handle", data_type="text"),
             ], primary_key=["id"], unique_constraints=[["email"], ["tenant", "handle"]]),
         }))
+        pinned = client.get("/api/projects/proj/graph-data").json()
+        assert pinned["snapshot"]["id"] != snap.id
+        rebased = client.post("/api/projects/proj/rebase-snapshot", json={"apply": True})
+        assert rebased.status_code == 200, rebased.text
         data = client.get("/api/projects/proj/graph-data").json()
         users = next(t for t in data["tables"] if t["name"] == "users")
         assert users["uniqueConstraints"] == [["email"], ["tenant", "handle"]]
@@ -1402,6 +1410,9 @@ class TestMappingEndpoints:
         catalog = mgr._load()
         catalog.snapshots["legacy"] = SchemaSnapshot.model_validate(legacy)
         mgr._save(catalog)
+        # The project is pinned (P6.12): it reads the legacy capture once rebased onto it.
+        rebased = client.post("/api/projects/proj/rebase-snapshot", json={"apply": True})
+        assert rebased.status_code == 200, rebased.text
         data = client.get("/api/projects/proj/graph-data").json()
         assert data["snapshot"]["id"] == "legacy"
         assert data["snapshot"]["capturedAt"].startswith("2099-01-01T00:00:00")
