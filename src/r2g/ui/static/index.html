@@ -326,9 +326,9 @@
     transition: transform .15s; flex-shrink: 0;
   }
   .source-card-header .expand-icon.open { transform: rotate(90deg); }
-  .source-card-header .table-name { font-size: 12px; font-weight: 600; color: var(--accent); flex: 1; }
+  .source-card-header .table-name { font-size: 12px; font-weight: 600; color: var(--accent); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .source-card-header .col-count {
-    font-size: 10px; color: var(--text-muted); background: var(--surface2);
+    font-size: 10px; color: var(--text-muted); background: var(--surface2); flex-shrink: 0;
     padding: 1px 6px; border-radius: 3px;
   }
   .source-dot {
@@ -354,7 +354,7 @@
   }
   .source-col-row:hover { background: rgba(56,189,248,.03); }
   .source-col-row.excluded { opacity: .35; text-decoration: line-through; }
-  .source-col-row .col-name { flex: 1; }
+  .source-col-row .col-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .source-col-dot {
     width: 8px; height: 8px; border-radius: 50%;
     background: rgba(56,189,248,.3); border: 1.5px solid var(--accent);
@@ -368,13 +368,13 @@
   }
   .field-badge.pk { background: var(--yellow); color: #000; }
   .field-badge.fk { background: var(--accent); color: #000; }
-  /* The ontology term a source table or column maps to (P14.8). */
+  /* The ontology terms a source table or column maps to (P14.8), on a wrapping row of their own below it. */ .term-chip-row { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 12px 6px 34px; } .source-card-body .term-chip-row { padding: 0 12px 4px 24px; } .source-col-row.excluded + .term-chip-row { opacity: .35; text-decoration: line-through; }
   .term-chip {
-    font-size: 8px; padding: 0 4px; border-radius: 2px; font-weight: 700; flex-shrink: 0;
+    font-size: 10px; padding: 0 4px; border-radius: 2px; font-weight: 600; flex-shrink: 1; min-width: 0;
     background: #f4fef2; color: var(--arango-green); border: 1px solid #006532;
     max-width: 7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .field-type { margin-left: auto; font-size: 9px; color: var(--text-muted); flex-shrink: 0; }
+  .field-type { margin-left: auto; font-size: 9px; color: var(--text-muted); flex-shrink: 0; } .source-col-row .field-type { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Target cards */
   .target-section-label {
@@ -440,7 +440,7 @@
   .func-circle.hl circle { stroke: var(--accent2); stroke-width: 2.5; }
   .source-card.hl, .target-card.hl { box-shadow: inset 3px 0 0 0 var(--accent2); }
   .target-card.hl { box-shadow: inset -3px 0 0 0 var(--accent2); }
-  .source-col-row.hl, .target-prop-row.hl { background: rgba(99,102,241,.14) !important; }
+  .source-col-row.hl, .source-col-row.hl + .term-chip-row, .target-prop-row.hl { background: rgba(99,102,241,.14) !important; }
   .connector.table-conn { stroke-width: 2.5; opacity: .6; }
   .connector.col-conn { stroke-width: 1; opacity: .3; }
   .connector.col-conn:hover { opacity: .7; stroke-width: 2; }
@@ -938,7 +938,7 @@
   .target-card.has-issue .target-card-header { box-shadow: inset -3px 0 0 var(--red); }
 
   /* Lens: coverage */
-  body.lens-coverage .source-col-row.mapped, body.lens-coverage .target-prop-row.mapped { opacity: .35; }
+  body.lens-coverage .source-col-row.mapped, body.lens-coverage .source-col-row.mapped + .term-chip-row, body.lens-coverage .target-prop-row.mapped { opacity: .35; }
   body.lens-coverage .source-col-row.unmapped::after,
   body.lens-coverage .target-prop-row.unmapped::after {
     content: ''; position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
@@ -960,8 +960,8 @@
   /* Lens: sensitivity (Phase 9b) — color rows by mosaic-recomputed tier.
      Paint-only: a left border + tint on source columns and target properties.
      Source-column color = the highest level it feeds (mosaic = max). */
-  body.lens-sensitivity .source-col-row, body.lens-sensitivity .target-prop-row { opacity: .45; }
-  body.lens-sensitivity .source-col-row[class*="sens-"],
+  body.lens-sensitivity .source-col-row, body.lens-sensitivity .source-col-row + .term-chip-row, body.lens-sensitivity .target-prop-row { opacity: .45; }
+  body.lens-sensitivity .source-col-row[class*="sens-"], body.lens-sensitivity .source-col-row[class*="sens-"] + .term-chip-row,
   body.lens-sensitivity .target-prop-row[class*="sens-"] { opacity: 1; }
   body.lens-sensitivity .sens-restricted   { box-shadow: inset 3px 0 0 #da1a20; background: rgba(218,26,32,.06); }
   body.lens-sensitivity .sens-confidential { box-shadow: inset 3px 0 0 #fbbf24; background: rgba(251,191,36,.06); }
@@ -1460,9 +1460,9 @@ function _termChips(collKeys, termOf, terms, kind) {
     if (!byIri.has(iri)) byIri.set(iri, []);
     byIri.get(iri).push(key);
   }
-  return [...byIri].map(([iri, keys]) =>
-    `<span class="term-chip" title="${escHtml(`Ontology ${kind} of ${keys.join(', ')}: ${iri}`)}">${escHtml(_termText(iri, terms))}</span>`
-  ).join('');
+  return !byIri.size ? '' : '<div class="term-chip-row">' + [...byIri].map(([iri, keys]) =>
+    `<span class="term-chip" title="${escHtml(`Ontology ${kind} of ${keys.join(', ')}: ${_termText(iri, terms)} (${iri})`)}">${escHtml(_termText(iri, terms))}</span>`
+  ).join('') + '</div>';
 }
 
 function _termRow(label, value, list, onchange, column) {
@@ -2818,22 +2818,22 @@ function renderSourcePane(tables) {
       <div class="source-card${selectedCardKey === 'src:'+t.name ? ' selected' : ''}" data-table="${escHtml(t.name)}">
         <div class="source-card-header" onclick="onSourceCardClick(this.closest('.source-card').dataset.table)">
           <span class="expand-icon ${isCollapsed ? '' : 'open'}">&#9654;</span>
-          <span class="table-name">${escHtml(t.name)}</span>
-          ${_termChips(termKeys, (coll) => coll.term, CP.classes, 'class')}
+          <span class="table-name" title="${escHtml(t.name)}">${escHtml(t.name)}</span>
           <span class="col-count">${cols.length}</span>
           <button class="card-info-btn" title="Show table details" aria-label="Show details for ${escHtml(t.name)}" onclick="event.stopPropagation();inspectSource(this.closest('.source-card').dataset.table)">&#9432;</button>
           <div class="source-dot" data-table="${escHtml(t.name)}"></div>
         </div>
+        ${_termChips(termKeys, (coll) => coll.term, CP.classes, 'class')}
         <div class="source-card-body${isCollapsed ? ' collapsed' : ''}" id="src-body-${escHtml(t.name)}">
           ${cols.map(c => `
             <div class="source-col-row${excluded.has(c.name) ? ' excluded' : ''}" data-table="${escHtml(t.name)}" data-col="${escHtml(c.name)}">
               ${c.isPk ? '<span class="field-badge pk">PK</span>' : ''}
               ${c.isFk ? '<span class="field-badge fk">FK</span>' : ''}
-              ${_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], CP.properties, 'property')}
-              <span class="col-name">${escHtml(c.name)}</span>
-              <span class="field-type">${escHtml(c.type)}</span>
+              <span class="col-name" title="${escHtml(c.name)}">${escHtml(c.name)}</span>
+              <span class="field-type" title="${escHtml(c.type)}">${escHtml(c.type)}</span>
               <div class="source-col-dot" data-table="${escHtml(t.name)}" data-col="${escHtml(c.name)}"></div>
             </div>
+            ${_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], CP.properties, 'property')}
           `).join('')}
         </div>
       </div>
@@ -6661,8 +6661,9 @@ document.addEventListener('contextmenu', e => {
     ['#connector-svg path.connector', el => {
       openContextMenu(_menuConnector(el), e.clientX, e.clientY, { header: 'Connector' });
     }],
-    ['.source-col-row .source-col-dot, .source-col-row', el => {
-      const row = el.closest('.source-col-row');
+    // A column's term chips sit on a row of their own just after it, and belong to that column.
+    ['.source-col-row .source-col-dot, .source-col-row, .source-col-row + .term-chip-row', el => {
+      const row = el.closest('.source-col-row') || el.previousElementSibling;
       if (!row) return;
       const t = row.dataset.table, c = row.dataset.col;
       openContextMenu(_menuSourceColumn(t, c), e.clientX, e.clientY, { header: t + '.' + c });
@@ -6884,7 +6885,7 @@ function applyPinnedHighlight() {
 
 // Transient hover highlight; restores the pinned highlight on leave.
 function _onMapperHover(e) {
-  const colRow = e.target.closest('.source-col-row');
+  const colRow = e.target.closest('.source-col-row') || e.target.closest('.source-col-row + .term-chip-row')?.previousElementSibling;
   if (colRow) { renderHighlight(_hlForSource(colRow.dataset.table, colRow.dataset.col)); return; }
   const srcCard = e.target.closest('.source-card');
   if (srcCard) { renderHighlight(_hlForSource(srcCard.dataset.table)); return; }

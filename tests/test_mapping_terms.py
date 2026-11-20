@@ -284,13 +284,41 @@ class TestTheCanvasShowsTheTerms:
         assert ("_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], "
                 "CP.properties, 'property')") in pane
 
-    def test_the_chips_sit_clear_of_the_drag_handles(self):
+    def test_the_chips_sit_on_a_row_of_their_own_below_the_drag_handles(self):
+        # Inline chips pushed the count, the details button and the type out of a 160-250px
+        # pane; on a row below, the original row keeps its height, so its dot stays centred.
         pane = _function(self.page, "renderSourcePane")
-        header = pane[pane.index('class="table-name"'):pane.index('class="col-count"')]
-        assert "_termChips(" in header
-        row = pane[pane.index('field-badge fk'):pane.index('class="col-name"')]
-        assert "_termChips(" in row
-        assert pane.index("CP.properties") < pane.index('class="source-col-dot"')
+        header = pane[pane.index('class="source-card-header"'):pane.index('class="source-card-body')]
+        assert header.index('class="source-dot"') < header.index("_termChips(")
+        assert header.index("</div>") < header.index("_termChips(")
+        row = pane[pane.index('class="source-col-row'):]
+        assert row.index('class="source-col-dot"') < row.index("CP.properties")
+        assert row.index("</div>\n            </div>") < row.index("CP.properties")
+        assert "'<div class=\"term-chip-row\">'" in _function(self.page, "_termChips")
+
+    def test_a_column_chip_row_stands_for_its_column(self):
+        # The chips left the column row, so whatever read the row has to follow them to the row
+        # after it; a table's chips come after its header, not a column row, so stay the table's.
+        menu = self.page[self.page.index("document.addEventListener('contextmenu'"):]
+        column = menu[menu.index("['.source-col-row .source-col-dot"):menu.index("['.source-card'")]
+        assert "'.source-col-row .source-col-dot, .source-col-row, .source-col-row + .term-chip-row'" in column
+        assert "el.closest('.source-col-row') || el.previousElementSibling" in column
+        assert "_menuSourceColumn(t, c)" in column
+        hover = _function(self.page, "_onMapperHover")
+        row = ("e.target.closest('.source-col-row') || "
+               "e.target.closest('.source-col-row + .term-chip-row')?.previousElementSibling")
+        assert hover.index(row) < hover.index("e.target.closest('.source-card')")
+        assert ".source-col-row.hl + .term-chip-row" in self.page
+        lens = self.page[self.page.index("/* Lens: sensitivity"):self.page.index("/* Lens: diff")]
+        assert "body.lens-sensitivity .source-col-row + .term-chip-row," in lens
+        assert 'body.lens-sensitivity .source-col-row[class*="sens-"] + .term-chip-row,' in lens
+        assert "body.lens-sensitivity .term-chip-row" not in lens
+
+    def test_the_chip_row_wraps_and_never_hides_a_term(self):
+        css = self.page[self.page.index(".term-chip-row {"):]
+        rule = css[:css.index("}")]
+        assert "flex-wrap: wrap" in rule
+        assert "overflow" not in rule and "max-height" not in rule
 
     def test_one_chip_per_distinct_term_naming_every_collection_that_uses_it(self):
         chips = _function(self.page, "_termChips")
