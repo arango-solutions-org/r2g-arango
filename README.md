@@ -329,8 +329,9 @@ bundled live demo and role/setup instructions are in
 For a governed handoff built from a curated OWL/Turtle physical mapping, follow
 the [curated ontology approval-bundle workflow](docs/CURATED-ONTOLOGY-BUNDLES.md).
 It pins one source snapshot and registered ArangoDB target, reconciles the
-ontology before project creation, and produces a secret-free package for IT to
-inspect and approve before extraction or import.
+ontology before project creation. The secret-free package for IT to inspect
+and approve before extraction or import is designed there but not built yet
+(PRD P6.14).
 
 ### 1. Extract schema from PostgreSQL
 

@@ -4,6 +4,14 @@ This workflow turns a reviewed physical ontology and one exact relational-schema
 snapshot into an inspectable, secret-free package for an ArangoDB operator. It
 does not give r2g permission to run the package on the operator's behalf.
 
+**Status (2026-11-20).** Steps 1–7 work today: import, reconciliation against a
+pinned snapshot, project creation and explicit rebase (PRD P6.11–P6.13, P6.15).
+The package itself — the ZIP, its content root, checksums, approval record,
+extraction plan and guarded import (P6.14) — is **not built yet**. Today step 8
+opens the existing `arangoimport` script preview for the saved mapping; there
+is no download, and steps 9 onward and the sections *Approval boundary* and
+*Runtime safety* describe the design the package will follow.
+
 ## What must be ready
 
 - A registered Snowflake source. Enable **Include views** before taking the
@@ -44,7 +52,7 @@ does not give r2g permission to run the package on the operator's behalf.
    credentials through environment variables, extracts Snowflake rows, runs
    the guarded import, and runs verification.
 
-## Approval boundary
+## Approval boundary (planned, P6.14)
 
 The ZIP contains scripts and immutable metadata, not source rows or secrets.
 Its content root binds:
@@ -60,7 +68,7 @@ Its content root binds:
 Changing any bound input creates a different content root. An approval record
 for the old root must not authorize the new package.
 
-## Runtime safety
+## Runtime safety (planned, P6.14)
 
 Extraction uses explicit quoted projections rather than `SELECT *`. It writes
 to a temporary runtime directory, records query IDs, headers, row counts,
