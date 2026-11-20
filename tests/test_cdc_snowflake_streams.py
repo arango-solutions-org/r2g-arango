@@ -135,6 +135,7 @@ class FakeConn:
         self.dt_info: dict[str, dict] = {}
         self.stale: set[str] = set()
         self.dropped: set[str] = set()
+        self.read_errors: dict[str, Exception] = {}  # stream name -> what reading it raises
         self._tx_reads: dict[str, list[dict]] | None = None
         self._consumed: set[str] = set()
 
@@ -171,6 +172,8 @@ class FakeConn:
             return ["CURRENT_TIMESTAMP()"], [(self.now,)]
         if s.startswith("SELECT SYSTEM$STREAM_HAS_DATA"):
             name = params[0].split(".")[-1].strip('"')
+            if name in self.read_errors:
+                raise self.read_errors[name]
             if name in self.stale:
                 raise RuntimeError(f"Stream {name} is stale")
             if name in self.dropped:
@@ -254,6 +257,19 @@ def _listener(schema, mapping, writer, conn, db=None, **kw):
     lst = SnowflakeStreamListener(URL, handler, schema, mapping, connect=lambda **_: conn, **kw)
     lst.recorder.db = db or FakeDB()
     return lst
+
+
+def _one_object(name: str, collection: str) -> tuple[Schema, MappingConfig]:
+    """A schema and mapping with a single keyed object called *name*."""
+    schema = Schema(tables={name: Table(
+        name=name,
+        columns=[Column(name="ID", data_type="NUMBER", is_primary_key=True)],
+        primary_key=["ID"],
+    )})
+    mapping = MappingConfig(collections={name: CollectionMapping(
+        source_table=name, target_collection=collection,
+    )})
+    return schema, mapping
 
 
 # ── rows_to_events ──────────────────────────────────────────────────────────
@@ -503,6 +519,68 @@ class TestConsume:
         # collections are not stamped.
         assert set(db.docs[FRESHNESS_COLLECTION]) == {"Account"}
 
+    @pytest.mark.parametrize("named", [
+        "'CRM.CORE.R2G_STALE_LEADS'",
+        '"CRM"."CORE"."R2G_STALE_LEADS"',
+        "CRM.CORE.R2G_STALE_LEADS",
+        "R2G_STALE_LEADS",
+    ])
+    def test_error_naming_an_object_called_stale_is_not_an_unreadable_stream(self, writer, named):
+        # Snowflake's messages carry object names; a name is not a diagnosis.
+        schema, mapping = _one_object("STALE_LEADS", "Lead")
+        conn = FakeConn({"STALE_LEADS": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE_LEADS"] = RuntimeError(
+            f"002003 (42S02): SQL compilation error:\nObject {named} does not exist or not authorized."
+        )
+        with pytest.raises(RuntimeError, match="does not exist or not authorized") as caught:
+            _listener(schema, mapping, writer, conn).poll_once()
+        assert not isinstance(caught.value, StreamStaleError)
+
+    @pytest.mark.parametrize("message", [
+        "Stream R2G_STALE_LEADS is stale",
+        "Stream 'CRM.CORE.R2G_STALE_LEADS' is stale",
+        "Base table 'CRM.CORE.STALE_LEADS' dropped, cannot read from stream 'R2G_STALE_LEADS'",
+    ])
+    def test_object_called_stale_whose_stream_is_unreadable_is_still_reported(
+        self, writer, message,
+    ):
+        schema, mapping = _one_object("STALE_LEADS", "Lead")
+        conn = FakeConn({"STALE_LEADS": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE_LEADS"] = RuntimeError(message)
+        with pytest.raises(StreamStaleError, match="R2G_STALE_LEADS"):
+            _listener(schema, mapping, writer, conn).poll_once()
+
+    @pytest.mark.parametrize(("message", "unreadable"), [
+        ("Stream 'CRM.CORE.R2G_STALE' is stale", True),
+        ("Stream R2G_STALE is stale", True),
+        ("Object 'CRM.CORE.STALE' does not exist or not authorized.", False),
+    ])
+    def test_object_named_exactly_stale(self, writer, message, unreadable):
+        schema, mapping = _one_object("STALE", "Thing")
+        conn = FakeConn({"STALE": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STALE"] = RuntimeError(message)
+        with pytest.raises(RuntimeError) as caught:
+            _listener(schema, mapping, writer, conn).poll_once()
+        assert isinstance(caught.value, StreamStaleError) is unreadable
+
+    def test_object_named_like_a_word_of_the_wording_does_not_hide_it(self, writer):
+        schema, mapping = _one_object("STREAM", "Thing")
+        conn = FakeConn({"STREAM": ("BASE TABLE", "NO")}, {})
+        conn.read_errors["R2G_STREAM"] = RuntimeError(
+            "Base table CRM.CORE.STREAM dropped, cannot read from stream R2G_STREAM"
+        )
+        with pytest.raises(StreamStaleError, match="R2G_STREAM"):
+            _listener(schema, mapping, writer, conn).poll_once()
+
+    def test_known_error_number_decides_whatever_the_wording(self, writer):
+        schema, mapping = _one_object("ACCOUNT", "Account")
+        conn = FakeConn({"ACCOUNT": ("BASE TABLE", "NO")}, {})
+        err = RuntimeError("091901 (01000): wording r2g has never seen")
+        err.errno = 91901  # type: ignore[attr-defined]
+        conn.read_errors["R2G_ACCOUNT"] = err
+        with pytest.raises(StreamStaleError, match="R2G_ACCOUNT"):
+            _listener(schema, mapping, writer, conn).poll_once()
+
     def test_watermark_is_read_before_the_stream(self, schema, mapping, writer):
         conn = _tables_conn(account_rows=[_row("INSERT", False, "a", ID=1, NAME="Acme")])
         _listener(schema, mapping, writer, conn).poll_once()
@@ -607,14 +685,7 @@ class TestStreamStateKey:
     def test_object_whose_name_needs_quoting_is_recorded_and_stamped(self, writer):
         # The state write comes after Snowflake has committed, so a key
         # ArangoDB refuses would fail every cycle and stamp nothing.
-        schema = Schema(tables={"Order Items": Table(
-            name="Order Items",
-            columns=[Column(name="ID", data_type="NUMBER", is_primary_key=True)],
-            primary_key=["ID"],
-        )})
-        mapping = MappingConfig(collections={"Order Items": CollectionMapping(
-            source_table="Order Items", target_collection="OrderItem",
-        )})
+        schema, mapping = _one_object("Order Items", "OrderItem")
         conn = FakeConn({"Order Items": ("BASE TABLE", "NO")}, {})
         db = FakeDB()
         result = _listener(schema, mapping, writer, conn, db=db).poll_once()

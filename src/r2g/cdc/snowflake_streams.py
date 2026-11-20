@@ -49,6 +49,7 @@ the fabric's side.
 from __future__ import annotations
 
 import hashlib
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -98,6 +99,14 @@ _METADATA_PREFIX = "METADATA$"
 #: dropped or recreated (``CREATE OR REPLACE``) under the stream.
 _ERR_STREAM_SOURCE_DROPPED = 91901
 
+#: Wording that marks a failed read as an unreadable stream when the error
+#: carries no number r2g knows.
+_UNREADABLE_WORDING = ("stale", "cannot read from stream")
+_UNREADABLE_WORDS = frozenset(word for phrase in _UNREADABLE_WORDING for word in phrase.split())
+
+#: A quoted span of an error message: Snowflake quotes the names it reports.
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
 BASIS_SERVER_TIME = "server_time_before_read"
 BASIS_DT_DATA_TIMESTAMP = "dynamic_table_data_timestamp"
 
@@ -129,6 +138,22 @@ class StreamStaleError(SnowflakeStreamError):
 
 class BatchNotAppliedError(SnowflakeStreamError):
     """Some deltas of a stream's batch failed; the offset was not advanced."""
+
+
+def _wording_without_names(message: str, names: Iterable[str]) -> str:
+    """*message* in lower case, without quoted spans or the identifiers in *names*.
+
+    What is left is Snowflake's own wording, so a test of it cannot be
+    answered by what an object happens to be called (``STALE_LEADS``). A name
+    is removed only as a whole identifier, and never when it is itself one of
+    the words being tested for.
+    """
+    text = _QUOTED_SPAN.sub(" ", message).lower()
+    for name in sorted({n.lower() for n in names if n}, key=len, reverse=True):
+        if name in _UNREADABLE_WORDS:
+            continue
+        text = re.sub(rf"(?<![\w$]){re.escape(name)}(?![\w$])", " ", text)
+    return text
 
 
 def quote_ident(name: str) -> str:
@@ -579,14 +604,20 @@ class SnowflakeStreamListener:
         Detection is by the read failing, never by ``SHOW STREAMS``: its
         ``stale`` column means "may be stale" and is ``true`` for a stream
         that still reads normally (observed on a table with zero retention).
+
+        The error number decides when it is the one r2g knows. Otherwise the
+        message's wording does, read without the names in it: an object
+        called ``STALE_LEADS`` that is merely missing or not granted is not
+        an unreadable stream.
         """
-        message = str(err).lower()
-        if (
-            getattr(err, "errno", None) == _ERR_STREAM_SOURCE_DROPPED
-            or "stale" in message
-            or "cannot read from stream" in message
-        ):
-            raise StreamStaleError(target.stream_name, str(err)) from err
+        if getattr(err, "errno", None) != _ERR_STREAM_SOURCE_DROPPED:
+            wording = _wording_without_names(str(err), (
+                self.database, self.source_schema, self.stream_schema,
+                target.source_object, target.stream_name,
+            ))
+            if not any(marker in wording for marker in _UNREADABLE_WORDING):
+                return
+        raise StreamStaleError(target.stream_name, str(err)) from err
 
     def consume(self, target: StreamTarget) -> StreamWatermark:
         """Apply one stream's pending changes; return its new watermark."""
