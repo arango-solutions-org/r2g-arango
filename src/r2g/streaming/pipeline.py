@@ -394,7 +394,7 @@ class StreamingPipeline:
                 "table_has_no_primary_key",
                 table=table_name,
                 target=target,
-                hint="Documents will receive auto-generated _key values; edges referencing this table may fail",
+                hint="Documents are keyed by all column values; identical rows collapse to one document",
             )
 
         transformer = NodeTransformer(
