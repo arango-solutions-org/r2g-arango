@@ -109,8 +109,11 @@ def preview_table_rows(
     """
     from psycopg import sql
 
-    from r2g.connectors.base import serialize_rows
+    from r2g.connectors.base import require_connection_string, serialize_rows
 
+    # An empty string would make psycopg connect to the environment's default
+    # database (PGHOST, the local socket), not refuse.
+    require_connection_string(connection_string, "postgresql")
     query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
         sql.Identifier(schema_name),
         sql.Identifier(table_name),
@@ -124,6 +127,11 @@ def preview_table_rows(
 
 class PostgresConnector:
     def __init__(self, connection_string: str, schema_name: str = "public") -> None:
+        from r2g.connectors.base import require_connection_string
+
+        # Built directly by StreamingPipeline's pg_conn_string shim, not only by the
+        # factory; an empty string would connect to the environment's default database.
+        require_connection_string(connection_string, "postgresql")
         self.connection_string = connection_string
         self.schema_name = schema_name
 

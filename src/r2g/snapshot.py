@@ -75,7 +75,8 @@ def read_schema_file(path: str | Path) -> SchemaFile:
         raise SchemaFileError(
             f"Schema file '{resolved}' is not a physical schema "
             f"(RSA PhysicalSchema JSON): {exc.error_count()} error(s), first: "
-            f"{exc.errors()[0]['msg']} at {'.'.join(str(p) for p in exc.errors()[0]['loc'])}"
+            f"{exc.errors()[0]['msg']}"
+            + (f" at {where}" if (where := ".".join(str(p) for p in exc.errors()[0]["loc"])) else "")
         ) from exc
     if not physical.tables:
         raise SchemaFileError(f"Schema file '{resolved}' has no tables")

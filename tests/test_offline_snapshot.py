@@ -120,8 +120,9 @@ class TestReadSchemaFile:
     def test_non_json_is_refused_naming_the_file(self, tmp_path):
         bad = tmp_path / "schema.sql"
         bad.write_text("CREATE TABLE ACCOUNTS (ACCOUNT_ID VARCHAR);")
-        with pytest.raises(SchemaFileError, match="schema.sql' is not a physical schema"):
+        with pytest.raises(SchemaFileError, match="schema.sql' is not a physical schema") as e:
             read_schema_file(bad)
+        assert not str(e.value).endswith(" at ")  # JSON errors have no location
 
     def test_wrong_shape_is_refused(self, tmp_path):
         bad = tmp_path / "schema.json"
@@ -354,6 +355,58 @@ class TestLiveReadsRefuseAnOfflineSource:
         result = runner.invoke(app, ["source", "dump", "partner", "--output-dir", str(tmp_path / "out")])
         assert result.exit_code == 2  # dump's exit code for a refused request (ValueError)
         assert "--offline has no connection" in " ".join(result.output.split())
+
+    @pytest.fixture
+    def offline_postgres(self, catalog_dir, tmp_path, monkeypatch):
+        """An offline PostgreSQL source with a snapshot naming one table, on a server
+        whose environment names a default database (port 1: nothing listens)."""
+        for var, value in (("PGHOST", "127.0.0.1"), ("PGPORT", "1"), ("PGUSER", "x")):
+            monkeypatch.setenv(var, value)
+        mgr = CatalogManager(catalog_dir)
+        mgr.add_source("partner-pg", "postgresql", "", source_params={OFFLINE_PARAM: True})
+        path = tmp_path / "pg.json"
+        Schema(tables={"t": Table(name="t", columns=[Column(name="id", data_type="integer")])}
+               ).save_to_file(str(path))
+        capture_source_snapshot(
+            mgr, "partner-pg", schema_name="public", schema_file=read_schema_file(path)
+        )
+        return mgr
+
+    def test_studio_preview_refuses_with_the_reason(self, offline_postgres, catalog_dir):
+        # An empty connection string would make psycopg connect to the environment's
+        # default database and preview its rows (seen in review of #107).
+        from fastapi.testclient import TestClient
+
+        from r2g.ui.server import create_app
+
+        client = TestClient(create_app(catalog_dir=catalog_dir))
+        r = client.get("/api/sources/partner-pg/preview/t")
+        assert r.status_code == 400, r.text
+        assert "--offline has no connection" in r.json()["detail"]
+
+    def test_mcp_preview_refuses_with_the_reason(self, offline_postgres):
+        from unittest.mock import patch
+
+        from r2g.mcp_server import preview_table
+
+        with patch("r2g.mcp_server._get_catalog", return_value=offline_postgres):
+            result = preview_table("partner-pg", "t")
+        assert "--offline has no connection" in result["error"]
+
+    def test_a_postgres_connector_built_directly_refuses(self):
+        # StreamingPipeline's pg_conn_string shim (the MCP server's stream_project)
+        # builds one without the factory.
+        from r2g.connectors.postgres import PostgresConnector
+
+        with pytest.raises(ValueError, match="--offline has no connection"):
+            PostgresConnector("")
+
+    def test_building_a_snapshot_without_a_file_says_it_is_offline(self, catalog_dir):
+        from r2g.snapshot import build_source_schema
+
+        source = _add_offline(CatalogManager(catalog_dir))
+        with pytest.raises(ValueError, match="is offline"):
+            build_source_schema(source, schema_name="SALES")
 
     def test_value_sampler_refuses_an_empty_connection(self):
         from r2g.fk_inference import create_value_sampler
