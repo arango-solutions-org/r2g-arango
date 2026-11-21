@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -1255,3 +1256,222 @@ def test_a_receipt_written_for_another_tenant_is_not_trusted(shop, api, monkeypa
     monkeypatch.setenv("R2G_TENANT", "acme")
     body = project_exports.read_project_exports(shop, shop.get_project("shop"))
     assert body["csi"]["reasons"] == ["tenant_mismatch"] and body["state"] == "attention"
+
+
+# --- the Studio's viewer, run under node on what the API really returns -----------------------
+
+
+VIEWER = Path(r2g.__file__).parent / "ui" / "static" / "exports-viewer.js"
+PAGE = VIEWER.with_name("index.html").read_text(encoding="utf-8")
+_NODE_PAGE = """
+const cards = [], calls = [], toasts = [];
+let cardOpen = false;
+const element = () => ({ appendChild() {}, focus() {}, select() {} });
+globalThis.document = { getElementById: () => null, createElement: element, head: element(),
+                        querySelectorAll: () => [], querySelector: () => null };
+globalThis.window = globalThis;
+window.escHtml = escHtml;
+window.errorDetail = e => e.message;
+window.toast = (message, kind) => toasts.push([message, kind]);
+window.isFloatingCardOpen = () => cardOpen;
+window.openFloatingCard = card => { cardOpen = true; cards.push(card); };
+"""
+
+
+def _function(page: str, name: str) -> str:
+    """One top-level function of the page, as ``test_mapping_terms`` reads them."""
+    start = page.index(f"\nfunction {name}(")
+    return page[start:page.index("\n}\n", start) + 3]
+
+
+def _node(script: str) -> Any:
+    node = shutil.which("node")
+    assert node, "node is required: this test runs the viewer's JavaScript"
+    source = "".join(_function(PAGE, name) for name in ("_htmlEscape", "escHtml"))
+    done = subprocess.run([node, "-"], input=source + _NODE_PAGE + VIEWER.read_text(encoding="utf-8") + script,
+                          capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def _rendered(data: dict[str, Any], tab: str = "mapping") -> str:
+    return _node(f"""
+process.stdout.write(JSON.stringify(R2GExportsViewer.renderBody(
+    {{ data: {json.dumps(data)}, tab: {json.dumps(tab)} }})));
+""")
+
+
+def test_the_view_shows_the_tables_and_columns_of_both_exports(shop, api):
+    _export_both()
+    data = _read(api)
+    html = _rendered(data)
+    for expected in ("R2RML table <code>orders</code>", "CSI entity <code>Order</code>",
+                     "<code>user_id</code>", "urn:arango-sparql:concept#Order",
+                     "xsd:integer", "<code>placed</code>"):
+        assert expected in html
+    assert "Both exports are current" in html
+
+
+def test_the_view_shows_issue_17_without_matching_properties(shop, api):
+    schema = _shop_schema("status")
+    schema.tables["orders"].columns.append(Column(name="status", data_type="text"))
+    shop.create_snapshot("src", schema)
+    _export_both()
+    html = _rendered(_read(api))
+    assert "Only in CSI: <code>orderStatus</code>" in html
+    assert "Only in R2RML: <code>status</code>" in html and "issues/17" in html
+
+
+def test_exports_that_cannot_be_compared_claim_no_difference(shop, api):
+    assert _project("csi").exit_code == 0
+    shop.create_snapshot("src", _shop_schema("added_later"))
+    assert _project("r2rml").exit_code == 0
+    html = _rendered(_read(api))
+    assert "Not compared: the exports came from different inputs." in html
+    assert "only in CSI" not in html and "only in R2RML" not in html and "Only in" not in html
+
+
+def test_the_view_says_what_to_run_when_nothing_is_exported(api):
+    html = _rendered(_read(api))
+    assert "No exported mapping yet." in html
+    assert "r2g export-csi --project shop" in html and "r2g export-r2rml --project shop" in html
+
+
+def test_the_view_says_which_export_is_missing(shop, api):
+    assert _project("csi").exit_code == 0
+    html = _rendered(_read(api))
+    assert "Only one of the two exports" in html
+    assert "r2g export-r2rml --project shop" in html and "r2g export-csi --project" not in html
+
+
+@pytest.mark.parametrize("damage, label", [
+    (lambda path: path.write_text(path.read_text() + "x"), "Malformed"),
+    (lambda path: path.write_text(path.read_text() + "\n"), "Unverified"),
+])
+def test_the_view_names_a_damaged_export(shop, api, damage, label):
+    _export_both()
+    damage(_files(shop) / ARTIFACTS["r2rml"][0])
+    html = _rendered(_read(api))
+    assert label in html and "need attention" in html
+
+
+def test_the_view_names_a_stale_export_and_why(shop, api):
+    _export_both()
+    shop.create_snapshot("src", _shop_schema("added_later"))
+    html = _rendered(_read(api))
+    assert "Out of date" in html and "The schema changed after this export." in html
+
+
+@pytest.mark.parametrize("status, label", [("too_large", "Too large"), ("unreadable", "Unreadable")])
+def test_the_view_names_an_export_it_was_not_given(shop, api, status, label):
+    _export_both()
+    data = _read(api)
+    data["r2rml"] = {"status": status, "reasons": [], "receipt": None, "content": None, "structure": None}
+    data["state"] = "attention"
+    data["comparison"] = {"status": "not_comparable", "reason": "an export is not verified",
+                          "classes": None, "properties": None}
+    assert label in _rendered(data, "r2rml") and "no content to show" in _rendered(data, "r2rml")
+
+
+def test_the_provenance_tab_shows_both_exports_separately(shop, api):
+    assert _project("csi").exit_code == 0
+    first = shop.get_latest_snapshot("src").id
+    second = shop.create_snapshot("src", _shop_schema()).id
+    assert _project("r2rml", "--concept-base", "urn:ex:").exit_code == 0
+    html = _rendered(_read(api), "provenance")
+    assert first in html and second in html
+    assert "label_policy" in html and "concept_base" in html and "urn:ex:" in html
+    assert "Bitemporal provenance unavailable from this snapshot" in html
+    assert "transactionTime" in html
+
+
+def test_everything_from_an_artifact_is_escaped_and_no_iri_is_a_link(shop, api):
+    hostile = '<img src=x onerror=alert(1)>"\''
+    schema = _shop_schema(hostile)
+    shop.create_snapshot("src", schema)
+    _export_both("--source-type", hostile)
+    data = _read(api)
+    data["csi"]["reasons"] = data["r2rml"]["reasons"] = [hostile]
+    data["r2rml"]["structure"]["notes"] = [hostile]
+    for tab in ("mapping", "csi", "r2rml", "provenance"):
+        html = _rendered(data, tab)
+        assert "<img" not in html
+    assert "&lt;img" in _rendered(data, "mapping")
+    assert 'href="urn:' not in _rendered(data, "mapping")
+
+
+def test_the_raw_tabs_show_the_exact_saved_text(shop, api):
+    _export_both()
+    data = _read(api)
+    for kind in ARTIFACTS:
+        out = _node(f"""
+window.apiFetch = async () => ({json.dumps(data)});
+R2GExportsViewer.open({{ project: 'shop' }}).then(() => {{
+  const button = {{ dataset: {{ exportsTab: {json.dumps(kind)} }} }};
+  button.addEventListener = (_, handler) => {{ button.click = handler; }};
+  document.querySelectorAll = () => [button];
+  cards.length = 0;
+  R2GExportsViewer.open({{ project: 'shop' }}).then(() => {{
+    button.click();
+    process.stdout.write(JSON.stringify(R2GExportsViewer.visibleContent()));
+  }});
+}});
+""")
+        assert out == data[kind]["content"]
+
+
+def test_the_viewer_only_ever_reads_with_one_get(shop, api):
+    data = _read(api)
+    out = _node(f"""
+Object.defineProperty(globalThis, 'editState', {{ get() {{ throw new Error('read the editor'); }} }});
+window.apiFetch = async (...args) => {{ calls.push(args); return {json.dumps(data)}; }};
+R2GExportsViewer.open({{ project: 'a b/c' }}).then(() =>
+  process.stdout.write(JSON.stringify({{ calls, opened: cards.length }})));
+""")
+    assert out == {"calls": [["/api/projects/a%20b%2Fc/exports"]], "opened": 2}
+    source = VIEWER.read_text(encoding="utf-8")
+    for write in ("method:", "POST", "PUT", "buildMappingPayload", "editState"):
+        assert write not in source
+
+
+def test_a_failed_read_says_so_and_a_card_closed_meanwhile_stays_closed():
+    out = _node("""
+window.apiFetch = async () => { throw new Error("Could not read this project"); };
+(async () => {
+  await R2GExportsViewer.open({ project: 'shop' });
+  const failed = cards[cards.length - 1];
+  const before = cards.length;
+  window.apiFetch = async () => { cardOpen = false; return {}; };
+  await R2GExportsViewer.open({ project: 'shop' });
+  process.stdout.write(JSON.stringify({ failed: failed.body, label: failed.status.label,
+                                        extra: cards.length - before }));
+})();
+""")
+    assert "Could not read this project" in out["failed"] and out["label"] == "Error"
+    assert out["extra"] == 1   # the loading state only: the closed card is not reopened
+
+
+def test_a_slower_older_response_does_not_replace_a_newer_one():
+    out = _node("""
+let releaseOld;
+window.apiFetch = path => path.includes('old')
+  ? new Promise(resolve => { releaseOld = () => resolve({ marker: 'old' }); })
+  : Promise.reject(new Error('new project failed'));
+(async () => {
+  const old = R2GExportsViewer.open({ project: 'old' });
+  await R2GExportsViewer.open({ project: 'new' });
+  const count = cards.length;
+  releaseOld();
+  await old;
+  process.stdout.write(JSON.stringify({ unchanged: cards.length === count,
+                                        title: cards[cards.length - 1].title }));
+})();
+""")
+    assert out == {"unchanged": True, "title": "Exported mapping: new"}
+
+
+def test_without_a_project_the_viewer_says_so():
+    out = _node("""
+R2GExportsViewer.open({}).then(() => process.stdout.write(JSON.stringify({ toasts, cards: cards.length })));
+""")
+    assert out == {"toasts": [["Open a project first.", "error"]], "cards": 0}

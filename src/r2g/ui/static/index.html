@@ -2458,6 +2458,9 @@ function _menuProject(name) {
     { label: 'View arangoimport script bundle', icon: '\u2328',
       onClick: () => window.openArangoImportViewer({ scope: 'all' }),
       hint: 'Inspect or download a secret-safe alternative batch import script. Studio Load continues to stream over HTTP.' },
+    { label: 'View exported mapping', icon: '\u2637',
+      onClick: () => window.openExportsViewer({ project: name }),
+      hint: 'Inspect the CSI and R2RML saved for this project, read-only: what a federation will actually run, not the editing state.' },
     { label: 'Edit name & description\u2026', icon: '\u270E', onClick: () => openEditProjectForm(name),
       hint: 'Rename the project or change its description, target endpoint, and database. Does not touch already-loaded data.' },
     '-',
@@ -2539,6 +2542,9 @@ function openActionsMenu(ev) {
     { label: 'View arangoimport script bundle', icon: '\u2328', disabled: dis,
       hint: 'Inspect or download a generated alternative batch import script. Studio Load continues to stream over HTTP.',
       onClick: () => window.openArangoImportViewer({ scope: 'all' }) },
+    { label: 'View exported mapping', icon: '\u2637', disabled: dis,
+      hint: 'Inspect the CSI and R2RML saved for this project, read-only: what a federation will actually run, not the editing state.',
+      onClick: () => window.openExportsViewer({ project: currentProject }) },
     { label: 'Load history', icon: '\u21BB', disabled: dis,
       hint: 'View past load runs for this project with row counts, errors, and status.',
       onClick: showHistory },
@@ -6565,6 +6571,9 @@ function _menuCanvas() {
     { label: 'View arangoimport script bundle', icon: '\u2328',
       onClick: () => window.openArangoImportViewer({ scope: 'all' }),
       hint: 'Inspect or download a generated alternative batch import script. Studio Load continues to stream over HTTP.' },
+    { label: 'View exported mapping', icon: '\u2637',
+      onClick: () => window.openExportsViewer({ project: currentProject }),
+      hint: 'Inspect the CSI and R2RML saved for this project, read-only: what a federation will actually run, not the editing state.' },
     '-',
     { label: 'View as', icon: '\u25CD', submenu: [
       { label: 'Topology' + (currentLens === 'topology' ? '  \u2713' : ''), shortcut: '1', onClick: () => setLens('topology') },
@@ -8136,5 +8145,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 </script>
 <script src="static/arangoimport-viewer.js"></script>
+<script src="static/exports-viewer.js"></script>
 </body>
 </html>
