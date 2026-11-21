@@ -538,8 +538,13 @@ def summarize_r2rml(text: str) -> Dict[str, Any]:
         tables.append(entry)
 
     subjects = [t["subject"] for t in tables]
-    if len(set(subjects)) != len(subjects):
-        raise R2RMLError("a TriplesMap is defined twice")
+    repeated = sorted({s for s in subjects if subjects.count(s) > 1})
+    if repeated:
+        # Valid Turtle, but its statements are one map with several logical tables and subject
+        # maps. R2RML allows one of each, and no single table could be reported for it.
+        raise R2RMLError(
+            f"TriplesMap <#{repeated[0]}> is written more than once, which gives it several "
+            "logical tables where R2RML allows one")
     for entry in tables:
         for join in entry["joins"]:
             if join["parent"] not in subjects:

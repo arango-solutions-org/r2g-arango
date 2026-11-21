@@ -79,7 +79,7 @@
 
   function reasonText(reason) {
     if (String(reason).startsWith('invalid_r2rml: ')) {
-      return `The file is not R2RML that r2g wrote (${reason.slice('invalid_r2rml: '.length)}).`;
+      return `The file is not usable R2RML: ${reason.slice('invalid_r2rml: '.length)}.`;
     }
     return REASONS[reason] || reason;
   }

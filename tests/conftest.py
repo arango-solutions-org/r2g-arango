@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from r2g.types import Column, ForeignKey, Schema, Table
+
+
+def pytest_configure(config):
+    """Pin the width before collection imports ``r2g.main``: its module-level Rich console
+    keeps a ``COLUMNS`` it finds at import, so the per-test pin below cannot replace it."""
+    os.environ["COLUMNS"] = "200"
 
 
 @pytest.fixture(autouse=True)

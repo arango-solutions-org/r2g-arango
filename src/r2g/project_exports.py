@@ -18,15 +18,16 @@ import yaml
 from pydantic import ValidationError
 
 from r2g import __version__, control_plane
-from r2g.catalog import Catalog, CatalogManager, Project
+from r2g.catalog import Catalog, CatalogManager, Project, validate_project_name
 from r2g.config import ConfigManager
 from r2g.csi import validate_csi
 from r2g.curated_labels import load_curated_labels
+from r2g.expressions import extract_bind_references
 from r2g.governed import _write_atomically
 from r2g.log import get_logger
 from r2g.r2rml import R2RMLError, summarize_r2rml
 from r2g.security import ENC_PREFIX, SECRET_ENV, SECRET_FILENAME
-from r2g.types import MappingConfig, Schema
+from r2g.types import FieldExpression, MappingConfig, Schema
 
 #: export kind -> (its file, its receipt), fixed names in the project's directory.
 ARTIFACTS = {
@@ -38,10 +39,9 @@ RECEIPT_FORMAT = 1
 PUBLISHED_MODE = 0o640
 #: The largest export the Studio reads, unless ``R2G_EXPORT_MAX_BYTES`` says otherwise.
 DEFAULT_MAX_EXPORT_BYTES = 10 * 1024 * 1024
-_RECEIPT_FIELDS = frozenset({
-    "format_version", "project", "tenant", "kind", "artifact_sha256", "mapping_sha256",
-    "schema_sha256", "snapshot_id", "generated_at", "r2g_version", "options",
-})
+_RECEIPT_TEXT_FIELDS = ("project", "artifact_sha256", "mapping_sha256", "schema_sha256",
+                        "snapshot_id", "generated_at", "r2g_version")
+_RECEIPT_FIELDS = frozenset({*_RECEIPT_TEXT_FIELDS, "format_version", "tenant", "kind", "options"})
 #: CSI's provenance stamps that a catalog snapshot does not keep.
 _BITEMPORAL_FIELDS = ("transactionTime", "validTime", "validTimeSource", "predecessorFingerprint")
 
@@ -128,7 +128,9 @@ def check_mapping_coverage(config: MappingConfig, schema: Schema, source_name: s
                 problems[f"{where}: column {table}.{column}"] = None
 
     for key, cm in config.collections.items():
-        need(cm.source_table, [*cm.field_mappings, *(cm.include_fields or [])], f"collection {key}")
+        computed = [c for fx in cm.field_expressions for c in _expression_columns(fx)]
+        need(cm.source_table, [*cm.field_mappings, *(cm.include_fields or []), *computed],
+             f"collection {key}")
     for edge in config.edges:
         need(edge.from_collection, edge.from_fields, f"edge {edge.edge_collection}")
         need(edge.to_collection, edge.to_fields, f"edge {edge.edge_collection}")
@@ -139,6 +141,16 @@ def check_mapping_coverage(config: MappingConfig, schema: Schema, source_name: s
             if binding.source == source_name:
                 need(binding.table, [binding.column], f"shared key {shared.key}")
     return list(problems)
+
+
+def _expression_columns(fx: FieldExpression) -> list[str]:
+    """The source columns an expression can be shown to read: its declared ``sources``, the
+    target of a pass-through that declares none (what the transformer reads), and AQL's
+    ``@column`` references. KSQL and Python text is opaque, so a column named only there is
+    not checked."""
+    if not fx.expression.strip():
+        return fx.sources or [fx.target]
+    return [*fx.sources, *(extract_bind_references(fx.expression) if fx.engine == "aql" else [])]
 
 
 def prepare_export_directory(export: ProjectExport) -> None:
@@ -250,7 +262,7 @@ def _current_inputs(catalog: CatalogManager, project: Project) -> dict[str, str 
     if path.is_absolute():
         try:
             mapping_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a path holding a NUL byte
             logger.warning("export_mapping_unreadable", project=project.name)
     snapshot = catalog.get_latest_snapshot(project.source_name)
     return {
@@ -265,6 +277,10 @@ def _read_artifact(kind: str, directory: Path, project: str, tenant: str | None,
     name, receipt_name = ARTIFACTS[kind]
     entry: dict[str, Any] = {"status": "missing", "reasons": [], "receipt": None,
                              "content": None, "structure": None}
+    try:
+        validate_project_name(project)
+    except ValueError:  # never build a path from a name that could leave the projects root
+        return {**entry, "status": "malformed"}
     state, raw = _read_file(directory, name, limit)
     if raw is None:
         entry["status"] = state
@@ -318,9 +334,11 @@ def _read_file(directory: Path, name: str, limit: int) -> tuple[str, bytes | Non
     except PermissionError:
         return "unreadable", None
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENAMETOOLONG):
             return "malformed", None
         raise
+    except ValueError:  # a NUL byte or lone surrogate: refused before any system call
+        return "malformed", None
     return ("too_large", None) if len(raw) > limit else ("ok", raw)
 
 
@@ -331,12 +349,10 @@ def _verified_receipt(state: str, raw: bytes | None, kind: str, project: str, te
         return None, {"missing": "receipt_missing",
                       "unreadable": "receipt_unreadable"}.get(state, "receipt_invalid")
     try:
-        receipt = json.loads(raw)
+        receipt = _load_sendable_json(raw)
     except (ValueError, RecursionError):
         return None, "receipt_invalid"
-    if (not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS
-            or receipt["format_version"] != RECEIPT_FORMAT or receipt["kind"] != kind
-            or not isinstance(receipt["options"], dict)):
+    if not _receipt_is_well_formed(receipt, kind):
         return None, "receipt_invalid"
     if receipt["project"] != project:
         return None, "project_mismatch"
@@ -347,14 +363,40 @@ def _verified_receipt(state: str, raw: bytes | None, kind: str, project: str, te
     return receipt, ""
 
 
+def _load_sendable_json(raw: str | bytes) -> Any:
+    """Parsed JSON the API can send back. Python's parser accepts ``NaN``, ``1e999`` and lone
+    surrogates, which the response encoder refuses; here they raise ``ValueError``."""
+    value = json.loads(raw)
+    json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return value
+
+
+def _receipt_is_well_formed(receipt: Any, kind: str) -> bool:
+    """Every field has the type :func:`publish_export` writes, so the rest can rely on it."""
+    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
+        return False
+    options = receipt["options"]
+    return (type(receipt["format_version"]) is int
+            and receipt["format_version"] == RECEIPT_FORMAT
+            and receipt["kind"] == kind
+            and all(isinstance(receipt[f], str) for f in _RECEIPT_TEXT_FIELDS)
+            and isinstance(receipt["tenant"], (str, type(None)))
+            and isinstance(options, dict)
+            and isinstance(options.get("curated_labels_sha256"), (str, type(None)))
+            and (kind != "r2rml" or isinstance(options.get("concept_base"), str)))
+
+
 def _csi_structure(text: str) -> dict[str, Any]:
-    document = json.loads(text)
+    document = _load_sendable_json(text)
     validate_csi(document)
     model, physical = document["conceptualModel"], document["arangoPhysicalMapping"]
     entities = []
     for entity in model["entities"]:
         spec = physical["entities"].get(entity["name"], {})
         fields = spec.get("properties", {})
+        # The CSI schema requires an entity's name but not a property's.
+        if not all(isinstance(p.get("name"), str) and p["name"] for p in entity.get("properties", [])):
+            raise ValueError("a CSI property has no name")
         entities.append({
             "name": entity["name"],
             "collection": spec.get("collectionName"),

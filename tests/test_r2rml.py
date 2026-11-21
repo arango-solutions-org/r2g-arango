@@ -563,3 +563,23 @@ def test_a_refusal_names_the_line():
     line = next(i for i, text in enumerate(ttl.splitlines(), 1) if "'users'" in text)
     with pytest.raises(R2RMLError, match=f"line {line}:"):
         summarize_r2rml(ttl)
+
+
+def _two_tables_on_one_collection() -> tuple[MappingConfig, Schema]:
+    columns = [Column(name="id", data_type="integer")]
+    schema = Schema(tables={name: Table(name=name, primary_key=["id"], columns=columns)
+                            for name in ("a", "b")})
+    return MappingConfig(collections={name: CollectionMapping(
+        source_table=name, target_collection="shared") for name in ("a", "b")}), schema
+
+
+def test_a_map_the_emitter_writes_twice_is_refused_not_merged():
+    """Valid Turtle, but one TriplesMap with two logical tables, which R2RML does not allow."""
+    ttl = mapping_to_r2rml(*_two_tables_on_one_collection())
+    g = _parse(ttl)
+    maps = list(g.subjects(RDF.type, RR.TriplesMap))
+    assert len(set(maps)) == 1
+    assert len(list(g.objects(maps[0], RR.logicalTable))) == 2
+    assert len(list(g.objects(maps[0], RR.subjectMap))) == 2
+    with pytest.raises(R2RMLError, match=r"<#Shared> is written more than once.*allows one"):
+        summarize_r2rml(ttl)

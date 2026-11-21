@@ -392,6 +392,20 @@ def _collection(**changes: Any) -> dict[str, Any]:
     ({"collections": _collection(source_table="gone")}, "table 'gone'"),
     ({"collections": _collection(field_mappings={"gone": "x"})}, "column users.gone"),
     ({"collections": _collection(include_fields=["id", "gone"])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "x", "sources": ["gone"], "expression": ""}])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "x", "sources": ["gone"], "expression": "1 + 1", "engine": "ksql"}])},
+     "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "x", "expression": "UPPER(@gone)"}])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "x", "sources": ["id"], "expression": 'CONCAT(@id, @gone)'}])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "x", "expression": "NOT_IN_THE_LOCAL_SUBSET(@gone)"}])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[{"target": "gone"}])}, "column users.gone"),
+    ({"collections": _collection(field_expressions=[
+        {"target": "gone", "expression": "  ", "engine": "python"}])}, "column users.gone"),
     ({"edges": _edge(from_collection="gone")}, "table 'gone'"),
     ({"edges": _edge(to_collection="gone")}, "table 'gone'"),
     ({"edges": _edge(from_fields=["gone"])}, "column orders.gone"),
@@ -410,6 +424,19 @@ def test_coverage_refuses_what_the_snapshot_lacks(changes, says):
     {"collections": _collection(exclude_fields=["gone"], field_terms={"gone": "https://ex.org/p"})},
     {"edges": [{"edge_collection": "placed", "from_collection": "orders", "to_collection": "users",
                 "from_field": "user_id", "to_field": "id"}]},
+    {"collections": _collection(field_expressions=[
+        {"target": "computed", "sources": ["id"], "expression": "@id + 1"}])},
+    {"collections": _collection(field_expressions=[
+        {"target": "computed", "expression": "UPPER(@id)"}])},
+    {"collections": _collection(field_expressions=[{"target": "constant", "expression": "1 + 1"}])},
+    {"collections": _collection(field_expressions=[
+        {"target": "text", "expression": 'CONCAT(@id, "@not_a_column")'}])},
+    {"collections": _collection(field_expressions=[   # @ means nothing to another engine
+        {"target": "stream", "expression": "@not_a_column", "engine": "ksql"}])},
+    {"collections": _collection(field_expressions=[   # opaque: a limit, not a guarantee
+        {"target": "script", "expression": "row['not_a_column']", "engine": "python"}])},
+    {"collections": _collection(field_expressions=[{"target": "id"}])},
+    {"collections": _collection(field_expressions=[{"target": "renamed", "sources": ["id"]}])},
     {"shared_keys": [_shared()]},   # a virtual hub has no table
     {"shared_keys": [_shared(hub_kind="entity", hub_source="crm", hub_table="accounts",
                              hub_column="ref", bindings=[_binding("crm", "accounts", "ref"),
@@ -1081,6 +1108,134 @@ def test_a_malformed_artifact_says_so(shop, api, kind, content, reason):
     body = _read(api)
     assert body[kind]["status"] == "malformed" and body[kind]["reasons"][0].startswith(reason)
     assert body[kind]["structure"] is None and body["state"] == "attention"
+
+
+@pytest.mark.parametrize("bad", [{"label": "nameless"}, {"name": ""}, {"name": 7}, {"name": ["x"]}])
+def test_a_schema_valid_csi_property_without_a_usable_name_is_malformed(shop, api, bad):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["csi"][0]
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["conceptualModel"]["entities"][0]["properties"].append(bad)
+    validate_csi(document)   # the schema alone does not catch it
+    path.write_text(json.dumps(document), encoding="utf-8")
+    response = api.get("/api/projects/shop/exports")
+    assert response.status_code == 200
+    entry = response.json()["csi"]
+    assert (entry["status"], entry["reasons"], entry["structure"]) == ("malformed", ["invalid_csi"], None)
+    assert response.json()["comparison"]["status"] == "not_comparable"
+
+
+@pytest.mark.parametrize("kind, change", [
+    ("r2rml", {"options": {"concept_base": 7}}),
+    ("r2rml", {"options": {"concept_base": None}}),
+    ("r2rml", {"options": {"concept_base": ["urn:"]}}),
+    ("r2rml", {"options": {}}),
+    ("csi", {"options": {"curated_labels_sha256": 7}}),
+    ("r2rml", {"format_version": True}),
+    ("r2rml", {"format_version": "1"}),
+    ("r2rml", {"tenant": 7}),
+    ("r2rml", {"snapshot_id": 7}),
+    ("r2rml", {"mapping_sha256": None}),
+    ("r2rml", {"schema_sha256": ["x"]}),
+    ("r2rml", {"artifact_sha256": 7}),
+    ("r2rml", {"generated_at": 7}),
+    ("r2rml", {"r2g_version": None}),
+])
+def test_a_receipt_field_of_the_wrong_type_reads_as_unverified(shop, api, kind, change):
+    _export_both()
+    path = _files(shop) / ARTIFACTS[kind][1]
+    path.write_text(json.dumps({**_receipt(shop, kind), **change}), encoding="utf-8")
+    response = api.get("/api/projects/shop/exports")
+    assert response.status_code == 200
+    body = response.json()
+    assert (body[kind]["status"], body[kind]["reasons"]) == ("unverified", ["receipt_invalid"])
+    assert body["state"] == "attention" and body["comparison"]["classes"] is None
+
+
+@pytest.mark.parametrize("base", ["urn:ex:onto/", "https://ex.org/onto#", "urn:ünï:"])
+def test_a_valid_custom_concept_base_still_pairs_classes(shop, api, base):
+    assert _project("csi").exit_code == 0
+    assert _project("r2rml", "--concept-base", base).exit_code == 0
+    body = _read(api)
+    assert body["r2rml"]["status"] == "current"
+    assert body["comparison"]["classes"]["paired"] == ["Order", "User"]
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e999", '"\\ud800"'])
+def test_json_the_response_cannot_encode_is_refused(shop, api, value):
+    _export_both()
+    csi, receipt = (_files(shop) / name for name in ARTIFACTS["csi"])
+    original = csi.read_text(encoding="utf-8")
+    csi.write_text(original.replace('"provenance": {', f'"x-unsendable": {value}, "provenance": {{', 1),
+                   encoding="utf-8")
+    response = api.get("/api/projects/shop/exports")
+    assert response.status_code == 200
+    assert response.json()["csi"]["reasons"] == ["invalid_csi"]
+    csi.write_text(original, encoding="utf-8")
+    good = receipt.read_text(encoding="utf-8")
+    receipt.write_text(good.replace('"options": {', f'"options": {{"x": {value}, ', 1), encoding="utf-8")
+    response = api.get("/api/projects/shop/exports")
+    assert response.status_code == 200
+    assert response.json()["csi"]["reasons"] == ["receipt_invalid"]
+
+
+def test_a_projects_path_that_is_a_file_reads_as_malformed(shop, api):
+    moved = shop.dir / "projects-moved"
+    (shop.dir / "projects").rename(moved)
+    (shop.dir / "projects").write_text("not a directory", encoding="utf-8")
+    shop.update_project("shop", mapping_config_path=str(moved / "shop" / "mapping.yaml"))
+    body = _read(api)
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "malformed"
+    assert body["state"] == "attention"
+
+
+def test_a_mapping_path_with_a_nul_byte_is_unavailable_not_a_crash(shop, api):
+    _export_both()
+    shop.update_project("shop", mapping_config_path="/bad\x00path/mapping.yaml")
+    body = _read(api)
+    assert body["current"]["mapping_sha256"] is None
+    assert body["csi"]["status"] == "stale" and "mapping_changed" in body["csi"]["reasons"]
+
+
+@pytest.mark.parametrize("name", ["a\x00b", "a\ud800", "../../outside", "a/b"])
+def test_a_corrupted_project_name_is_malformed_before_any_file_access(shop, monkeypatch, name):
+    project = shop.get_project("shop").model_copy(update={"name": name})
+    entry_reads: list[Any] = []
+    monkeypatch.setattr(project_exports, "_read_file",
+                        lambda *args: entry_reads.append(args) or ("missing", None))
+    body = project_exports.read_project_exports(shop, project)
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "malformed"
+    assert body["state"] == "attention" and entry_reads == []
+
+
+@pytest.mark.parametrize("directory", ["bad\x00dir", "bad\ud800dir", "a" * 5000])
+def test_a_corrupted_artifact_path_reads_as_malformed(tmp_path, directory):
+    assert project_exports._read_file(tmp_path / directory, "mapping.csi.json", 100) == ("malformed", None)
+    assert project_exports._read_file(tmp_path, directory, 100) == ("malformed", None)
+
+
+def test_a_name_too_long_for_the_filesystem_is_malformed_through_the_api(shop, api):
+    name = "a" * 5000
+    shop.create_project(name, "src", str(_mapping_path(shop)))
+    response = api.get(f"/api/projects/{name}/exports")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "malformed"
+    assert str(shop.dir) not in response.text
+
+
+def test_two_tables_on_one_collection_are_reported_not_merged(shop, api):
+    ConfigManager.save_config(MappingConfig.model_validate({"collections": {
+        t: {"source_table": t, "target_collection": "shared"} for t in ("users", "orders")},
+        "edges": []}), _mapping_path(shop))
+    _export_both()
+    body = _read(api)
+    published = (_files(shop) / ARTIFACTS["r2rml"][0]).read_text(encoding="utf-8")
+    assert published.count("<#Shared>\n") == 2   # what the emitter really writes, unchanged
+    assert body["r2rml"]["status"] == "malformed" and "written more than once" in body["r2rml"]["reasons"][0]
+    assert body["r2rml"]["content"] == published and body["r2rml"]["structure"] is None
+    assert body["state"] == "attention" and body["comparison"]["status"] == "not_comparable"
+    assert "not usable R2RML" in _rendered(body)
 
 
 def test_malformed_r2rml_stays_visible_with_its_line(shop, api):
