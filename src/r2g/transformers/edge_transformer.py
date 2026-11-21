@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator, Iterable
 from typing import Any, Dict, Optional
 
-from r2g.keys import sanitize_key_component
+from r2g.keys import row_key, sanitize_key_component
 from r2g.log import get_logger
 from r2g.types import CollectionMapping, EdgeDefinition, LpgLayout, Schema, Table
 
@@ -112,15 +112,7 @@ class EdgeTransformer:
         return cls(edge_def, table, key_separator=key_separator, join_mode=True)
 
     def _vertex_key_from_pk(self, row: Dict[str, Any]) -> str:
-        if not self.source_table.primary_key:
-            raise ValueError(f"Table '{self.source_table.name}' has no primary key; cannot build edge endpoint key")
-        parts: list[str] = []
-        for pk_col in self.source_table.primary_key:
-            val = row.get(pk_col)
-            if val is None:
-                raise ValueError(f"Row missing PK value for column '{pk_col}': {row}")
-            parts.append(sanitize_key_component(val))
-        return self.key_separator.join(parts)
+        return row_key(self.source_table, row, self.key_separator)
 
     def transform_row(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if self.join_mode:
