@@ -8,10 +8,13 @@ the same change permitted, and every record can be read back.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -642,6 +645,222 @@ def test_a_request_delivers_after_its_response(cp, tmp_path):
     assert oct(os.stat(queued).st_mode & 0o777) == "0o600"  # it holds a credential
     fn, args = later.tasks[0]
     assert fn(*args) == "delivered" and len(cp.recorded) == 1
+
+
+# --- #54: the durable write of a published export -------------------------------------------
+
+
+def directory_is(monkeypatch, path: Path, *, uid: int | None = None, gid: int | None = None,
+                 mode: int | None = None) -> None:
+    """``os.stat`` reports ``path`` with this owner, group or mode; nothing else changes."""
+    real = os.stat
+
+    def fake(target, *args, **kwargs):
+        result = real(target, *args, **kwargs)
+        if not isinstance(target, (str, Path)) or Path(target) != path:
+            return result
+        fields = list(result)[:10]
+        fields[0] = result.st_mode if mode is None else stat.S_IFDIR | mode
+        fields[4] = result.st_uid if uid is None else uid
+        fields[5] = result.st_gid if gid is None else gid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", fake)
+
+
+def another_writer(monkeypatch, path: Path) -> int:
+    """The directory belongs to someone else, in a group the file does not have yet."""
+    group = os.stat(path).st_gid + 1
+    directory_is(monkeypatch, path, uid=os.geteuid() + 1, gid=group, mode=0o770)
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: None)
+    return group
+
+
+def mode_of(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def publish(path: Path, text: str = "new") -> list[str]:
+    return governed._write_atomically(path, text, mode=0o640, durable=True)
+
+
+def test_a_published_file_is_0640_whatever_the_umask(tmp_path):
+    before = os.umask(0o077)
+    try:
+        assert publish(tmp_path / "export") == []
+    finally:
+        os.umask(before)
+    assert mode_of(tmp_path / "export") == 0o640
+    assert [p.name for p in tmp_path.iterdir()] == ["export"]
+
+
+def test_a_durable_write_happens_in_the_agreed_order(tmp_path, monkeypatch):
+    calls: list[str] = []
+    real_open, real_fsync, real_chmod, real_replace = os.open, os.fsync, os.fchmod, os.replace
+
+    def opened(path, flags, mode=0o777, **kwargs):
+        if flags & os.O_CREAT:
+            calls.append(f"create {oct(mode)}")
+        return real_open(path, flags, mode, **kwargs)
+
+    def synced(fd):
+        calls.append("fsync directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync file")
+        real_fsync(fd)
+
+    directory_is(monkeypatch, tmp_path, gid=os.stat(tmp_path).st_gid + 1)
+    monkeypatch.setattr(os, "open", opened)
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: calls.append("group"))
+    monkeypatch.setattr(os, "fchmod", lambda fd, m: (calls.append("mode"), real_chmod(fd, m))[1])
+    monkeypatch.setattr(os, "fsync", synced)
+    monkeypatch.setattr(os, "replace", lambda a, b: (calls.append("replace"), real_replace(a, b))[1])
+    publish(tmp_path / "export")
+    assert calls == ["create 0o600", "group", "mode", "fsync file", "replace", "fsync directory"]
+
+
+def test_a_file_already_in_the_right_group_is_not_changed(tmp_path, monkeypatch):
+    def refuses(fd, uid, gid):
+        raise AssertionError("no group change was needed")
+
+    monkeypatch.setattr(os, "fchown", refuses)
+    assert publish(tmp_path / "export") == []
+    assert mode_of(tmp_path / "export") == 0o640
+
+
+@pytest.mark.parametrize("existing, owns, mode, warns", [
+    (0o640, True, 0o640, False),
+    (0o600, True, 0o600, True),     # owner-only, and said so
+    (0o644, True, 0o640, False),    # never carried forward
+    (0o600, False, 0o640, False),   # another writer's 0600 would hide it from the Studio
+])
+def test_what_a_replaced_file_keeps(tmp_path, monkeypatch, existing, owns, mode, warns):
+    path = tmp_path / "export"
+    path.write_text("old")
+    path.chmod(existing)
+    if not owns:
+        another_writer(monkeypatch, tmp_path)
+    assert bool(publish(path)) is warns
+    assert mode_of(path) == mode and path.read_text() == "new"
+
+
+def test_a_replaced_file_keeps_its_group_only_if_the_directorys_group_can_read_it(
+        tmp_path, monkeypatch):
+    path = tmp_path / "export"
+    path.write_text("old")
+    path.chmod(0o640)
+    group = another_writer(monkeypatch, tmp_path)
+    asked: list[int] = []
+    monkeypatch.setattr(os, "fchown", lambda fd, uid, gid: asked.append(gid))
+    publish(path)
+    assert asked == [group]
+
+
+def test_a_symlink_at_the_destination_is_replaced_not_followed(tmp_path):
+    target = tmp_path / "elsewhere"
+    target.write_text("old")
+    link = tmp_path / "export"
+    link.symlink_to(target)
+    publish(link)
+    assert not link.is_symlink() and link.read_text() == "new" and target.read_text() == "old"
+
+
+def test_a_rejected_group_change_leaves_the_owner_with_a_0600_file(tmp_path, monkeypatch):
+    def rejected(fd, uid, gid):
+        raise PermissionError("not on this volume")
+
+    directory_is(monkeypatch, tmp_path, gid=os.stat(tmp_path).st_gid + 1)
+    monkeypatch.setattr(os, "fchown", rejected)
+    warnings = publish(tmp_path / "export")
+    assert mode_of(tmp_path / "export") == 0o600
+    assert any("only by the user who wrote it" in w for w in warnings)
+
+
+def test_a_rejected_group_change_refuses_anyone_else(tmp_path, monkeypatch):
+    def rejected(fd, uid, gid):
+        raise PermissionError("/secret/volume/path")
+
+    path = tmp_path / "export"
+    path.write_text("old")
+    another_writer(monkeypatch, tmp_path)
+    monkeypatch.setattr(os, "fchown", rejected)
+    with pytest.raises(PermissionError, match="rejected the group change") as refused:
+        publish(path)
+    assert "/secret" not in str(refused.value)
+    assert path.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["export"]
+
+
+@pytest.mark.parametrize("owns, directory_mode", [(True, 0o670), (False, 0o760)])
+def test_a_directory_the_reader_cannot_search_refuses(tmp_path, monkeypatch, owns, directory_mode):
+    path = tmp_path / "export"
+    path.write_text("old")
+    if owns:
+        directory_is(monkeypatch, tmp_path, mode=directory_mode)
+    else:
+        another_writer(monkeypatch, tmp_path)
+        directory_is(monkeypatch, tmp_path, mode=directory_mode)
+    with pytest.raises(PermissionError, match="does not let the Studio reach"):
+        publish(path)
+    assert path.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["export"]
+
+
+def fsync_of_directories_fails(monkeypatch, code: int) -> None:
+    real = os.fsync
+
+    def synced(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(code, "no")
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", synced)
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP])
+def test_a_filesystem_without_directory_sync_is_a_warning(tmp_path, monkeypatch, code):
+    fsync_of_directories_fails(monkeypatch, code)
+    assert publish(tmp_path / "export") == ["this filesystem cannot sync the project directory"]
+    assert (tmp_path / "export").read_text() == "new"
+
+
+def test_a_failed_directory_sync_raises_and_does_not_roll_back(tmp_path, monkeypatch):
+    fsync_of_directories_fails(monkeypatch, errno.EIO)
+    with pytest.raises(OSError):
+        publish(tmp_path / "export")
+    assert (tmp_path / "export").read_text() == "new"
+
+
+def test_a_durable_write_does_not_create_the_directory(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        publish(tmp_path / "missing" / "export")
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_a_failed_replace_keeps_the_old_file_and_no_temporary(tmp_path, monkeypatch, durable):
+    def fails(source, target):
+        raise OSError(errno.EIO, "no")
+
+    path = tmp_path / "export"
+    path.write_text("old")
+    path.chmod(0o640)
+    monkeypatch.setattr(os, "replace", fails)
+    with pytest.raises(OSError):
+        governed._write_atomically(path, "new", mode=0o640, durable=durable)
+    assert path.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["export"]
+
+
+def test_versions_and_the_queue_keep_their_modes_and_are_not_synced(tmp_path, monkeypatch):
+    def no_sync(fd):
+        raise AssertionError("only a published export is synced")
+
+    monkeypatch.setattr(os, "fsync", no_sync)
+    before = os.umask(0o022)
+    try:
+        reference = governed.keep_version(tmp_path / "p", "text")
+        governed.Outbox(tmp_path / "outbox").send(OWNER, entry(), background=MagicMock())
+    finally:
+        os.umask(before)
+    digest = reference.rsplit(":", 1)[1]
+    assert mode_of(tmp_path / "p" / "versions" / f"{digest}.yaml") == 0o644
+    assert mode_of(tmp_path / "outbox" / "pending" / "e1.json") == 0o600
 
 
 # --- P14.13 ------------------------------------------------------------------------------
