@@ -52,11 +52,11 @@
       .floating-card[data-fc-id="${CARD_ID}"] .fc-body { display:flex; flex-direction:column; gap:8px; overflow:auto; }
       .exports-tabs { display:flex; gap:4px; flex-wrap:wrap; flex:none; }
       .exports-tabs button { border:1px solid var(--border); background:var(--surface); color:var(--text); border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; }
-      .exports-tabs button[aria-selected="true"] { background:#f4fef2; color:#006532; border-color:#006532; font-weight:600; }
+      .exports-tabs button[aria-selected="true"] { background:color-mix(in srgb, var(--arango-green) 16%, var(--surface)); color:var(--text); border-color:var(--arango-green); font-weight:600; }
       .exports-banner { border:1px solid var(--border); border-radius:6px; padding:8px; font-size:12px; color:var(--text); flex:none; }
       .exports-banner code, .exports-table code, .exports-class code { font-family:Courier,monospace; overflow-wrap:anywhere; }
       .exports-pill { display:inline-block; border:1px solid var(--border); border-radius:10px; padding:0 7px; font-size:11px; font-weight:600; white-space:nowrap; }
-      .exports-pill.current { color:#006532; background:#f4fef2; border-color:#006532; }
+      .exports-pill.current { color:var(--text); background:color-mix(in srgb, var(--arango-green) 16%, var(--surface)); border-color:var(--arango-green); }
       .exports-pill.malformed, .exports-pill.unreadable { color:var(--red); border-color:var(--red); }
       .exports-pill.stale, .exports-pill.unverified, .exports-pill.too_large { color:var(--yellow); border-color:var(--yellow); }
       .exports-class { border:1px solid var(--border); border-radius:6px; padding:8px; flex:none; }
@@ -232,14 +232,16 @@
         <div>${esc(view.error)}</div></div>`;
     }
     if (!view.data) return '<div class="exports-note" role="status">Loading the exported mapping…</div>';
+    // Only the selected tab's panel exists, so only that tab can name it.
     const tabs = TABS.map(([id, label]) =>
-      `<button type="button" role="tab" data-exports-tab="${id}" aria-selected="${view.tab === id}">${label}</button>`
+      `<button type="button" role="tab" id="exports-tab-${id}" data-exports-tab="${id}" aria-selected="${view.tab === id}"${
+        view.tab === id ? ` aria-controls="exports-panel-${id}"` : ''}>${label}</button>`
     ).join('');
     const content = view.tab === 'mapping' ? mappingTab(view.data)
       : view.tab === 'provenance' ? provenanceTab(view.data)
         : rawTab(view.data, view.tab);
     return `<div class="exports-tabs" role="tablist" aria-label="Exported mapping views">${tabs}</div>
-      ${banner(view.data)}<div role="tabpanel">${content}</div>`;
+      ${banner(view.data)}<div role="tabpanel" id="exports-panel-${view.tab}" aria-labelledby="exports-tab-${view.tab}">${content}</div>`;
   }
 
   function visibleContent() {

@@ -6571,7 +6571,7 @@ function _menuCanvas() {
     { label: 'View arangoimport script bundle', icon: '\u2328',
       onClick: () => window.openArangoImportViewer({ scope: 'all' }),
       hint: 'Inspect or download a generated alternative batch import script. Studio Load continues to stream over HTTP.' },
-    { label: 'View exported mapping', icon: '\u2637',
+    { label: 'View exported mapping', icon: '\u2637', disabled: !currentProject,
       onClick: () => window.openExportsViewer({ project: currentProject }),
       hint: 'Inspect the CSI and R2RML saved for this project, read-only: what a federation will actually run, not the editing state.' },
     '-',

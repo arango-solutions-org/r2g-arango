@@ -1555,6 +1555,16 @@ def test_everything_from_an_artifact_is_escaped_and_no_iri_is_a_link(shop, api):
     assert 'href="urn:' not in _rendered(data, "mapping")
 
 
+@pytest.mark.parametrize("tab", ["mapping", "csi", "r2rml", "provenance"])
+def test_the_selected_tab_and_its_panel_name_each_other(shop, api, tab):
+    _export_both()
+    html = _rendered(_read(api), tab)
+    assert f'id="exports-tab-{tab}" data-exports-tab="{tab}" aria-selected="true" ' \
+           f'aria-controls="exports-panel-{tab}"' in html
+    assert f'role="tabpanel" id="exports-panel-{tab}" aria-labelledby="exports-tab-{tab}"' in html
+    assert html.count("aria-controls=") == 1   # the other panels are not in the page
+
+
 def test_the_raw_tabs_show_the_exact_saved_text(shop, api):
     _export_both()
     data = _read(api)
