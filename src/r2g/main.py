@@ -563,15 +563,81 @@ def _report_curated_plan(plan) -> bool:
     return not plan.problems
 
 
+_PROJECT_EXPORT_HELP = (
+    "Export this catalog project's mapping against its source's latest snapshot, to the "
+    "project's directory, where the Studio reads it. Replaces --config and --schema."
+)
+
+
+class _MissingOption(typer.BadParameter):
+    """A required option, now that ``--project`` can stand in for it."""
+
+    def format_message(self) -> str:
+        return f"Missing option {self.param_hint}."
+
+
+def _check_export_inputs(
+    project: Optional[str],
+    config_path: Optional[str],
+    schema_file: Optional[str],
+    *,
+    schema_required: bool = False,
+) -> None:
+    """Exactly one of ``--project`` or the path options. Before the command's try, like
+    every other usage error."""
+    if project is not None:
+        if config_path is not None or schema_file is not None:
+            console.print("[red]--project cannot be combined with --config or --schema.[/red]")
+            raise typer.Exit(code=2)
+    elif config_path is None:
+        raise _MissingOption("", param_hint="'--config' / '-c'")
+    elif schema_required and schema_file is None:
+        raise _MissingOption("", param_hint="'--schema' / '-s'")
+
+
+def _write_export(published, kind: str, output: Optional[str], default: str, text: str,
+                  generated_at: str, options: dict[str, Any]) -> str:
+    """Publish to the project's directory, or write where ``--output`` says as always."""
+    from r2g.project_exports import publish_export
+
+    if published is None or output is not None:
+        target = default if output is None else output
+        Path(target).write_text(text, encoding="utf-8")
+        if published is not None:
+            console.print("[yellow]--output given: the Studio's copy was not updated.[/yellow]")
+        return target
+    path, warnings = publish_export(published, kind, text, generated_at, options)
+    console.print(f"  [dim]catalog {escape(str(published.directory.parent.parent))}"
+                  f"{f', tenant {escape(published.tenant)}' if published.tenant else ''}[/dim]")
+    for warning in warnings:
+        console.print(f"[yellow]Warning: {escape(warning)}.[/yellow]")
+    return str(path)
+
+
+def _read_export_labels(published, path: Optional[str]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """The curated labels, and for a project export the hash its receipt records."""
+    from r2g.curated_labels import load_curated_labels
+    from r2g.project_exports import read_curated_labels
+
+    if not path:
+        return None, None
+    return read_curated_labels(path) if published is not None else (load_curated_labels(path), None)
+
+
 @app.command("export-csi")
 def export_csi(
-    config_path: str = typer.Option(..., "--config", "-c", help="Mapping config YAML"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Mapping config YAML"),
     schema_file: Optional[str] = typer.Option(
         None, "--schema", "-s", help="Path to schema.json (enriches entity properties)"
     ),
-    output: str = typer.Option("mapping.csi.json", "--output", "-o", help="Output CSI v1 JSON path"),
-    source_type: str = typer.Option(
-        "relational", "--source-type", help="provenance.source.kind (e.g. postgresql, mysql, mssql)"
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output CSI v1 JSON path [default: mapping.csi.json]"
+    ),
+    source_type: Optional[str] = typer.Option(
+        None,
+        "--source-type",
+        help="provenance.source.kind (e.g. postgresql, mysql, mssql) [default: relational, "
+        "or the source's type with --project]",
     ),
     source_ref: str = typer.Option(
         "", "--source-ref", help="provenance.source.ref (database/schema pointer; defaults to config source_schema)"
@@ -595,6 +661,7 @@ def export_csi(
     allow_unapplied_labels: bool = typer.Option(
         False, "--allow-unapplied-labels", help=_ALLOW_UNAPPLIED_HELP
     ),
+    project: Optional[str] = typer.Option(None, "--project", help=_PROJECT_EXPORT_HELP),
 ) -> None:
     """Emit a forward CSI v1 interchange document from an r2g mapping.
 
@@ -613,8 +680,10 @@ def export_csi(
     from datetime import datetime, timezone
 
     from r2g.csi import mapping_to_csi, validate_csi
-    from r2g.curated_labels import CuratedPlan, load_curated_labels
+    from r2g.curated_labels import CuratedPlan
+    from r2g.project_exports import ProjectExportError, resolve_project_export
 
+    _check_export_inputs(project, config_path, schema_file)
     # Validated before the try: typer.Exit is an Exception, so raising it inside
     # would be swallowed by the generic handler below and reported as an empty
     # "Failed to export CSI:".
@@ -626,8 +695,16 @@ def export_csi(
         raise typer.Exit(code=2)
 
     try:
-        mapping = ConfigManager.load_config(config_path)
-        schema = Schema.load_from_file(schema_file) if schema_file else None
+        published = resolve_project_export(project) if project is not None else None
+        schema: Optional[Schema]
+        if published is not None:
+            mapping, schema = published.config, published.schema
+        else:
+            assert config_path is not None  # _check_export_inputs
+            mapping = ConfigManager.load_config(config_path)
+            schema = Schema.load_from_file(schema_file) if schema_file else None
+        kind = source_type if source_type is not None else (
+            published.source_type if published is not None else "relational")
         if schema is None:
             # Class names read the schema's foreign keys (P12.13); export-r2rml
             # always has them, so without --schema the two can name a class apart.
@@ -635,7 +712,7 @@ def export_csi(
                 "[yellow]No --schema: class names use the singularizer only, without the "
                 "schema's foreign-key evidence, and can differ from export-r2rml's.[/yellow]"
             )
-        curated = load_curated_labels(curated_labels_file) if curated_labels_file else None
+        curated, curated_sha256 = _read_export_labels(published, curated_labels_file)
         generated_at = datetime.now(timezone.utc).isoformat()
         # Forward the bitemporal stamps RSA >= 0.8.0 records on the physical schema
         # (DESIGN-ADDENDUM-bitemporal): r2g neither mints nor reshapes them.
@@ -643,7 +720,7 @@ def export_csi(
         doc = mapping_to_csi(
             mapping,
             schema,
-            source_type=source_type,
+            source_type=kind,
             source_ref=source_ref,
             generated_at=generated_at,
             label_policy=label_policy,
@@ -665,8 +742,15 @@ def export_csi(
                     f"(--allow-unapplied-labels to write anyway).[/red]"
                 )
                 raise typer.Exit(code=1)
-        Path(output).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-        console.print(f"[green]Wrote CSI v1 document:[/green] [bold]{output}[/bold]")
+        written = _write_export(
+            published, "csi", output, "mapping.csi.json", json.dumps(doc, indent=2) + "\n",
+            generated_at,
+            {"label_policy": label_policy, "source_type": doc["provenance"]["source"]["kind"],
+             "source_ref": doc["provenance"]["source"].get("ref"), "validated": validate,
+             "curated_labels_sha256": curated_sha256,
+             "allow_unapplied_labels": allow_unapplied_labels},
+        )
+        console.print(f"[green]Wrote CSI v1 document:[/green] [bold]{written}[/bold]")
         console.print(
             f"  [dim]{len(doc['conceptualModel']['entities'])} entities, "
             f"{len(doc['conceptualModel']['relationships'])} relationships"
@@ -716,6 +800,9 @@ def export_csi(
                 )
     except typer.Exit:
         raise
+    except ProjectExportError as e:
+        console.print(f"[red]Not exported:[/red] {escape(str(e))}")
+        raise typer.Exit(code=1)
     except Exception as e:
         log.exception("export_csi_failed", output=output)
         console.print(f"[red]Failed to export CSI:[/red] {e}")
@@ -724,17 +811,22 @@ def export_csi(
 
 @app.command("export-r2rml")
 def export_r2rml(
-    config_path: str = typer.Option(..., "--config", "-c", help="Mapping config YAML"),
-    schema_file: str = typer.Option(..., "--schema", "-s", help="Path to schema.json"),
-    output: str = typer.Option("mapping.r2rml.ttl", "--output", "-o", help="Output R2RML Turtle path"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Mapping config YAML"),
+    schema_file: Optional[str] = typer.Option(None, "--schema", "-s", help="Path to schema.json"),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output R2RML Turtle path [default: mapping.r2rml.ttl]"
+    ),
     concept_base: str = typer.Option(
         "urn:arango-sparql:concept#", "--concept-base", help="IRI namespace for classes/properties"
     ),
     resource_base: str = typer.Option(
         "http://r2g.example/resource/", "--resource-base", help="IRI namespace for row subject IRIs"
     ),
-    source_type: str = typer.Option(
-        "relational", "--source-type", help="Source system kind (recorded in the header)"
+    source_type: Optional[str] = typer.Option(
+        None,
+        "--source-type",
+        help="Source system kind (recorded in the header) [default: relational, or the "
+        "source's type with --project]",
     ),
     curated_labels_file: Optional[str] = typer.Option(
         None, "--curated-labels", help=_CURATED_LABELS_HELP
@@ -742,6 +834,7 @@ def export_r2rml(
     allow_unapplied_labels: bool = typer.Option(
         False, "--allow-unapplied-labels", help=_ALLOW_UNAPPLIED_HELP
     ),
+    project: Optional[str] = typer.Option(None, "--project", help=_PROJECT_EXPORT_HELP),
 ) -> None:
     """Emit an R2RML mapping (relational -> RDF) for SPARQL->SQL pushdown via Ontop.
 
@@ -751,14 +844,24 @@ def export_r2rml(
     ``--curated-labels`` must be the same file given to ``export-csi``, or the
     two legs will name concepts differently.
     """
+    from datetime import datetime, timezone
+
     from r2g.csi import curated_plan_for_mapping
-    from r2g.curated_labels import load_curated_labels
+    from r2g.project_exports import ProjectExportError, resolve_project_export
     from r2g.r2rml import mapping_to_r2rml
 
+    _check_export_inputs(project, config_path, schema_file, schema_required=True)
     try:
-        mapping = ConfigManager.load_config(config_path)
-        schema = Schema.load_from_file(schema_file)
-        curated = load_curated_labels(curated_labels_file) if curated_labels_file else None
+        published = resolve_project_export(project) if project is not None else None
+        if published is not None:
+            mapping, schema = published.config, published.schema
+        else:
+            assert config_path is not None and schema_file is not None  # _check_export_inputs
+            mapping = ConfigManager.load_config(config_path)
+            schema = Schema.load_from_file(schema_file)
+        kind = source_type if source_type is not None else (
+            published.source_type if published is not None else "relational")
+        curated, curated_sha256 = _read_export_labels(published, curated_labels_file)
         if curated is not None:
             plan = curated_plan_for_mapping(mapping, schema, curated)
             if not _report_curated_plan(plan) and not allow_unapplied_labels:
@@ -772,21 +875,30 @@ def export_r2rml(
             schema,
             concept_base=concept_base,
             resource_base=resource_base,
-            source_type=source_type,
+            source_type=kind,
             curated_labels=curated,
         )
-        Path(output).write_text(ttl, encoding="utf-8")
+        written = _write_export(
+            published, "r2rml", output, "mapping.r2rml.ttl", ttl,
+            datetime.now(timezone.utc).isoformat(),
+            {"concept_base": concept_base, "resource_base": resource_base, "source_type": kind,
+             "curated_labels_sha256": curated_sha256,
+             "allow_unapplied_labels": allow_unapplied_labels},
+        )
         n_entities = sum(
             1
             for cm in mapping.collections.values()
             if cm.collection_type != "edge" and not cm.is_join_table
         )
-        console.print(f"[green]Wrote R2RML mapping:[/green] [bold]{output}[/bold]")
+        console.print(f"[green]Wrote R2RML mapping:[/green] [bold]{written}[/bold]")
         console.print(
             f"  [dim]{n_entities} TriplesMaps, {len(mapping.edges)} FK relationships[/dim]"
         )
     except typer.Exit:
         raise
+    except ProjectExportError as e:
+        console.print(f"[red]Not exported:[/red] {escape(str(e))}")
+        raise typer.Exit(code=1)
     except Exception as e:
         log.exception("export_r2rml_failed", output=output)
         console.print(f"[red]Failed to export R2RML:[/red] {e}")

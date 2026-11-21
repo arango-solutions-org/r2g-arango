@@ -110,6 +110,51 @@ r2g export-r2rml --config mapping.yaml --schema schema.json --output analytics.r
 > same introspect → shape → validate workflow yields both a migration and a
 > federation mapping from one source.
 
+### Reviewing what a project exported
+
+To see what a federation will actually run, export a catalog project's mapping and open it in the
+Studio with **View exported mapping** in the project or canvas menu:
+
+```bash
+r2g export-csi   --project NAME
+r2g export-r2rml --project NAME
+```
+
+Both use the project's mapping and the latest snapshot of its source, and write to
+`<catalog>/projects/NAME/`. They refuse a mapping that names a table or column the snapshot lacks.
+For expressions, that covers declared sources, pass-through targets and AQL `@column` references.
+A column named only inside KSQL or Python text is not checked.
+`--project` replaces `--config` and `--schema`. With `--output`, the file goes only there and the
+Studio's copy is not updated. The view is read-only and never generates an export, and it says when
+an export is missing, out of date or damaged. `R2G_EXPORT_MAX_BYTES` limits the size it will read
+(default 10 MiB).
+
+The commands write four files to `<catalog>/projects/NAME/`:
+
+- `mapping.csi.json`: the exported CSI document.
+- `mapping.csi.export.json`: the CSI export receipt, with its provenance and integrity hashes.
+- `mapping.r2rml.ttl`: the exported R2RML document.
+- `mapping.r2rml.export.json`: the R2RML export receipt, with its provenance and integrity hashes.
+
+Each export has its own receipt because each exporter has its own options and generation details.
+
+Under a control plane, the Studio has no export action. An administrator runs these commands as
+a non-root user in the tenant's Studio environment, with the same `R2G_CATALOG_DIR`, `R2G_TENANT`
+and secret key as the Studio. `/data` must persist and be shared by every Studio replica.
+
+So that the administrator who publishes these files and the Studio that reads them can share them,
+they are written with mode `0640` and the project directory's group. A replaced file keeps its
+group and mode. If the group cannot be set and the writer owns the directory, the file falls back
+to owner-only `0600` and the command warns. If the writer does not own the directory, the command
+refuses instead. This does not guarantee access in every deployment: that still depends on the
+Studio user's group membership and the volume's permissions.
+
+CSI and R2RML can name the same column differently ([#17](https://github.com/arango-solutions-org/r2g-arango/issues/17)),
+and the view shows where they do. A catalog snapshot does not keep CSI's bitemporal stamps, so a
+project export reports them as unavailable.
+Two tables mapped to one collection produce R2RML that R2RML itself does not allow, and the view
+reports that export as malformed instead of merging the tables.
+
 ## Prerequisites
 
 - **Python 3.10+**
@@ -546,8 +591,8 @@ r2g stream --dry-run \
 | `mapping-diff` | Compare two mapping configs and show what ArangoDB changes are needed |
 | `selective-reload` | Compute and execute a selective reload based on mapping changes |
 | `history` | Show load history (`--project`, `--limit`) |
-| `export-csi` | Emit a **CSI v1** conceptual-schema-interchange document (conceptual model + ArangoDB physical mapping) for federation; drives the fabric's Arango leg (`--config`, `--schema`, `--output`, `--source-type`, `--source-ref`, `--label-policy`, `--curated-labels`, `--allow-unapplied-labels`, `--validate/--no-validate`) |
-| `export-r2rml` | Emit an **R2RML** mapping (relational → RDF) for SPARQL→SQL pushdown via Ontop — the federation relational leg (`--config`, `--schema`, `--output`, `--concept-base`, `--resource-base`, `--source-type`, `--curated-labels`, `--allow-unapplied-labels`) |
+| `export-csi` | Emit a **CSI v1** conceptual-schema-interchange document (conceptual model + ArangoDB physical mapping) for federation; drives the fabric's Arango leg (`--config`, `--schema`, `--output`, `--source-type`, `--source-ref`, `--label-policy`, `--curated-labels`, `--allow-unapplied-labels`, `--validate/--no-validate`); `--project NAME` exports a catalog project's mapping for the Studio's read-only view |
+| `export-r2rml` | Emit an **R2RML** mapping (relational → RDF) for SPARQL→SQL pushdown via Ontop — the federation relational leg (`--config`, `--schema`, `--output`, `--concept-base`, `--resource-base`, `--source-type`, `--curated-labels`, `--allow-unapplied-labels`); `--project NAME` exports a catalog project's mapping for the Studio's read-only view |
 | `ui` | Start the Relational-to-Graph Studio web UI (requires the `ui` extra) |
 | `mcp` | Start the R2G MCP server for AI agent integration (requires the `mcp` extra) |
 

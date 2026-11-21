@@ -9,6 +9,23 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A read-only view of a project's exported mapping (#54, PRD P14.16).** `r2g export-csi --project
+  NAME` and `r2g export-r2rml --project NAME` export a catalog project's mapping against the latest
+  snapshot of its source, to the project's directory, each with a receipt of its inputs. They refuse
+  a mapping that names a table or column the snapshot lacks. The Studio's **View exported mapping**
+  shows the tables and columns of the saved CSI and R2RML, their provenance, and whether they are
+  current, through a new read-only `GET /api/projects/{name}/exports`. It never generates an export.
+  Without `--project` both commands behave as before. Not yet: stable column identities (#91), and
+  the fix for the names CSI and R2RML can give one column differently (#17), which the view shows.
+  Catalog snapshots do not keep CSI's bitemporal stamps, so a project export reports them as
+  unavailable.
+  Two source tables mapped to one collection can make the R2RML emitter, which is unchanged, write
+  repeated `<#Subject>` TriplesMap blocks. The structured reader rejects the repeated subject
+  rather than merging the tables, the API reports the export as malformed with an explanation, and
+  the exported Turtle stays available to reviewers. Changing exporter identities or federation
+  output is separate work.
+  The column check covers declared expression sources, pass-through targets and AQL `@column`
+  references. KSQL and Python text is opaque, so a column named only there is not checked.
 - **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
   `r2g source add --offline` registers a source with no connection string, and
   `r2g source snapshot NAME --from-file schema.json` takes its snapshot from RSA `PhysicalSchema`

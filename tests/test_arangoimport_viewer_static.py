@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 STATIC_DIR = Path(__file__).parents[1] / "src" / "r2g" / "ui" / "static"
@@ -79,3 +80,14 @@ def test_bare_command_views_say_what_the_bundle_adds():
     ):
         assert expression in source
     assert "return result.script || '';" in source
+
+
+def test_the_exports_viewer_is_loaded_and_opened_from_the_project_menus():
+    index = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    # Relative, so it also loads under a path prefix (see test_control_plane_mode).
+    assert '<script src="static/exports-viewer.js"></script>' in index
+    assert index.count("label: 'View exported mapping'") == 3
+    assert index.count("window.openExportsViewer({ project: name })") == 1
+    assert index.count("window.openExportsViewer({ project: currentProject })") == 2
+    entries = re.findall(r"label: 'View exported mapping', icon: '[^']*',([^\n]*)", index)
+    assert sorted(e.strip() for e in entries) == ["", "disabled: !currentProject,", "disabled: dis,"]

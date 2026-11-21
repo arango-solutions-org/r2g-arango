@@ -20,10 +20,13 @@ Outside a control plane none of this runs, and the Studio is unchanged.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import threading
 import time
 import uuid
@@ -211,13 +214,82 @@ def keep_version(project_dir: Path, text: str) -> str:
     return f"{project_dir.name}/mapping@sha256:{digest}"
 
 
-def _write_atomically(path: Path, text: str, *, mode: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_atomically(path: Path, text: str, *, mode: int, durable: bool = False) -> list[str]:
+    """Replace ``path`` with ``text`` in one step, leaving no temporary file if that fails.
+
+    ``durable`` is for a project's published exports: the directory must already exist, the
+    file gets exact access (:func:`_set_published_access`), and it and its directory are
+    synced. Returns what the caller should warn about; nothing unless ``durable``.
+    """
+    warnings: list[str] = []
+    if not durable:
+        path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if durable else mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            if durable:
+                f.flush()
+                warnings += _set_published_access(f.fileno(), path, mode)
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    if durable:
+        warnings += _fsync_directory(path.parent)
+    return warnings
+
+
+def _set_published_access(fd: int, path: Path, mode: int) -> list[str]:
+    """Give the open temporary file ``mode`` and the group that lets the Studio read it.
+
+    The Studio's user is not known here, so the directory's owner and group stand in for it.
+    A replaced file keeps its group and ``mode``, or its ``0600`` if the writer owns the
+    directory. Refuses, before anything is replaced, when neither could read the result.
+    """
+    directory = os.stat(path.parent)
+    writer_owns = directory.st_uid == os.geteuid()
+    try:
+        existing: os.stat_result | None = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    kept = stat.S_IMODE(existing.st_mode) if existing and stat.S_ISREG(existing.st_mode) else None
+
+    owner_only = kept == 0o600 and writer_owns
+    if not owner_only:
+        keeps_group = existing is not None and kept == mode and writer_owns
+        group = existing.st_gid if existing is not None and keeps_group else directory.st_gid
+        if os.fstat(fd).st_gid != group:
+            try:
+                os.fchown(fd, -1, group)
+            except OSError as exc:
+                if not writer_owns:
+                    raise PermissionError(
+                        "this volume rejected the group change the Studio needs to read "
+                        "the export") from exc
+                owner_only = True
+    if not owner_only:
+        os.fchmod(fd, mode)
+    if not directory.st_mode & (stat.S_IXUSR if writer_owns else stat.S_IXGRP):
+        raise PermissionError("the project directory does not let the Studio reach the export")
+    return ["the export is readable only by the user who wrote it (mode 0600)"] if owner_only else []
+
+
+def _fsync_directory(directory: Path) -> list[str]:
+    """Sync a rename to disk. A filesystem without directory sync is a warning."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+            raise
+        return ["this filesystem cannot sync the project directory"]
+    finally:
+        os.close(fd)
+    return []
 
 
 # --- recording ------------------------------------------------------------------------------

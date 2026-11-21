@@ -19,6 +19,7 @@ from r2g.r2rml import (  # noqa: E402
     R2RMLError,
     _xsd_datatype,
     mapping_to_r2rml,
+    summarize_r2rml,
 )
 from r2g.types import (  # noqa: E402
     CollectionMapping,
@@ -404,3 +405,181 @@ def test_export_r2rml_cli(tmp_path):
     assert result.exit_code == 0, result.output
     g = _parse(out.read_text(encoding="utf-8"))
     assert set(_triples_maps(g)) == {"User", "Order"}
+
+
+# --- summarize_r2rml: reading back what the emitter wrote ------------------------------------
+
+
+def _by_rdflib(ttl: str) -> dict:
+    """What rdflib, a full Turtle parser, reads from the document, in the summary's shape."""
+    g = _parse(ttl)
+    xsd = str(rdflib.XSD)
+    tables = {}
+    for tm in g.subjects(RDF.type, RR.TriplesMap):
+        subject_map = g.value(tm, RR.subjectMap)
+        columns, joins = [], []
+        for pom in g.objects(tm, RR.predicateObjectMap):
+            obj = g.value(pom, RR.objectMap)
+            predicate = str(g.value(pom, RR.predicate))
+            parent = g.value(obj, RR.parentTriplesMap)
+            if parent is None:
+                datatype = g.value(obj, RR.datatype)
+                columns.append((str(g.value(obj, RR.column)), predicate,
+                                None if datatype is None else "xsd:" + str(datatype)[len(xsd):]))
+            else:
+                joins.append((predicate, str(parent).rsplit("#", 1)[1], tuple(sorted(
+                    (str(g.value(c, RR.child)), str(g.value(c, RR.parent)))
+                    for c in g.objects(obj, RR.joinCondition)))))
+        tables[str(tm).rsplit("#", 1)[1]] = (
+            str(g.value(g.value(tm, RR.logicalTable), RR.tableName)),
+            str(g.value(subject_map, RR.template)), str(g.value(subject_map, RR["class"])),
+            sorted(columns, key=repr), sorted(joins, key=repr))
+    return tables
+
+
+def _by_summary(ttl: str) -> dict:
+    return {
+        t["subject"]: (
+            t["table"], t["template"], t["class"],
+            sorted(((c["column"], c["predicate"], c["datatype"]) for c in t["columns"]), key=repr),
+            sorted(((j["predicate"], j["parent"], tuple(sorted(
+                (c["child"], c["parent"]) for c in j["conditions"]))) for j in t["joins"]), key=repr))
+        for t in summarize_r2rml(ttl)["tables"]
+    }
+
+
+def _awkward_schema() -> Schema:
+    return Schema(tables={
+        "t": Table(name='we"ird;t]', schema_name="sa#les", primary_key=["id", 'k;e"y'], columns=[
+            Column(name="id", data_type="integer"),
+            Column(name='k;e"y', data_type="text"),
+            Column(name='a;b ]"c#d\\e', data_type="text"),
+            Column(name="tab\tnew\nline\rcr", data_type="uuid"),
+            Column(name="名前", data_type="timestamp"),
+            Column(name="# not a comment", data_type="numeric"),
+        ]),
+        "p": Table(name="p", columns=[Column(name="x", data_type="text"),
+                                      Column(name="y", data_type="text")]),
+    })
+
+
+def _awkward_config() -> MappingConfig:
+    return MappingConfig(
+        collections={n: CollectionMapping(source_table=n, target_collection=c)
+                     for n, c in (("t", "Thing"), ("p", "Part"))},
+        edges=[EdgeDefinition(edge_collection="has", from_collection="t", to_collection="p",
+                              from_fields=["id", 'k;e"y'], to_fields=["x", "y"])],
+    )
+
+
+@pytest.mark.parametrize("config, schema, options", [
+    (_config, _schema, {}),
+    (_config, _schema, {"concept_base": "urn:no:hash:", "resource_base": "http://ex.org/r#"}),
+    (_awkward_config, _awkward_schema, {}),
+    (_awkward_config, _awkward_schema, {"concept_base": "https://ex.org/onto/"}),
+    (_config, _schema, {"curated_labels": {"curatedLabelsVersion": "1", "entities": [
+        {"name": "User", "label": "Customer"}]}}),
+])
+def test_the_summary_reads_what_rdflib_reads(config, schema, options):
+    ttl = mapping_to_r2rml(config(), schema(), **options)
+    assert _by_summary(ttl) == _by_rdflib(ttl) != {}
+
+
+def test_the_summary_reads_the_committed_golden_document():
+    from pathlib import Path
+
+    ttl = (Path(__file__).parent / "fixtures" / "serialization_compat" /
+           "reference.r2rml.ttl").read_text(encoding="utf-8")
+    assert _by_summary(ttl) == _by_rdflib(ttl) != {}
+
+
+def test_the_summary_keeps_physical_names_exactly():
+    summary = summarize_r2rml(mapping_to_r2rml(_awkward_config(), _awkward_schema()))
+    thing = next(t for t in summary["tables"] if t["subject"] == "Thing")
+    assert thing["table"] == '"sa#les"."we""ird;t]"'
+    assert {'a;b ]"c#d\\e', "tab\tnew\nline\rcr", "名前", "# not a comment"} <= {
+        c["column"] for c in thing["columns"]}
+    assert thing["joins"][0]["conditions"] == [{"child": "id", "parent": "x"},
+                                               {"child": 'k;e"y', "parent": "y"}]
+
+
+def test_the_summary_carries_what_a_federation_will_not_run():
+    config = _config()
+    config.edges.append(EdgeDefinition(edge_collection="via", from_collection="user_orders",
+                                       to_collection="users", from_fields=["a"], to_fields=["b"]))
+    schema = _schema()
+    schema.tables["users"].primary_key = []
+    notes = summarize_r2rml(mapping_to_r2rml(config, schema))["notes"]
+    assert any("no primary key" in n for n in notes)
+    assert any("computed properties omitted" in n and "total_cents" in n for n in notes)
+    assert any(n.startswith("Skipped edges") for n in notes) and any("via" in n for n in notes)
+
+
+def test_an_empty_document_has_no_tables():
+    assert summarize_r2rml(mapping_to_r2rml(MappingConfig(), Schema())) == {"tables": [], "notes": []}
+
+
+def _emitted() -> str:
+    return mapping_to_r2rml(_config(), _schema())
+
+
+@pytest.mark.parametrize("change", [
+    lambda t: t.replace('rr:tableName "users"', "rr:tableName 'users'"),         # single quotes
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName """users"""'),     # long string
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName "us\\u0065rs"'),    # \\u escape
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName "us\\xers"'),       # unknown escape
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName "us\ners"'),       # raw newline
+    lambda t: t.replace("@prefix rr: <http://www.w3.org/ns/r2rml#>",
+                        "@prefix rr: <http://example.org/other#>"),               # prefix rebound
+    lambda t: t.replace("@prefix xsd:", "@prefix ex: <urn:x> .\n@prefix xsd:"),   # extra prefix
+    lambda t: t.replace("rr:logicalTable [", "rr:sqlQuery [", 1),                 # unknown term
+    lambda t: t.replace("rr:datatype xsd:", "rr:language xsd:", 1),               # unknown term
+    lambda t: t.replace("rr:datatype xsd:integer", "rr:datatype rdf:langString", 1),
+    lambda t: t.replace("rr:subjectMap [", "rr:subjectMap ", 1),                  # unbalanced
+    lambda t: t.replace("    ] .", "    ] ] .", 1),                               # unbalanced
+    lambda t: "    ]\n".join(t.rsplit("    ] .\n", 1)),                            # no final .
+    lambda t: t.replace("    ] .\n", '    ] "stray"\n', 1),                        # not a closing .
+    lambda t: t + "<#User> a rr:TriplesMap .\n",                                  # incomplete
+    lambda t: t + _emitted().split("@prefix xsd:")[1].split("\n", 1)[1],          # defined twice
+    lambda t: t + "trailing",                                                     # trailing content
+    lambda t: t.replace("rr:parentTriplesMap <#User>", "rr:parentTriplesMap <#Nobody>"),
+    lambda t: t.replace("rr:parentTriplesMap <#User>", "rr:parentTriplesMap <http://x/User>"),
+    lambda t: t.replace("<#User>\n", "<http://x/User>\n", 1),                     # outside document
+    lambda t: t.replace("a rr:TriplesMap", "a rr:Other", 1),
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName "users" , "x"'),    # object list
+    lambda t: t.replace('rr:tableName "users"', 'rr:tableName "users" ; rr:tableName "x"'),
+    lambda t: t.replace('rr:tableName "users"', "rr:tableName " + "[ rr:x " * 5000 + '"y"' + " ]" * 5000),
+    lambda t: "",
+])
+def test_the_summary_refuses_anything_else(change):
+    changed = change(_emitted())
+    assert changed != _emitted()
+    with pytest.raises(R2RMLError):
+        summarize_r2rml(changed)
+
+
+def test_a_refusal_names_the_line():
+    ttl = _emitted().replace('rr:tableName "users"', "rr:tableName 'users'")
+    line = next(i for i, text in enumerate(ttl.splitlines(), 1) if "'users'" in text)
+    with pytest.raises(R2RMLError, match=f"line {line}:"):
+        summarize_r2rml(ttl)
+
+
+def _two_tables_on_one_collection() -> tuple[MappingConfig, Schema]:
+    columns = [Column(name="id", data_type="integer")]
+    schema = Schema(tables={name: Table(name=name, primary_key=["id"], columns=columns)
+                            for name in ("a", "b")})
+    return MappingConfig(collections={name: CollectionMapping(
+        source_table=name, target_collection="shared") for name in ("a", "b")}), schema
+
+
+def test_a_map_the_emitter_writes_twice_is_refused_not_merged():
+    """Valid Turtle, but one TriplesMap with two logical tables, which R2RML does not allow."""
+    ttl = mapping_to_r2rml(*_two_tables_on_one_collection())
+    g = _parse(ttl)
+    maps = list(g.subjects(RDF.type, RR.TriplesMap))
+    assert len(set(maps)) == 1
+    assert len(list(g.objects(maps[0], RR.logicalTable))) == 2
+    assert len(list(g.objects(maps[0], RR.subjectMap))) == 2
+    with pytest.raises(R2RMLError, match=r"<#Shared> is written more than once.*allows one"):
+        summarize_r2rml(ttl)

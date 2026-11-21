@@ -19,7 +19,7 @@ forward-CSI emitter in :mod:`r2g.csi`.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .types import MappingConfig, Schema, Table
 
@@ -368,3 +368,185 @@ def mapping_to_r2rml(
         lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+# --- reading back what mapping_to_r2rml wrote --------------------------------------------
+
+_TTL_TOKEN = re.compile(
+    r"""(?P<space>\s+)
+    |(?P<comment>\#[^\n]*)
+    |(?P<string>"(?:[^"\\\n]|\\[\\"nrt])*")
+    |(?P<iri><[^<>\s]*>)
+    |(?P<directive>@prefix\b)
+    |(?P<name>[A-Za-z]+:[A-Za-z]*|a(?=\s))
+    |(?P<punct>[\[\];.])""",
+    re.VERBOSE,
+)
+_TTL_ESCAPES = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}
+#: The deepest ``[ ]`` the emitter writes: map > predicate-object > object > join condition.
+_TTL_MAX_DEPTH = 3
+
+# What each node may hold: predicate -> (kind of object, how many: "1", "?" or "*").
+_TRIPLES_MAP = {
+    "a": ("name", "1"),
+    "rr:logicalTable": ("node", "1"),
+    "rr:subjectMap": ("node", "1"),
+    "rr:predicateObjectMap": ("node", "*"),
+}
+_LOGICAL_TABLE = {"rr:tableName": ("string", "1")}
+_SUBJECT_MAP = {"rr:template": ("string", "1"), "rr:class": ("iri", "1")}
+_PREDICATE_OBJECT = {"rr:predicate": ("iri", "1"), "rr:objectMap": ("node", "1")}
+_COLUMN_OBJECT = {"rr:column": ("string", "1"), "rr:datatype": ("name", "?")}
+_JOIN_OBJECT = {"rr:parentTriplesMap": ("iri", "1"), "rr:joinCondition": ("node", "*")}
+_JOIN_CONDITION = {"rr:child": ("string", "1"), "rr:parent": ("string", "1")}
+
+
+def _ttl_tokens(text: str) -> Tuple[List[Tuple[str, str, int]], List[str]]:
+    """(kind, text, line) of each token, and r2g's notes among the comments."""
+    tokens: List[Tuple[str, str, int]] = []
+    notes: List[str] = []
+    position, line = 0, 1
+    while position < len(text):
+        match = _TTL_TOKEN.match(text, position)
+        if match is None:
+            raise R2RMLError(f"line {line}: not r2g's R2RML at {text[position:position + 20]!r}")
+        kind, value = str(match.lastgroup), match.group()
+        if kind == "comment" and value.startswith(("# NOTE:", "# Skipped edges", "#   ")):
+            notes.append(value.lstrip("# "))
+        elif kind not in ("space", "comment"):
+            tokens.append((kind, value, line))
+        line += value.count("\n")
+        position = match.end()
+    return tokens, notes
+
+
+def _ttl_node(node: Tuple[List[Any], int], shape: Dict[str, Tuple[str, str]]) -> Dict[str, Any]:
+    """A parsed node's values by predicate, refusing anything ``shape`` does not allow."""
+    pairs, line = node
+    found: Dict[str, List[Any]] = {}
+    for verb, kind, value, at in pairs:
+        if verb not in shape or shape[verb][0] != kind:
+            raise R2RMLError(f"line {at}: unexpected {verb} ({kind})")
+        found.setdefault(verb, []).append(value)
+    out: Dict[str, Any] = {}
+    for verb, (_, count) in shape.items():
+        values = found.get(verb, [])
+        if count == "*":
+            out[verb] = values
+        elif len(values) > 1 or (count == "1" and not values):
+            raise R2RMLError(f"line {line}: expected one {verb}, found {len(values)}")
+        else:
+            out[verb] = values[0] if values else None
+    return out
+
+
+def _ttl_object_entry(predicate: str, node: Tuple[List[Any], int]) -> Tuple[str, Dict[str, Any]]:
+    """A predicate-object map as a ``columns`` or ``joins`` entry."""
+    pairs, line = node
+    if any(verb == "rr:parentTriplesMap" for verb, *_ in pairs):
+        join = _ttl_node(node, _JOIN_OBJECT)
+        parent = join["rr:parentTriplesMap"]
+        if not parent.startswith("#"):
+            raise R2RMLError(f"line {line}: parent map {parent!r} is not in this document")
+        conditions = [_ttl_node(c, _JOIN_CONDITION) for c in join["rr:joinCondition"]]
+        return "joins", {"predicate": predicate, "parent": parent[1:], "conditions": [
+            {"child": c["rr:child"], "parent": c["rr:parent"]} for c in conditions]}
+    column = _ttl_node(node, _COLUMN_OBJECT)
+    datatype = column["rr:datatype"]
+    if datatype is not None and not datatype.startswith("xsd:"):
+        raise R2RMLError(f"line {line}: unexpected datatype {datatype}")
+    return "columns", {"column": column["rr:column"], "predicate": predicate, "datatype": datatype}
+
+
+def summarize_r2rml(text: str) -> Dict[str, Any]:
+    """The tables, columns and joins of a document :func:`mapping_to_r2rml` wrote.
+
+    This reads that emitter's output and nothing wider, so r2g needs no RDF library at
+    runtime. Anything else, even valid Turtle, raises :class:`R2RMLError`.
+    """
+    tokens, notes = _ttl_tokens(text)
+    prefixes = [t[:2] for t in _ttl_tokens(_PREFIXES)[0]]
+    if [t[:2] for t in tokens[:len(prefixes)]] != prefixes:
+        raise R2RMLError("line 1: not r2g's R2RML prefixes")
+    position = len(prefixes)
+
+    def take() -> Tuple[str, str, int]:
+        nonlocal position
+        if position >= len(tokens):
+            raise R2RMLError("the document ends early")
+        position += 1
+        return tokens[position - 1]
+
+    def pairs(depth: int) -> List[Tuple[str, str, Any, int]]:
+        """``verb object (; verb object)* ;?``, up to the closing token (not consumed)."""
+        out: List[Tuple[str, str, Any, int]] = []
+        while True:
+            kind, verb, line = take()
+            if kind != "name":
+                raise R2RMLError(f"line {line}: expected a predicate, found {verb!r}")
+            kind, value, at = take()
+            parsed: Any
+            if value == "[" and kind == "punct":
+                if depth >= _TTL_MAX_DEPTH:
+                    raise R2RMLError(f"line {at}: nested too deeply")
+                parsed = (pairs(depth + 1), at)
+                closing = take()
+                if closing[1] != "]":
+                    raise R2RMLError(f"line {closing[2]}: expected ]")
+                kind = "node"
+            elif kind == "string":
+                parsed = re.sub(r"\\(.)", lambda m: _TTL_ESCAPES[m.group(1)], value[1:-1])
+            elif kind == "iri":
+                parsed = value[1:-1]
+            elif kind == "name":
+                parsed = value
+            else:
+                raise R2RMLError(f"line {at}: unexpected {value!r}")
+            out.append((verb, kind, parsed, line))
+            if position >= len(tokens) or tokens[position][1] != ";":
+                return out
+            take()
+            if position < len(tokens) and tokens[position][1] in ("]", "."):
+                return out
+
+    tables: List[Dict[str, Any]] = []
+    while position < len(tokens):
+        kind, subject, line = take()
+        if kind != "iri" or not subject.startswith("<#") or len(subject) == 3:
+            raise R2RMLError(f"line {line}: expected a <#TriplesMap>, found {subject!r}")
+        triples_map = _ttl_node((pairs(0), line), _TRIPLES_MAP)
+        closing = take()
+        if closing[1] != ".":
+            raise R2RMLError(f"line {closing[2]}: expected .")
+        if triples_map["a"] != "rr:TriplesMap":
+            raise R2RMLError(f"line {line}: not a rr:TriplesMap")
+        table = _ttl_node(triples_map["rr:logicalTable"], _LOGICAL_TABLE)
+        subject_map = _ttl_node(triples_map["rr:subjectMap"], _SUBJECT_MAP)
+        entry: Dict[str, Any] = {
+            "subject": subject[2:-1],
+            "table": table["rr:tableName"],
+            "template": subject_map["rr:template"],
+            "class": subject_map["rr:class"],
+            "columns": [],
+            "joins": [],
+        }
+        for node in triples_map["rr:predicateObjectMap"]:
+            predicate_object = _ttl_node(node, _PREDICATE_OBJECT)
+            where, item = _ttl_object_entry(predicate_object["rr:predicate"],
+                                            predicate_object["rr:objectMap"])
+            entry[where].append(item)
+        tables.append(entry)
+
+    subjects = [t["subject"] for t in tables]
+    repeated = sorted({s for s in subjects if subjects.count(s) > 1})
+    if repeated:
+        # Valid Turtle, but its statements are one map with several logical tables and subject
+        # maps. R2RML allows one of each, and no single table could be reported for it.
+        raise R2RMLError(
+            f"TriplesMap <#{repeated[0]}> is written more than once, which gives it several "
+            "logical tables where R2RML allows one")
+    for entry in tables:
+        for join in entry["joins"]:
+            if join["parent"] not in subjects:
+                raise R2RMLError(f"{entry['subject']} joins to unknown map {join['parent']!r}")
+    return {"tables": tables, "notes": notes}

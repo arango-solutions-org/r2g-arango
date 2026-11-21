@@ -1561,6 +1561,21 @@ def create_app(
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/api/projects/{name}/exports")
+    async def get_project_exports(name: str):
+        """The CSI and R2RML saved for this project and their status. Never generates them."""
+        from r2g.project_exports import read_project_exports
+
+        project = catalog.get_project(name)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project '{name}' not found")
+        try:
+            body = await run_in_threadpool(read_project_exports, catalog, project)
+        except OSError:
+            logger.exception("project_exports_read_failed", project=name)
+            raise HTTPException(status_code=500, detail="Could not read this project's exports")
+        return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
     @app.get("/api/projects/{name}/history")
     async def get_project_history(name: str, limit: int = 20):
         records = catalog.get_history(project_name=name, limit=limit)
