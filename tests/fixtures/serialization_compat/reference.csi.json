@@ -1,0 +1,128 @@
+{
+  "csiVersion": "1",
+  "conceptualModel": {
+    "entities": [
+      {
+        "name": "User",
+        "labels": [
+          "User"
+        ],
+        "properties": [
+          {
+            "name": "userUserId"
+          },
+          {
+            "name": "emailAddress"
+          },
+          {
+            "name": "fullName"
+          },
+          {
+            "name": "createdAt"
+          }
+        ]
+      },
+      {
+        "name": "Order",
+        "labels": [
+          "Order"
+        ],
+        "properties": [
+          {
+            "name": "id"
+          },
+          {
+            "name": "orderUserId"
+          },
+          {
+            "name": "total"
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "type": "placed",
+        "fromEntity": "User",
+        "toEntity": "Order"
+      },
+      {
+        "type": "shippedItem",
+        "fromEntity": "Shipment",
+        "toEntity": "OrderItem"
+      }
+    ]
+  },
+  "arangoPhysicalMapping": {
+    "entities": {
+      "User": {
+        "style": "COLLECTION",
+        "collectionName": "User",
+        "properties": {
+          "userUserId": {
+            "field": "user_id"
+          },
+          "emailAddress": {
+            "field": "emailAddress"
+          },
+          "fullName": {
+            "field": "fullName"
+          },
+          "createdAt": {
+            "field": "created_at"
+          }
+        }
+      },
+      "Order": {
+        "style": "COLLECTION",
+        "collectionName": "Order",
+        "properties": {
+          "id": {
+            "field": "id"
+          },
+          "orderUserId": {
+            "field": "user_id"
+          },
+          "total": {
+            "field": "total"
+          }
+        }
+      }
+    },
+    "relationships": {
+      "placed": {
+        "style": "DEDICATED_COLLECTION",
+        "edgeCollectionName": "placed"
+      },
+      "shippedItem": {
+        "style": "DEDICATED_COLLECTION",
+        "edgeCollectionName": "shipped_item"
+      }
+    }
+  },
+  "provenance": {
+    "producer": "r2g",
+    "producerVersion": "<stable>",
+    "direction": "forward",
+    "source": {
+      "kind": "relational",
+      "ref": "commerce",
+      "fingerprint": null
+    },
+    "generatedAt": "<stable>",
+    "labelCollisions": [
+      {
+        "label": "userId",
+        "entities": [
+          "Order",
+          "User"
+        ],
+        "resolution": "qualified",
+        "renamedTo": {
+          "Order": "orderUserId",
+          "User": "userUserId"
+        }
+      }
+    ]
+  }
+}
