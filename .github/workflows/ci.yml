@@ -41,6 +41,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # tests/test_mapping_terms.py runs the Studio canvas's JavaScript under node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install dependencies
         # [all] pulls in every optional connector/UI/MCP extra so the full test
         # suite can import them; [test] adds pytest/pytest-cov.
