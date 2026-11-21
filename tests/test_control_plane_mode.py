@@ -134,6 +134,33 @@ class TestTheControlPlanesOwnReads:
         assert r.status_code == 503
 
 
+class TestTheExportsRead:
+    """#54: the saved exports are a project's read, behind the same gate as its mapping."""
+
+    path = "/api/projects/customer-360/exports"
+
+    def test_a_users_context_reads_the_project_it_opens(self, governed):
+        response = governed.get(self.path, headers=bearer())
+        assert response.status_code == 200 and response.json()["project"] == "customer-360"
+
+    @pytest.mark.parametrize("token, status", [
+        (None, 401), ("forged", 401), (OTHER_TENANT, 403), (UNAVAILABLE, 503),
+        (SERVICE, 401),   # the service token reads graph-data and nothing else
+    ])
+    def test_anyone_else_is_refused(self, governed, token, status):
+        headers = bearer(token) if token else {}
+        assert governed.get(self.path, headers=headers).status_code == status
+
+    def test_another_project_is_not_found(self, governed):
+        assert governed.get("/api/projects/someone-elses/exports",
+                            headers=bearer()).status_code == 404
+
+    @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+    def test_it_cannot_be_written(self, governed, method):
+        response = getattr(governed, method)(self.path, headers=bearer())
+        assert response.status_code == 403
+
+
 class TestMode:
     def test_the_page_learns_the_mode_before_it_has_a_context(self, governed):
         assert governed.get("/api/mode").json() == {"control_plane": True, "home": "/"}

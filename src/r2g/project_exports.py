@@ -4,21 +4,27 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import jsonschema
 import yaml
 from pydantic import ValidationError
 
 from r2g import __version__, control_plane
-from r2g.catalog import Catalog, CatalogManager
+from r2g.catalog import Catalog, CatalogManager, Project
 from r2g.config import ConfigManager
+from r2g.csi import validate_csi
 from r2g.curated_labels import load_curated_labels
 from r2g.governed import _write_atomically
+from r2g.log import get_logger
+from r2g.r2rml import R2RMLError, summarize_r2rml
 from r2g.security import ENC_PREFIX, SECRET_ENV, SECRET_FILENAME
 from r2g.types import MappingConfig, Schema
 
@@ -30,6 +36,16 @@ ARTIFACTS = {
 RECEIPT_FORMAT = 1
 #: Readable by the writer and the project directory's group, never by everyone.
 PUBLISHED_MODE = 0o640
+#: The largest export the Studio reads, unless ``R2G_EXPORT_MAX_BYTES`` says otherwise.
+DEFAULT_MAX_EXPORT_BYTES = 10 * 1024 * 1024
+_RECEIPT_FIELDS = frozenset({
+    "format_version", "project", "tenant", "kind", "artifact_sha256", "mapping_sha256",
+    "schema_sha256", "snapshot_id", "generated_at", "r2g_version", "options",
+})
+#: CSI's provenance stamps that a catalog snapshot does not keep.
+_BITEMPORAL_FIELDS = ("transactionTime", "validTime", "validTimeSource", "predecessorFingerprint")
+
+logger = get_logger(__name__)
 
 
 class ProjectExportError(ValueError):
@@ -88,7 +104,7 @@ def resolve_project_export(name: str) -> ProjectExport:
         config=config,
         mapping_sha256=mapping_sha256,
         schema=snapshot.schema_data,
-        schema_sha256=hashlib.sha256(snapshot.schema_data.model_dump_json().encode()).hexdigest(),
+        schema_sha256=_schema_sha256(snapshot.schema_data),
         snapshot_id=snapshot.id,
         source_type=source.source_type,
         tenant=os.environ["R2G_TENANT"].strip() if control_plane.mode() else None,
@@ -186,6 +202,224 @@ def read_curated_labels(path: str) -> tuple[dict[str, Any], str]:
     if not unchanged:
         raise ProjectExportError(f"The curated labels at {path} changed while read; try again")
     return labels, hashlib.sha256(raw).hexdigest()
+
+
+def read_project_exports(catalog: CatalogManager, project: Project) -> dict[str, Any]:
+    """What is saved for this project and how far it can be trusted. Reads only: it never
+    generates an export, and returns no filesystem path or operating-system error text."""
+    directory = catalog.dir.expanduser() / "projects" / project.name
+    limit = _max_export_bytes()
+    tenant = os.environ.get("R2G_TENANT", "").strip() if control_plane.mode() else None
+    current = _current_inputs(catalog, project)
+    csi, r2rml = (_read_artifact(kind, directory, project.name, tenant, current, limit)
+                  for kind in ("csi", "r2rml"))
+    trusted = all(e["status"] in ("current", "stale") for e in (csi, r2rml))
+    same_inputs = same_labels = None
+    if trusted:
+        same_inputs = all(csi["receipt"][f] == r2rml["receipt"][f]
+                          for f in ("mapping_sha256", "schema_sha256"))
+        same_labels = (csi["receipt"]["options"].get("curated_labels_sha256")
+                       == r2rml["receipt"]["options"].get("curated_labels_sha256"))
+    return {
+        "project": project.name,
+        "state": _overall_state(csi["status"], r2rml["status"], same_inputs, same_labels),
+        "same_inputs": same_inputs,
+        "same_curated_labels": same_labels,
+        "current": current,
+        "csi": csi,
+        "r2rml": r2rml,
+        "comparison": _compare(csi, r2rml, same_inputs, same_labels),
+    }
+
+
+def _overall_state(csi: str, r2rml: str, same_inputs: bool | None, same_labels: bool | None) -> str:
+    if "unreadable" in (csi, r2rml):
+        return "attention"
+    if csi == r2rml == "missing":
+        return "none"
+    if "missing" in (csi, r2rml):
+        return "partial"
+    return "complete" if csi == r2rml == "current" and same_inputs and same_labels else "attention"
+
+
+def _current_inputs(catalog: CatalogManager, project: Project) -> dict[str, str | None]:
+    """The hashes an export must match. One that cannot be read is ``None``, so nothing
+    is reported as current against it."""
+    mapping_sha256 = None
+    path = Path(project.mapping_config_path)
+    if path.is_absolute():
+        try:
+            mapping_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            logger.warning("export_mapping_unreadable", project=project.name)
+    snapshot = catalog.get_latest_snapshot(project.source_name)
+    return {
+        "mapping_sha256": mapping_sha256,
+        "schema_sha256": _schema_sha256(snapshot.schema_data) if snapshot else None,
+        "snapshot_id": snapshot.id if snapshot else None,
+    }
+
+
+def _read_artifact(kind: str, directory: Path, project: str, tenant: str | None,
+                   current: dict[str, str | None], limit: int) -> dict[str, Any]:
+    name, receipt_name = ARTIFACTS[kind]
+    entry: dict[str, Any] = {"status": "missing", "reasons": [], "receipt": None,
+                             "content": None, "structure": None}
+    state, raw = _read_file(directory, name, limit)
+    if raw is None:
+        entry["status"] = state
+        return entry
+    try:
+        entry["content"] = raw.decode("utf-8")
+        entry["structure"] = (_csi_structure(entry["content"]) if kind == "csi"
+                              else summarize_r2rml(entry["content"]))
+    except UnicodeDecodeError:
+        return {**entry, "status": "malformed", "reasons": ["not_utf8"]}
+    except R2RMLError as exc:
+        return {**entry, "status": "malformed", "reasons": [f"invalid_r2rml: {exc}"]}
+    except (ValueError, RecursionError, jsonschema.ValidationError):
+        return {**entry, "status": "malformed", "reasons": ["invalid_csi"]}
+    if kind == "csi":
+        document = json.loads(entry["content"])["provenance"]
+        missing = [f for f in _BITEMPORAL_FIELDS if document.get(f) is None]
+        entry["bitemporal"] = {"status": "unavailable" if missing else "available",
+                               "fields": missing}
+
+    receipt_state, receipt_raw = _read_file(directory, receipt_name, limit)
+    receipt, problem = _verified_receipt(receipt_state, receipt_raw, kind, project, tenant, raw)
+    if receipt is None:
+        return {**entry, "status": "unverified", "reasons": [problem]}
+    entry["receipt"] = receipt
+    entry["reasons"] = [
+        f"{what}_changed" for what, key in (("mapping", "mapping_sha256"), ("schema", "schema_sha256"))
+        if receipt[key] != current[key]]
+    entry["status"] = "stale" if entry["reasons"] else "current"
+    return entry
+
+
+def _read_file(directory: Path, name: str, limit: int) -> tuple[str, bytes | None]:
+    """``("ok", bytes)``, or why not. Nothing is resolved first, so a symlink is never read."""
+    path = directory / name
+    try:
+        if not stat.S_ISDIR(os.lstat(directory).st_mode):
+            return "malformed", None
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return "malformed", None
+        if info.st_size > limit:
+            return "too_large", None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return "malformed", None
+            raw = f.read(limit + 1)
+    except FileNotFoundError:
+        return "missing", None
+    except PermissionError:
+        return "unreadable", None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return "malformed", None
+        raise
+    return ("too_large", None) if len(raw) > limit else ("ok", raw)
+
+
+def _verified_receipt(state: str, raw: bytes | None, kind: str, project: str, tenant: str | None,
+                      artifact: bytes) -> tuple[dict[str, Any] | None, str]:
+    """The receipt if it vouches for exactly these bytes, else why it does not."""
+    if raw is None:
+        return None, {"missing": "receipt_missing",
+                      "unreadable": "receipt_unreadable"}.get(state, "receipt_invalid")
+    try:
+        receipt = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None, "receipt_invalid"
+    if (not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS
+            or receipt["format_version"] != RECEIPT_FORMAT or receipt["kind"] != kind
+            or not isinstance(receipt["options"], dict)):
+        return None, "receipt_invalid"
+    if receipt["project"] != project:
+        return None, "project_mismatch"
+    if receipt["tenant"] != tenant:
+        return None, "tenant_mismatch"
+    if receipt["artifact_sha256"] != hashlib.sha256(artifact).hexdigest():
+        return None, "artifact_changed"
+    return receipt, ""
+
+
+def _csi_structure(text: str) -> dict[str, Any]:
+    document = json.loads(text)
+    validate_csi(document)
+    model, physical = document["conceptualModel"], document["arangoPhysicalMapping"]
+    entities = []
+    for entity in model["entities"]:
+        spec = physical["entities"].get(entity["name"], {})
+        fields = spec.get("properties", {})
+        entities.append({
+            "name": entity["name"],
+            "collection": spec.get("collectionName"),
+            "properties": [
+                {"name": p["name"],
+                 "field": fields.get(p["name"], {}).get("field", fields.get(p["name"], {}).get("path"))}
+                for p in entity.get("properties", [])],
+        })
+    relationships = [
+        {"type": r["type"], "from": r["fromEntity"], "to": r["toEntity"],
+         "edge_collection": physical["relationships"].get(r["type"], {}).get("edgeCollectionName")}
+        for r in model["relationships"]]
+    return {"entities": entities, "relationships": relationships,
+            "join_keys": model.get("joinKeys", [])}
+
+
+def _compare(csi: dict[str, Any], r2rml: dict[str, Any], same_inputs: bool | None,
+             same_labels: bool | None) -> dict[str, Any]:
+    """Which classes and property names only one export has. Without one mapping, schema and
+    set of curated labels behind both, a difference would say nothing, so none is claimed.
+    Properties are listed, never paired: the two exports share no identity for a column."""
+    reason = ("an export is not verified" if same_inputs is None
+              else "the exports came from different inputs" if not same_inputs
+              else "the exports used different curated labels" if not same_labels else None)
+    if reason is not None:
+        return {"status": "not_comparable", "reason": reason, "classes": None, "properties": None}
+    base = r2rml["receipt"]["options"].get("concept_base", "")
+
+    def local(iri: str) -> str:
+        return iri[len(base):] if base and iri.startswith(base) else iri
+
+    csi_classes = {e["name"]: {p["name"] for p in e["properties"]}
+                   for e in csi["structure"]["entities"]}
+    r2rml_classes = {local(t["class"]): {local(c["predicate"]) for c in t["columns"]}
+                     for t in r2rml["structure"]["tables"]}
+    paired = sorted(csi_classes.keys() & r2rml_classes.keys())
+    properties = []
+    for name in paired:
+        csi_only, r2rml_only = (sorted(csi_classes[name] - r2rml_classes[name]),
+                                sorted(r2rml_classes[name] - csi_classes[name]))
+        if csi_only or r2rml_only:
+            properties.append({"class": name, "csi_only": csi_only, "r2rml_only": r2rml_only})
+    return {
+        "status": "comparable",
+        "reason": None,
+        "classes": {"paired": paired, "csi_only": sorted(csi_classes.keys() - r2rml_classes.keys()),
+                    "r2rml_only": sorted(r2rml_classes.keys() - csi_classes.keys())},
+        "properties": properties,
+    }
+
+
+def _max_export_bytes() -> int:
+    configured = os.environ.get("R2G_EXPORT_MAX_BYTES", "").strip()
+    if configured:
+        try:
+            if (limit := int(configured)) > 0:
+                return limit
+        except ValueError:
+            pass
+        logger.warning("export_max_bytes_invalid", value=configured)
+    return DEFAULT_MAX_EXPORT_BYTES
+
+
+def _schema_sha256(schema: Schema) -> str:
+    return hashlib.sha256(schema.model_dump_json().encode()).hexdigest()
 
 
 def _catalog_dir() -> Path:

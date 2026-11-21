@@ -24,11 +24,12 @@ from typing import Any
 
 import pytest
 from cryptography.fernet import Fernet
+from fastapi.testclient import TestClient
 from test_serialization_compat import _REGEN, FIXTURES, MAPPING_GOLDEN, SCHEMA_GOLDEN
 from typer.testing import CliRunner
 
 import r2g
-from r2g import project_exports
+from r2g import control_plane, project_exports
 from r2g.catalog import CatalogManager
 from r2g.config import ConfigManager
 from r2g.csi import validate_csi
@@ -43,6 +44,7 @@ from r2g.project_exports import (
 )
 from r2g.security import ENC_PREFIX, SECRET_FILENAME, SecretKeyError
 from r2g.types import Column, ForeignKey, MappingConfig, Schema, Table
+from r2g.ui.server import create_app
 
 #: command -> (its default --output, its golden file)
 COMMANDS = {
@@ -63,6 +65,20 @@ def _reset_structlog():
         wrapper_class=structlog.make_filtering_bound_logger(0),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
     )
+
+
+@pytest.fixture(autouse=True)
+def _log_to_stderr_uncached(monkeypatch):
+    """Keep the CLI from pointing loggers at CliRunner's stream, which closes: these tests go
+    on to use the catalog and the API after an export."""
+    import structlog
+
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(0),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=False,
+    )
+    monkeypatch.setattr("r2g.main.setup_logging", lambda *_args, **_kwargs: None)
 
 
 def _stable(text: str) -> str:
@@ -833,3 +849,409 @@ def test_labels_changed_while_read_are_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(project_exports, "load_curated_labels", changed_meanwhile)
     with pytest.raises(ProjectExportError, match="changed while"):
         project_exports.read_curated_labels(str(labels))
+
+
+# --- GET /api/projects/{name}/exports ---------------------------------------------------------
+
+
+@pytest.fixture
+def api(shop, monkeypatch) -> TestClient:
+    monkeypatch.delenv("R2G_API_TOKEN", raising=False)
+    monkeypatch.delenv("R2G_EXPORT_MAX_BYTES", raising=False)
+    return TestClient(create_app(catalog_dir=str(shop.dir)))
+
+
+def _read(api: TestClient) -> dict[str, Any]:
+    response = api.get("/api/projects/shop/exports")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _export_both(*args: str) -> None:
+    for kind in ARTIFACTS:
+        result = _project(kind, *args)
+        assert result.exit_code == 0, result.output
+
+
+def _labels_file(tmp_path: Path, name: str, label: str) -> str:
+    path = tmp_path / name
+    path.write_text(json.dumps({"curatedLabelsVersion": "1", "entities": [
+        {"name": "User", "label": label}]}), encoding="utf-8")
+    return str(path)
+
+
+def test_nothing_exported_reads_as_none(api):
+    body = _read(api)
+    assert body["state"] == "none" and body["same_inputs"] is None
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "missing"
+    assert body["comparison"]["status"] == "not_comparable"
+
+
+def test_a_project_without_a_directory_reads_as_none(shop, api):
+    moved = _files(shop).with_name("moved")
+    _files(shop).rename(moved)
+    assert _read(api)["state"] == "none"
+
+
+@pytest.mark.parametrize("kind, other", [("csi", "r2rml"), ("r2rml", "csi")])
+def test_one_export_reads_as_partial(shop, api, kind, other):
+    assert _project(kind).exit_code == 0
+    body = _read(api)
+    assert body["state"] == "partial"
+    assert body[kind]["status"] == "current" and body[other]["status"] == "missing"
+
+
+def test_both_exports_read_as_complete_with_their_exact_content(shop, api):
+    _export_both()
+    response = api.get("/api/projects/shop/exports")
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["state"] == "complete" and body["same_inputs"] and body["same_curated_labels"]
+    for kind, (name, _) in ARTIFACTS.items():
+        assert body[kind]["status"] == "current"
+        assert body[kind]["content"] == (_files(shop) / name).read_text(encoding="utf-8")
+        assert body[kind]["receipt"] == _receipt(shop, kind)
+    assert body["current"]["snapshot_id"] == shop.get_latest_snapshot("src").id
+
+
+def test_the_structure_holds_the_tables_and_columns_of_both(shop, api):
+    _export_both()
+    body = _read(api)
+    tables = {t["table"]: t for t in body["r2rml"]["structure"]["tables"]}
+    assert set(tables) == {"users", "orders"}
+    assert {c["column"] for c in tables["orders"]["columns"]} == {"id", "user_id"}
+    assert tables["orders"]["joins"][0]["conditions"] == [{"child": "user_id", "parent": "id"}]
+    entities = {e["name"]: e for e in body["csi"]["structure"]["entities"]}
+    assert set(entities) == {"User", "Order"} and entities["Order"]["collection"] == "orders"
+    assert {p["field"] for p in entities["Order"]["properties"]} == {"id", "user_id"}
+    assert body["csi"]["structure"]["relationships"][0]["edge_collection"] == "placed"
+
+
+def test_bitemporal_stamps_are_reported_as_unavailable(shop, api):
+    _export_both()
+    assert _read(api)["csi"]["bitemporal"] == {
+        "status": "unavailable",
+        "fields": ["transactionTime", "validTime", "validTimeSource", "predecessorFingerprint"]}
+
+
+def test_a_changed_mapping_reads_as_stale(shop, api):
+    _export_both()
+    path = _mapping_path(shop)
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    body = _read(api)
+    assert body["state"] == "attention" and body["same_inputs"] is True
+    for kind in ARTIFACTS:
+        assert (body[kind]["status"], body[kind]["reasons"]) == ("stale", ["mapping_changed"])
+
+
+def test_a_new_snapshot_with_another_schema_reads_as_stale(shop, api):
+    _export_both()
+    shop.create_snapshot("src", _shop_schema("added_later"))
+    body = _read(api)
+    assert body["csi"]["reasons"] == body["r2rml"]["reasons"] == ["schema_changed"]
+
+
+def test_a_snapshot_changed_in_place_reads_as_stale(shop, api):
+    _export_both()
+    snapshot = shop.get_latest_snapshot("src")
+    shop.update_snapshot_schema(snapshot.id, _shop_schema("changed_in_place"))
+    body = _read(api)
+    assert body["current"]["snapshot_id"] == body["csi"]["receipt"]["snapshot_id"]
+    assert body["csi"]["status"] == "stale" and body["state"] == "attention"
+
+
+def test_the_same_schema_under_a_new_snapshot_stays_current(shop, api):
+    _export_both()
+    old = shop.get_latest_snapshot("src").id
+    new = shop.create_snapshot("src", _shop_schema()).id
+    body = _read(api)
+    assert body["state"] == "complete"
+    assert body["csi"]["receipt"]["snapshot_id"] == old and body["current"]["snapshot_id"] == new
+
+
+def test_exports_from_different_inputs_are_not_complete_or_compared(shop, api):
+    assert _project("csi").exit_code == 0
+    shop.create_snapshot("src", _shop_schema("added_later"))
+    assert _project("r2rml").exit_code == 0
+    body = _read(api)
+    assert body["state"] == "attention" and body["same_inputs"] is False
+    assert body["comparison"] == {"status": "not_comparable", "classes": None, "properties": None,
+                                  "reason": "the exports came from different inputs"}
+
+
+def test_different_curated_labels_are_not_complete_or_compared(shop, api, tmp_path):
+    assert _project("csi", "--curated-labels", _labels_file(tmp_path, "a", "Customer")).exit_code == 0
+    assert _project("r2rml", "--curated-labels", _labels_file(tmp_path, "b", "Client")).exit_code == 0
+    body = _read(api)
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "current"
+    assert body["same_inputs"] is True and body["same_curated_labels"] is False
+    assert body["state"] == "attention" and body["comparison"]["status"] == "not_comparable"
+
+
+def test_one_side_with_curated_labels_is_not_complete(shop, api, tmp_path):
+    assert _project("csi", "--curated-labels", _labels_file(tmp_path, "a", "Customer")).exit_code == 0
+    assert _project("r2rml").exit_code == 0
+    assert _read(api)["state"] == "attention"
+
+
+def test_the_same_curated_labels_are_complete_and_pair_the_renamed_class(shop, api, tmp_path):
+    _export_both("--curated-labels", _labels_file(tmp_path, "a", "Customer"))
+    body = _read(api)
+    assert body["state"] == "complete"
+    assert body["comparison"]["classes"]["paired"] == ["Customer", "Order"]
+
+
+def test_issue_17_is_shown_without_pairing_properties(shop, api):
+    schema = _shop_schema("status")
+    schema.tables["orders"].columns.append(Column(name="status", data_type="text"))
+    shop.create_snapshot("src", schema)
+    _export_both()
+    comparison = _read(api)["comparison"]
+    assert comparison["status"] == "comparable"
+    assert comparison["classes"] == {"paired": ["Order", "User"], "csi_only": [], "r2rml_only": []}
+    assert {"class": "Order", "csi_only": ["orderStatus"], "r2rml_only": ["status"]} in comparison["properties"]
+    assert {"class": "User", "csi_only": ["userStatus"], "r2rml_only": ["status"]} in comparison["properties"]
+
+
+def test_a_custom_concept_base_without_a_hash_still_pairs_classes(shop, api):
+    assert _project("csi").exit_code == 0
+    assert _project("r2rml", "--concept-base", "urn:ex:onto/").exit_code == 0
+    assert _read(api)["comparison"]["classes"]["paired"] == ["Order", "User"]
+
+
+def test_a_class_on_one_side_is_in_that_sides_list_only():
+    entry = {"receipt": {"options": {"concept_base": "urn:c:"}}}
+    csi = {**entry, "structure": {"entities": [
+        {"name": "Both", "properties": []}, {"name": "OnlyCsi", "properties": []}]}}
+    r2rml = {**entry, "structure": {"tables": [
+        {"class": "urn:c:Both", "columns": []}, {"class": "urn:c:OnlyR2rml", "columns": []},
+        {"class": "urn:other:Both", "columns": []}]}}
+    assert project_exports._compare(csi, r2rml, True, True)["classes"] == {
+        "paired": ["Both"], "csi_only": ["OnlyCsi"], "r2rml_only": ["OnlyR2rml", "urn:other:Both"]}
+
+
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_changed_artifact_reads_as_unverified(shop, api, kind):
+    _export_both()
+    path = _files(shop) / ARTIFACTS[kind][0]
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    body = _read(api)
+    assert (body[kind]["status"], body[kind]["reasons"]) == ("unverified", ["artifact_changed"])
+    assert body[kind]["receipt"] is None and body[kind]["content"] is not None
+    assert body["state"] == "attention" and body["same_inputs"] is None
+    assert body["comparison"]["status"] == "not_comparable"
+
+
+@pytest.mark.parametrize("change, reason", [
+    (None, "receipt_missing"),
+    ("{not json", "receipt_invalid"),
+    ("[]", "receipt_invalid"),
+    ({"unknown": 1}, "receipt_invalid"),
+    ({"format_version": 2}, "receipt_invalid"),
+    ({"kind": "other"}, "receipt_invalid"),
+    ({"options": "x"}, "receipt_invalid"),
+    ({"project": "other"}, "project_mismatch"),
+    ({"tenant": "other"}, "tenant_mismatch"),
+])
+def test_a_receipt_that_cannot_vouch_reads_as_unverified(shop, api, change, reason):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["csi"][1]
+    if change is None:
+        path.unlink()
+    elif isinstance(change, str):
+        path.write_text(change, encoding="utf-8")
+    else:
+        path.write_text(json.dumps({**_receipt(shop), **change}), encoding="utf-8")
+    entry = _read(api)["csi"]
+    assert (entry["status"], entry["reasons"], entry["receipt"]) == ("unverified", [reason], None)
+
+
+@pytest.mark.parametrize("kind, content, reason", [
+    ("csi", b"{not json", "invalid_csi"),
+    ("csi", b'{"csiVersion": "1"}', "invalid_csi"),
+    ("csi", b"[" * 100000, "invalid_csi"),
+    ("csi", b"\xff\xfe", "not_utf8"),
+    ("r2rml", b"not turtle", "invalid_r2rml"),
+    ("r2rml", b"\xff\xfe", "not_utf8"),
+])
+def test_a_malformed_artifact_says_so(shop, api, kind, content, reason):
+    _export_both()
+    (_files(shop) / ARTIFACTS[kind][0]).write_bytes(content)
+    body = _read(api)
+    assert body[kind]["status"] == "malformed" and body[kind]["reasons"][0].startswith(reason)
+    assert body[kind]["structure"] is None and body["state"] == "attention"
+
+
+def test_malformed_r2rml_stays_visible_with_its_line(shop, api):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["r2rml"][0]
+    path.write_text("bad 'turtle'", encoding="utf-8")
+    entry = _read(api)["r2rml"]
+    assert entry["content"] == "bad 'turtle'" and "line 1" in entry["reasons"][0]
+
+
+def test_an_oversized_artifact_is_withheld(shop, api, monkeypatch):
+    _export_both()
+    monkeypatch.setenv("R2G_EXPORT_MAX_BYTES", "10")
+    body = _read(api)
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "too_large"
+    assert body["csi"]["content"] is None and body["state"] == "attention"
+
+
+@pytest.mark.parametrize("value", ["many", "0", "-1"])
+def test_an_invalid_size_limit_uses_the_default(shop, api, monkeypatch, value):
+    _export_both()
+    monkeypatch.setenv("R2G_EXPORT_MAX_BYTES", value)
+    assert _read(api)["state"] == "complete"
+
+
+def test_a_symlinked_artifact_is_not_followed(shop, api, tmp_path):
+    _export_both()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside the project", encoding="utf-8")
+    path = _files(shop) / ARTIFACTS["csi"][0]
+    path.unlink()
+    path.symlink_to(secret)
+    response = api.get("/api/projects/shop/exports")
+    assert response.json()["csi"]["status"] == "malformed"
+    assert "outside the project" not in response.text
+
+
+def test_a_symlinked_receipt_is_not_followed(shop, api, tmp_path):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["csi"][1]
+    real = tmp_path / "receipt.json"
+    real.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(real)
+    entry = _read(api)["csi"]
+    assert (entry["status"], entry["reasons"]) == ("unverified", ["receipt_invalid"])
+
+
+def test_a_symlinked_project_directory_is_not_followed(shop, api, tmp_path):
+    _export_both()
+    moved = tmp_path / "outside"
+    _files(shop).rename(moved)
+    _files(shop).symlink_to(moved)
+    body = _read(api)
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "malformed"
+    assert body["csi"]["content"] is None
+
+
+def test_a_file_swapped_for_a_symlink_after_the_check_is_not_followed(tmp_path, monkeypatch):
+    secret, regular, link = tmp_path / "secret", tmp_path / "regular", tmp_path / "export"
+    secret.write_text("outside", encoding="utf-8")
+    regular.write_text("x", encoding="utf-8")
+    link.symlink_to(secret)
+    real = os.lstat
+    monkeypatch.setattr(os, "lstat", lambda p: real(regular if Path(p) == link else p))
+    assert project_exports._read_file(tmp_path, "export", 100) == ("malformed", None)
+
+
+def test_a_file_that_grows_after_the_check_is_withheld(tmp_path, monkeypatch):
+    path, small = tmp_path / "export", tmp_path / "small"
+    path.write_text("x" * 50, encoding="utf-8")
+    small.write_text("x", encoding="utf-8")
+    real = os.lstat
+    monkeypatch.setattr(os, "lstat", lambda p: real(small if Path(p) == path else p))
+    assert project_exports._read_file(tmp_path, "export", 10) == ("too_large", None)
+
+
+def test_a_fifo_is_not_opened(shop, api):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["csi"][0]
+    path.unlink()
+    os.mkfifo(path)
+    assert _read(api)["csi"]["status"] == "malformed"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+def test_an_unreadable_artifact_is_attention_even_if_the_other_is_missing(shop, api, tmp_path):
+    assert _project("csi").exit_code == 0
+    path = _files(shop) / ARTIFACTS["csi"][0]
+    path.chmod(0)
+    try:
+        response = api.get("/api/projects/shop/exports")
+    finally:
+        path.chmod(0o640)
+    body = response.json()
+    assert body["csi"]["status"] == "unreadable" and body["csi"]["content"] is None
+    assert body["r2rml"]["status"] == "missing" and body["state"] == "attention"
+    assert str(tmp_path) not in response.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+def test_an_unreadable_receipt_reads_as_unverified(shop, api, tmp_path):
+    _export_both()
+    path = _files(shop) / ARTIFACTS["csi"][1]
+    path.chmod(0)
+    try:
+        response = api.get("/api/projects/shop/exports")
+    finally:
+        path.chmod(0o640)
+    entry = response.json()["csi"]
+    assert (entry["status"], entry["reasons"]) == ("unverified", ["receipt_unreadable"])
+    assert entry["content"] is not None and str(tmp_path) not in response.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+def test_a_directory_that_cannot_be_searched_is_never_none(shop, api, tmp_path):
+    _export_both()
+    mapping = _mapping_path(shop)
+    (tmp_path / "mapping.yaml").write_bytes(mapping.read_bytes())
+    shop.update_project("shop", mapping_config_path=str(tmp_path / "mapping.yaml"))
+    _files(shop).chmod(0)
+    try:
+        response = api.get("/api/projects/shop/exports")
+    finally:
+        _files(shop).chmod(0o755)
+    body = response.json()
+    assert response.status_code == 200 and body["state"] == "attention"
+    assert body["csi"]["status"] == body["r2rml"]["status"] == "unreadable"
+    assert str(tmp_path) not in response.text
+
+
+def test_any_other_read_error_says_nothing_about_the_path(shop, api, tmp_path, monkeypatch):
+    _export_both()
+
+    def fails(*args, **kwargs):
+        raise OSError(errno.EIO, "disk error", str(tmp_path / "private"))
+
+    monkeypatch.setattr(project_exports, "_read_file", fails)
+    response = TestClient(api.app, raise_server_exceptions=False).get("/api/projects/shop/exports")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Could not read this project's exports"}
+
+
+def test_an_unknown_project_is_404(api):
+    assert api.get("/api/projects/nope/exports").status_code == 404
+
+
+def test_reading_regenerates_and_writes_nothing(shop, api, monkeypatch):
+    _export_both()
+
+    def snapshot() -> dict[str, tuple[bytes, int]]:
+        return {str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+                for p in shop.dir.rglob("*") if p.is_file()}
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("a read must not generate an export")
+
+    monkeypatch.setattr("r2g.csi.mapping_to_csi", must_not_run)
+    monkeypatch.setattr("r2g.r2rml.mapping_to_r2rml", must_not_run)
+    before = snapshot()
+    assert _read(api)["state"] == "complete"
+    assert snapshot() == before
+
+
+def test_the_response_holds_no_filesystem_path(shop, api, tmp_path):
+    _export_both()
+    assert str(tmp_path) not in api.get("/api/projects/shop/exports").text
+
+
+def test_a_receipt_written_for_another_tenant_is_not_trusted(shop, api, monkeypatch):
+    _export_both()
+    monkeypatch.setattr(control_plane, "mode", lambda: True)
+    monkeypatch.setenv("R2G_TENANT", "acme")
+    body = project_exports.read_project_exports(shop, shop.get_project("shop"))
+    assert body["csi"]["reasons"] == ["tenant_mismatch"] and body["state"] == "attention"
