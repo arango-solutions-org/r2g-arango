@@ -397,8 +397,10 @@ def create_value_sampler(
         is_postgresql,
         is_sqlserver,
         normalize_source_type,
+        require_connection_string,
     )
 
+    require_connection_string(connection_string, source_type)
     params = source_params or {}
     # Resolve $VAR credential references the same way create_source_connector does.
     connection_string = expand_env_vars(connection_string)

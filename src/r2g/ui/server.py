@@ -1071,6 +1071,8 @@ def create_app(
             return {"table": table, "rows": rows, "count": len(rows)}
         except HTTPException:
             raise
+        except ValueError as e:  # an offline source: nothing to connect to (P6.17)
+            raise HTTPException(status_code=400, detail=_safe_detail(e))
         except Exception as e:
             logger.warning("preview_table_failed", source=name, table=table, error=str(e))
             raise HTTPException(status_code=500, detail="Failed to preview table data")
