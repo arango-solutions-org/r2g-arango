@@ -91,6 +91,12 @@ def _golden(command: str) -> str:
     return COMMANDS[command][1].read_text(encoding="utf-8")
 
 
+def _invoke_plain(args: list[str]):
+    """Invoke without styling: Typer forces a Rich terminal under GITHUB_ACTIONS, whose escape
+    sequences split the option names in a usage error. Only a dumb terminal drops them all."""
+    return CliRunner().invoke(app, args, env={"TERM": "dumb"})
+
+
 def _export(command: str, *args: str) -> None:
     result = CliRunner().invoke(app, [command, *INPUTS, *args])
     assert result.exit_code == 0, result.output
@@ -125,7 +131,7 @@ def test_the_defaults_write_one_file_in_the_working_directory(tmp_path, monkeypa
 ])
 def test_a_required_option_left_out_exits_2_and_writes_nothing(tmp_path, monkeypatch, args, missing):
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(app, args)
+    result = _invoke_plain(args)
     assert result.exit_code == 2
     assert missing in result.output
     assert list(tmp_path.iterdir()) == []
@@ -638,7 +644,7 @@ def test_project_with_path_inputs_exits_2_and_writes_nothing(shop, kind, extra):
 
 
 def test_a_missing_config_still_reads_as_a_missing_option():
-    result = CliRunner().invoke(app, ["export-csi"])
+    result = _invoke_plain(["export-csi"])
     assert result.exit_code == 2 and "Missing option '--config' / '-c'." in result.output
 
 
@@ -853,7 +859,7 @@ def test_both_receipts_record_the_same_inputs_and_curated_labels(shop, tmp_path)
 
 
 def test_a_missing_schema_still_reads_as_a_missing_option():
-    result = CliRunner().invoke(app, ["export-r2rml", "-c", str(MAPPING_GOLDEN)])
+    result = _invoke_plain(["export-r2rml", "-c", str(MAPPING_GOLDEN)])
     assert result.exit_code == 2 and "Missing option '--schema' / '-s'." in result.output
 
 
