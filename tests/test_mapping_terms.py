@@ -8,6 +8,11 @@ user's context; without one nothing reads them. Each refusal has a positive cont
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
+import subprocess
+from html import unescape
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -257,3 +262,141 @@ def test_the_editors_copy_of_the_mapping_carries_the_terms():
     assert data["collections"]["books"]["fieldTerms"] == {"title": TITLE}
     assert data["collections"]["authors"]["term"] is None
     assert [e["term"] for e in data["edges"]] == [WROTE]
+
+
+def _function(page: str, name: str) -> str:
+    """The source of one top-level function of the page, so a check cannot match elsewhere."""
+    start = page.index(f"\nfunction {name}(")
+    return page[start:page.index("\n}\n", start) + 3]
+
+
+class TestTheCanvasShowsTheTerms:
+    """Each source table shows the class it maps to, each source column the property, on the
+    canvas itself and not only in the inspector."""
+
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+
+    def test_a_table_shows_the_class_of_every_collection_it_feeds(self):
+        pane = _function(self.page, "renderSourcePane")
+        # Every collection of the table, not only the first one found.
+        assert "_collKeysForTable(sourceTable)" in pane
+        assert "_collEntryForSourceTable" not in _function(self.page, "_termChips")
+        assert "_termChips(termKeys, (coll) => coll.term, CP.classes, 'class')" in pane
+
+    def test_a_column_shows_the_property_each_collection_names_for_that_source_column(self):
+        pane = _function(self.page, "renderSourcePane")
+        # Keyed by the source column, as the inspector writes them, not a target name.
+        assert ("_termChips(termKeys, (coll) => (coll.fieldTerms || {})[c.name], "
+                "CP.properties, 'property')") in pane
+
+    def test_the_chips_sit_on_a_row_of_their_own_below_the_drag_handles(self):
+        # Inline chips pushed the count, the details button and the type out of a 160-250px
+        # pane; on a row below, the original row keeps its height, so its dot stays centred.
+        pane = _function(self.page, "renderSourcePane")
+        header = pane[pane.index('class="source-card-header"'):pane.index('class="source-card-body')]
+        assert header.index('class="source-dot"') < header.index("_termChips(")
+        assert header.index("</div>") < header.index("_termChips(")
+        row = pane[pane.index('class="source-col-row'):]
+        assert row.index('class="source-col-dot"') < row.index("CP.properties")
+        assert row.index("</div>\n            </div>") < row.index("CP.properties")
+        assert "'<div class=\"term-chip-row\">'" in _function(self.page, "_termChips")
+
+    def test_a_column_chip_row_stands_for_its_column(self):
+        # The chips left the column row, so whatever read the row has to follow them to the row
+        # after it; a table's chips come after its header, not a column row, so stay the table's.
+        menu = self.page[self.page.index("document.addEventListener('contextmenu'"):]
+        column = menu[menu.index("['.source-col-row .source-col-dot"):menu.index("['.source-card'")]
+        assert "'.source-col-row .source-col-dot, .source-col-row, .source-col-row + .term-chip-row'" in column
+        assert "el.closest('.source-col-row') || el.previousElementSibling" in column
+        assert "_menuSourceColumn(t, c)" in column
+        hover = _function(self.page, "_onMapperHover")
+        row = ("e.target.closest('.source-col-row') || "
+               "e.target.closest('.source-col-row + .term-chip-row')?.previousElementSibling")
+        assert hover.index(row) < hover.index("e.target.closest('.source-card')")
+        assert ".source-col-row.hl + .term-chip-row" in self.page
+        lens = self.page[self.page.index("/* Lens: sensitivity"):self.page.index("/* Lens: diff")]
+        assert "body.lens-sensitivity .source-col-row + .term-chip-row," in lens
+        assert 'body.lens-sensitivity .source-col-row[class*="sens-"] + .term-chip-row,' in lens
+        assert "body.lens-sensitivity .term-chip-row" not in lens
+
+    def test_the_chip_row_wraps_and_never_hides_a_term(self):
+        css = self.page[self.page.index(".term-chip-row {"):]
+        rule = css[:css.index("}")]
+        assert "flex-wrap: wrap" in rule
+        assert "overflow" not in rule and "max-height" not in rule
+
+    def test_one_chip_per_distinct_term_naming_every_collection_that_uses_it(self):
+        chips = _function(self.page, "_termChips")
+        # Grouped by IRI, in the order the collections name them; different IRIs stay apart.
+        assert "for (const key of collKeys)" in chips
+        assert "byIri.get(iri).push(key)" in chips
+        assert "keys.join(', ')" in chips and "${iri}" in chips
+        assert "sort(" not in chips
+
+    def test_a_term_reads_as_its_label_else_its_local_name_else_the_iri(self):
+        text = _function(self.page, "_termText")
+        assert "_termLabel(uri, terms)" in text
+        assert "split(/[#/]/).pop()" in text
+        assert "return local || String(uri);" in text
+
+    def test_every_chip_value_is_escaped(self):
+        chips = _function(self.page, "_termChips")
+        assert 'title="${escHtml(' in chips
+        assert ">${escHtml(_termText(iri, terms))}</span>" in chips
+
+    def _chips(self, cp_on: bool, collections: dict[str, Any], kind: str = "class",
+               terms: list[dict[str, str]] | None = None) -> tuple[str, list[tuple[str, str]]]:
+        """Run the page's own _termChips under node: its HTML, and each chip's tooltip and text."""
+        node = shutil.which("node")
+        assert node, "node is required: this test runs the canvas's JavaScript"
+        script = "".join(_function(self.page, name) for name in
+                         ("_htmlEscape", "escHtml", "_termLabel", "_termText", "_termChips"))
+        script += f"""
+const CP = {{ on: {json.dumps(cp_on)} }};
+const editState = {{ collections: {json.dumps(collections)} }};
+const termOf = {json.dumps(kind)} === 'class' ? (c) => c.term : (c) => (c.fieldTerms || {{}}).id;
+process.stdout.write(_termChips(Object.keys(editState.collections), termOf,
+                                {json.dumps(terms or [])}, {json.dumps(kind)}));
+"""
+        out = subprocess.run([node, "-"], input=script, capture_output=True, text=True,
+                             check=True, timeout=30).stdout
+        chips = re.findall(r'<span class="term-chip" title="([^"]*)">([^<]*)</span>', out)
+        return out, [(unescape(title), unescape(text)) for title, text in chips]
+
+    def test_the_canvas_names_terms_only_under_a_control_plane(self):
+        books = {"books": {"term": BOOK}}
+        assert self._chips(False, books, terms=ONTOLOGY["classes"]) == ("", [])
+        assert self._chips(True, books, terms=ONTOLOGY["classes"])[1] == [
+            (f"Ontology class of books: Book ({BOOK})", "Book")]
+
+    def test_the_chips_as_the_canvas_draws_them(self):
+        bare = "https://ex.org/lending/"
+        hashed = "https://ex.org/lending#"
+        collections = {
+            "authors": {"term": AUTHOR}, "books": {"term": BOOK}, "novels": {"term": BOOK},
+            "untyped": {}, "nulled": {"term": None},
+            "shelves": {"term": "https://ex.org/lending#Shelf"}, "slash": {"term": bare},
+            "hash": {"term": hashed}, "a<b": {"term": "https://ex.org/x#T"},
+        }
+        risky = "<i>&\"'"
+        terms = [{"uri": BOOK, "label": "Book"}, {"uri": AUTHOR, "label": ""},
+                 {"uri": "https://ex.org/x#T", "label": risky}]
+        html, chips = self._chips(True, collections, terms=terms)
+        assert chips == [
+            (f"Ontology class of authors: Author ({AUTHOR})", "Author"),  # empty label
+            (f"Ontology class of books, novels: Book ({BOOK})", "Book"),  # grouped, first seen
+            ("Ontology class of shelves: Shelf (https://ex.org/lending#Shelf)", "Shelf"),
+            (f"Ontology class of slash: {bare} ({bare})", bare),
+            (f"Ontology class of hash: {hashed} ({hashed})", hashed),
+            (f"Ontology class of a<b: {risky} (https://ex.org/x#T)", risky),
+        ]
+        assert "<i>" not in html and "a<b" not in html and "'" not in html
+        assert self._chips(True, {"books": {"fieldTerms": {"id": TITLE}}, "authors": {}},
+                           kind="property")[1] == [(f"Ontology property of books: title ({TITLE})", "title")]
+
+    def test_editing_a_table_or_column_term_redraws_the_cards(self):
+        for name in ("setCollectionTerm", "setFieldTerm"):
+            body = _function(self.page, name)
+            assert body.index("markDirty();") < body.index("renderMapper();"), name
+        # A relationship's term shows on no card, so its edit redraws nothing.
+        assert "renderMapper" not in _function(self.page, "setEdgeTerm")
