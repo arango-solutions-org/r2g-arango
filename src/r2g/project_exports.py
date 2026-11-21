@@ -5,18 +5,31 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import ValidationError
 
-from r2g import control_plane
+from r2g import __version__, control_plane
 from r2g.catalog import Catalog, CatalogManager
 from r2g.config import ConfigManager
+from r2g.curated_labels import load_curated_labels
+from r2g.governed import _write_atomically
 from r2g.security import ENC_PREFIX, SECRET_ENV, SECRET_FILENAME
 from r2g.types import MappingConfig, Schema
+
+#: export kind -> (its file, its receipt), fixed names in the project's directory.
+ARTIFACTS = {
+    "csi": ("mapping.csi.json", "mapping.csi.export.json"),
+    "r2rml": ("mapping.r2rml.ttl", "mapping.r2rml.export.json"),
+}
+RECEIPT_FORMAT = 1
+#: Readable by the writer and the project directory's group, never by everyone.
+PUBLISHED_MODE = 0o640
 
 
 class ProjectExportError(ValueError):
@@ -133,6 +146,46 @@ def prepare_export_directory(export: ProjectExport) -> None:
         if other.exists() and os.path.samestat(info, os.stat(other)):
             raise ProjectExportError(
                 f"Projects '{export.name}' and '{other.name}' share one directory")
+
+
+def publish_export(export: ProjectExport, kind: str, text: str, generated_at: str,
+                   options: dict[str, Any]) -> tuple[Path, list[str]]:
+    """Replace one export, then its receipt. A failure between the two leaves a receipt that
+    does not match the file, which reads as unverified. Returns the file and any warnings."""
+    prepare_export_directory(export)
+    name, receipt_name = ARTIFACTS[kind]
+    path = export.directory / name
+    warnings = _write_atomically(path, text, mode=PUBLISHED_MODE, durable=True)
+    receipt = {
+        "format_version": RECEIPT_FORMAT,
+        "project": export.name,
+        "tenant": export.tenant,
+        "kind": kind,
+        "artifact_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "mapping_sha256": export.mapping_sha256,
+        "schema_sha256": export.schema_sha256,
+        "snapshot_id": export.snapshot_id,
+        "generated_at": generated_at,
+        "r2g_version": __version__,
+        "options": options,
+    }
+    warnings += _write_atomically(export.directory / receipt_name,
+                                  json.dumps(receipt, indent=2) + "\n",
+                                  mode=PUBLISHED_MODE, durable=True)
+    return path, list(dict.fromkeys(warnings))
+
+
+def read_curated_labels(path: str) -> tuple[dict[str, Any], str]:
+    """The curated labels and the hash of the bytes that hold exactly those labels."""
+    labels = load_curated_labels(path)
+    try:
+        raw = Path(path).read_bytes()
+        unchanged = json.loads(raw) == labels
+    except (OSError, ValueError) as exc:
+        raise ProjectExportError(f"Cannot read the curated labels at {path}: {exc}") from exc
+    if not unchanged:
+        raise ProjectExportError(f"The curated labels at {path} changed while read; try again")
+    return labels, hashlib.sha256(raw).hexdigest()
 
 
 def _catalog_dir() -> Path:
