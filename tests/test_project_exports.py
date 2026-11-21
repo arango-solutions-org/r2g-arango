@@ -35,6 +35,7 @@ from r2g.csi import validate_csi
 from r2g.governed import keep_version
 from r2g.main import app
 from r2g.project_exports import (
+    ARTIFACTS,
     ProjectExportError,
     check_mapping_coverage,
     prepare_export_directory,
@@ -492,6 +493,11 @@ def test_a_missing_directory_is_not_created_under_a_control_plane(shop, monkeypa
 # --- export-csi --project ----------------------------------------------------------------------
 
 
+EMITTERS = {"csi": "r2g.csi.mapping_to_csi", "r2rml": "r2g.r2rml.mapping_to_r2rml"}
+#: An option that changes each export's bytes.
+CHANGED = {"csi": ["--source-ref", "changed"], "r2rml": ["--resource-base", "http://changed/"]}
+
+
 def _files(catalog: CatalogManager) -> Path:
     return catalog.dir / "projects" / "shop"
 
@@ -500,13 +506,17 @@ def _csi(*args: str):
     return CliRunner().invoke(app, ["export-csi", "--project", "shop", *args])
 
 
-def _receipt(catalog: CatalogManager) -> dict[str, Any]:
-    return json.loads((_files(catalog) / "mapping.csi.export.json").read_text(encoding="utf-8"))
+def _project(kind: str, *args: str):
+    return CliRunner().invoke(app, [f"export-{kind}", "--project", "shop", *args])
 
 
-def _published_pair(catalog: CatalogManager) -> tuple[bytes, bytes]:
-    return ((_files(catalog) / "mapping.csi.json").read_bytes(),
-            (_files(catalog) / "mapping.csi.export.json").read_bytes())
+def _receipt(catalog: CatalogManager, kind: str = "csi") -> dict[str, Any]:
+    return json.loads((_files(catalog) / ARTIFACTS[kind][1]).read_text(encoding="utf-8"))
+
+
+def _published_pair(catalog: CatalogManager, kind: str = "csi") -> tuple[bytes, bytes]:
+    return ((_files(catalog) / ARTIFACTS[kind][0]).read_bytes(),
+            (_files(catalog) / ARTIFACTS[kind][1]).read_bytes())
 
 
 def test_a_project_export_publishes_the_file_and_its_receipt(shop, tmp_path, monkeypatch):
@@ -575,11 +585,12 @@ def test_a_project_export_invents_no_bitemporal_stamps(shop):
         assert stamp not in provenance
 
 
+@pytest.mark.parametrize("kind", ARTIFACTS)
 @pytest.mark.parametrize("extra", [["-c", "m.yaml"], ["-s", "s.json"]])
-def test_project_with_path_inputs_exits_2_and_writes_nothing(shop, extra):
-    result = _csi(*extra)
+def test_project_with_path_inputs_exits_2_and_writes_nothing(shop, kind, extra):
+    result = _project(kind, *extra)
     assert result.exit_code == 2 and "cannot be combined" in result.output
-    assert not (_files(shop) / "mapping.csi.json").exists()
+    assert not (_files(shop) / ARTIFACTS[kind][0]).exists()
 
 
 def test_a_missing_config_still_reads_as_a_missing_option():
@@ -591,9 +602,18 @@ def test_a_missing_config_still_reads_as_a_missing_option():
     (["-c", "", "-o", "out"], 1),               # an empty path is an unreadable file, not absent
     ([*INPUTS, "-o", ""], 1),                   # and an empty output is not the default
 ])
-def test_an_empty_path_option_is_not_treated_as_left_out(tmp_path, monkeypatch, args, code):
+@pytest.mark.parametrize("command", COMMANDS)
+def test_an_empty_path_option_is_not_treated_as_left_out(tmp_path, monkeypatch, command, args, code):
     monkeypatch.chdir(tmp_path)
-    assert CliRunner().invoke(app, ["export-csi", *args]).exit_code == code
+    args = [*args, "-s", str(SCHEMA_GOLDEN)] if "-s" not in args else args
+    assert CliRunner().invoke(app, [command, *args]).exit_code == code
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_empty_schema_path_is_not_treated_as_left_out(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = ["export-r2rml", "-c", str(MAPPING_GOLDEN), "-s", ""]
+    assert CliRunner().invoke(app, args).exit_code == 1
     assert list(tmp_path.iterdir()) == []
 
 
@@ -608,62 +628,70 @@ def test_the_receipt_records_the_source_type_the_document_has(shop):
     assert _receipt(shop)["options"]["source_type"] == "relational"
 
 
-def test_project_with_output_leaves_the_studio_copy_alone(shop, tmp_path):
-    assert _csi().exit_code == 0
-    before = _published_pair(shop)
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_project_with_output_leaves_the_studio_copy_alone(shop, kind, tmp_path):
+    assert _project(kind).exit_code == 0
+    before = _published_pair(shop, kind)
     out = tmp_path / "elsewhere.json"
-    result = _csi("-o", str(out))
+    result = _project(kind, "-o", str(out))
     assert result.exit_code == 0 and "not updated" in result.output
-    assert out.is_file() and _published_pair(shop) == before
+    assert out.is_file() and _published_pair(shop, kind) == before
     assert not list(tmp_path.glob("elsewhere*.export.json"))
 
 
-def test_a_csi_export_leaves_the_r2rml_receipt_alone(shop):
-    other = _files(shop) / "mapping.r2rml.export.json"
-    other.write_text('{"kind": "r2rml"}', encoding="utf-8")
-    assert _csi().exit_code == 0
-    assert other.read_text(encoding="utf-8") == '{"kind": "r2rml"}'
+@pytest.mark.parametrize("kind, other", [("csi", "r2rml"), ("r2rml", "csi")])
+def test_one_export_leaves_the_others_files_alone(shop, kind, other):
+    files = [_files(shop) / name for name in ARTIFACTS[other]]
+    for path in files:
+        path.write_text("the other export", encoding="utf-8")
+    assert _project(kind).exit_code == 0
+    assert all(path.read_text(encoding="utf-8") == "the other export" for path in files)
 
 
-def test_a_refused_project_says_why_and_writes_nothing(shop):
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_refused_project_says_why_and_writes_nothing(shop, kind):
     ConfigManager.save_config(_shop_mapping(collections=_collection(source_table="gone")),
                               _mapping_path(shop))
-    result = _csi()
+    result = _project(kind)
     assert result.exit_code == 1 and "Not exported" in result.output and "gone" in result.output
-    assert not (_files(shop) / "mapping.csi.json").exists()
+    assert not (_files(shop) / ARTIFACTS[kind][0]).exists()
 
 
-def test_root_publishes_nothing_but_may_write_elsewhere(shop, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_root_publishes_nothing_but_may_write_elsewhere(shop, kind, tmp_path, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    assert _csi().exit_code == 1
-    assert not (_files(shop) / "mapping.csi.json").exists()
+    assert _project(kind).exit_code == 1
+    assert not (_files(shop) / ARTIFACTS[kind][0]).exists()
     out = tmp_path / "elsewhere.json"
-    assert _csi("-o", str(out)).exit_code == 0 and out.is_file()
+    assert _project(kind, "-o", str(out)).exit_code == 0 and out.is_file()
 
 
-def test_a_failed_generation_keeps_the_published_pair(shop, monkeypatch):
-    assert _csi().exit_code == 0
-    before = _published_pair(shop)
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_failed_generation_keeps_the_published_pair(shop, kind, monkeypatch):
+    assert _project(kind).exit_code == 0
+    before = _published_pair(shop, kind)
 
     def fails(*args, **kwargs):
         raise RuntimeError("generator failed")
 
-    monkeypatch.setattr("r2g.csi.mapping_to_csi", fails)
-    assert _csi().exit_code == 1
-    assert _published_pair(shop) == before
+    monkeypatch.setattr(EMITTERS[kind], fails)
+    assert _project(kind).exit_code == 1
+    assert _published_pair(shop, kind) == before
 
 
-def test_curated_labels_not_applied_keep_the_published_pair(shop, tmp_path):
-    assert _csi().exit_code == 0
-    before = _published_pair(shop)
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_curated_labels_not_applied_keep_the_published_pair(shop, kind, tmp_path):
+    assert _project(kind).exit_code == 0
+    before = _published_pair(shop, kind)
     labels = tmp_path / "labels.json"
     labels.write_text(json.dumps({"curatedLabelsVersion": "1", "entities": [
         {"name": "Nobody", "label": "Customer"}]}), encoding="utf-8")
-    assert _csi("--curated-labels", str(labels)).exit_code == 1
-    assert _published_pair(shop) == before
+    assert _project(kind, "--curated-labels", str(labels)).exit_code == 1
+    assert _published_pair(shop, kind) == before
 
 
-def test_a_failed_directory_sync_exits_1_and_writes_no_receipt(shop, monkeypatch):
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_failed_directory_sync_exits_1_and_writes_no_receipt(shop, kind, monkeypatch):
     fsync_fails = OSError(errno.EIO, "no")
     real = os.fsync
 
@@ -673,14 +701,15 @@ def test_a_failed_directory_sync_exits_1_and_writes_no_receipt(shop, monkeypatch
         real(fd)
 
     monkeypatch.setattr(os, "fsync", synced)
-    assert _csi().exit_code == 1
-    assert (_files(shop) / "mapping.csi.json").is_file()
-    assert not (_files(shop) / "mapping.csi.export.json").exists()
+    assert _project(kind).exit_code == 1
+    assert (_files(shop) / ARTIFACTS[kind][0]).is_file()
+    assert not (_files(shop) / ARTIFACTS[kind][1]).exists()
 
 
-def test_a_failure_between_the_two_writes_leaves_a_receipt_that_does_not_match(shop, monkeypatch):
-    assert _csi().exit_code == 0
-    old = _receipt(shop)
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_failure_between_the_two_writes_leaves_a_receipt_that_does_not_match(shop, kind, monkeypatch):
+    assert _project(kind).exit_code == 0
+    old = _receipt(shop, kind)
     real = project_exports._write_atomically
 
     def receipt_fails(path, text, **kwargs):
@@ -689,25 +718,105 @@ def test_a_failure_between_the_two_writes_leaves_a_receipt_that_does_not_match(s
         return real(path, text, **kwargs)
 
     monkeypatch.setattr(project_exports, "_write_atomically", receipt_fails)
-    assert _csi("--source-ref", "changed").exit_code == 1
-    text = (_files(shop) / "mapping.csi.json").read_text(encoding="utf-8")
-    assert _receipt(shop) == old and old["artifact_sha256"] != hashlib.sha256(text.encode()).hexdigest()
+    assert _project(kind, *CHANGED[kind]).exit_code == 1
+    text = (_files(shop) / ARTIFACTS[kind][0]).read_text(encoding="utf-8")
+    assert _receipt(shop, kind) == old and old["artifact_sha256"] != hashlib.sha256(text.encode()).hexdigest()
 
 
-def test_a_warning_from_the_write_reaches_the_user(shop):
-    path = _files(shop) / "mapping.csi.json"
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_warning_from_the_write_reaches_the_user(shop, kind):
+    path = _files(shop) / ARTIFACTS[kind][0]
     path.write_text("old", encoding="utf-8")
     path.chmod(0o600)
-    result = _csi()
+    result = _project(kind)
     assert result.exit_code == 0 and "readable only by the user who wrote it" in result.output
 
 
-def test_a_control_plane_export_records_its_tenant_in_the_receipt(shop, monkeypatch):
+@pytest.mark.parametrize("kind", ARTIFACTS)
+def test_a_control_plane_export_records_its_tenant_in_the_receipt(shop, kind, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_URL", "http://cp.test/api")
     monkeypatch.setenv("R2G_TENANT", "acme")
-    result = _csi()
+    result = _project(kind)
     assert result.exit_code == 0 and "tenant acme" in result.output
-    assert _receipt(shop)["tenant"] == "acme"
+    assert _receipt(shop, kind)["tenant"] == "acme"
+
+
+def test_r2rml_project_export_publishes_the_file_and_its_receipt(shop, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = _project("r2rml")
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "mapping.r2rml.ttl").exists()
+    path = _files(shop) / "mapping.r2rml.ttl"
+    text = path.read_text(encoding="utf-8")
+    assert "(source: postgresql)" in text
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    latest = shop.get_latest_snapshot("src")
+    receipt = _receipt(shop, "r2rml")
+    generated_at = receipt.pop("generated_at")
+    assert generated_at.endswith("+00:00")
+    assert receipt == {
+        "format_version": 1, "project": "shop", "tenant": None, "kind": "r2rml",
+        "artifact_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "mapping_sha256": hashlib.sha256(_mapping_path(shop).read_bytes()).hexdigest(),
+        "schema_sha256": hashlib.sha256(latest.schema_data.model_dump_json().encode()).hexdigest(),
+        "snapshot_id": latest.id,
+        "r2g_version": r2g.__version__,
+        "options": {"concept_base": "urn:arango-sparql:concept#",
+                    "resource_base": "http://r2g.example/resource/", "source_type": "postgresql",
+                    "curated_labels_sha256": None, "allow_unapplied_labels": False},
+    }
+
+
+def test_r2rml_project_export_is_byte_identical_to_the_path_export(shop, tmp_path):
+    assert _project("r2rml").exit_code == 0
+    schema = tmp_path / "schema.json"
+    shop.get_latest_snapshot("src").schema_data.save_to_file(str(schema))
+    out = tmp_path / "path.ttl"
+    result = CliRunner().invoke(app, ["export-r2rml", "-c", str(_mapping_path(shop)), "-s", str(schema),
+                                      "--source-type", "postgresql", "-o", str(out)])
+    assert result.exit_code == 0, result.output
+    assert (_files(shop) / "mapping.r2rml.ttl").read_bytes() == out.read_bytes()
+
+
+def test_r2rml_uses_the_latest_snapshot_not_the_pin(shop):
+    shop.create_snapshot("src", _shop_schema("added_later"))
+    assert _project("r2rml").exit_code == 0
+    assert "added_later" in (_files(shop) / "mapping.r2rml.ttl").read_text(encoding="utf-8")
+
+
+def test_r2rml_options_reach_the_document_and_the_receipt(shop):
+    assert _project("r2rml", "--concept-base", "urn:ex:", "--resource-base", "http://ex/",
+                    "--source-type", "mysql").exit_code == 0
+    text = (_files(shop) / "mapping.r2rml.ttl").read_text(encoding="utf-8")
+    assert "<urn:ex:User>" in text and "http://ex/User/" in text and "(source: mysql)" in text
+    options = _receipt(shop, "r2rml")["options"]
+    assert (options["concept_base"], options["resource_base"], options["source_type"]) == (
+        "urn:ex:", "http://ex/", "mysql")
+
+
+def test_both_receipts_record_the_same_inputs_and_curated_labels(shop, tmp_path):
+    labels = tmp_path / "private-labels.json"
+    labels.write_text(json.dumps({"curatedLabelsVersion": "1", "entities": [
+        {"name": "User", "label": "Customer"}]}), encoding="utf-8")
+    for kind in ARTIFACTS:
+        assert _project(kind, "--curated-labels", str(labels)).exit_code == 0
+    csi, r2rml = _receipt(shop, "csi"), _receipt(shop, "r2rml")
+    for field in ("mapping_sha256", "schema_sha256", "snapshot_id"):
+        assert csi[field] == r2rml[field]
+    assert csi["options"]["curated_labels_sha256"] == r2rml["options"]["curated_labels_sha256"]
+    assert "label_policy" not in r2rml["options"] and "concept_base" not in csi["options"]
+    assert "private-labels" not in json.dumps(r2rml)
+
+
+def test_a_missing_schema_still_reads_as_a_missing_option():
+    result = CliRunner().invoke(app, ["export-r2rml", "-c", str(MAPPING_GOLDEN)])
+    assert result.exit_code == 2 and "Missing option '--schema' / '-s'." in result.output
+
+
+def test_an_empty_r2rml_source_type_stays_in_the_header(tmp_path):
+    out = tmp_path / "out"
+    _export("export-r2rml", "--source-type", "", "-o", str(out))
+    assert "(source: )" in out.read_text(encoding="utf-8")
 
 
 def test_labels_changed_while_read_are_refused(tmp_path, monkeypatch):
