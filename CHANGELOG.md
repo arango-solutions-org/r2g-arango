@@ -48,6 +48,12 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`r2g secrets init` and `r2g secrets status` use the catalog's directory.** They
+  hardwired `~/.r2g/secret.key`, while the catalog reads `secret.key` from its own
+  directory and honours `R2G_CATALOG_DIR`. With that variable set (the control-plane
+  image sets it), `status` reported a file that did not exist and `init` wrote a second
+  key the catalog never read. Both now resolve the directory as the catalog does;
+  `R2G_CATALOG_DIR` is documented in the README and `.env.example`.
 - **CSV-direct import scripts build composite keys with the mapping's
   `key_separator`.** `r2g generate-csv-import` and the Studio's CSV-mode import
   preview joined composite primary and foreign keys with a hardcoded `_`, while every

@@ -294,13 +294,21 @@ def _writes(
     return locked
 
 
+def default_catalog_dir() -> Path:
+    """The catalog directory when none is given: ``R2G_CATALOG_DIR``, else ``~/.r2g``.
+
+    A deployment serving several tenants gives each its own directory. Everything kept
+    beside the catalog (its ``secret.key``, the dead-letter queue) lives here, so every
+    command that names one of those files must resolve it through this function.
+    """
+    env_dir = os.environ.get("R2G_CATALOG_DIR", "").strip()
+    return Path(env_dir).expanduser() if env_dir else Path.home() / ".r2g"
+
+
 class CatalogManager:
     def __init__(self, catalog_dir: str | Path | None = None):
         if catalog_dir is None:
-            # R2G_CATALOG_DIR, as the MCP server already honours, else ~/.r2g. A deployment
-            # serving several tenants gives each its own directory.
-            env_dir = os.environ.get("R2G_CATALOG_DIR", "").strip()
-            self._dir = Path(env_dir).expanduser() if env_dir else Path.home() / ".r2g"
+            self._dir = default_catalog_dir()
         else:
             self._dir = Path(catalog_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
