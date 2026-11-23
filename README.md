@@ -547,7 +547,7 @@ r2g stream --dry-run \
 | `selective-reload` | Compute and execute a selective reload based on mapping changes |
 | `history` | Show load history (`--project`, `--limit`) |
 | `export-csi` | Emit a **CSI v1** conceptual-schema-interchange document (conceptual model + ArangoDB physical mapping) for federation; drives the fabric's Arango leg (`--config`, `--schema`, `--output`, `--source-type`, `--source-ref`, `--label-policy`, `--curated-labels`, `--allow-unapplied-labels`, `--validate/--no-validate`) |
-| `export-r2rml` | Emit an **R2RML** mapping (relational → RDF) for SPARQL→SQL pushdown via Ontop — the federation relational leg (`--config`, `--schema`, `--output`, `--concept-base`, `--resource-base`, `--source-type`, `--curated-labels`, `--allow-unapplied-labels`) |
+| `export-r2rml` | Emit an **R2RML** mapping (relational → RDF) for SPARQL→SQL pushdown via Ontop — the federation relational leg (`--config`, `--schema`, `--output`, `--concept-base`, `--resource-base`, `--source-type`, `--curated-labels`, `--allow-unapplied-labels`, `--csi`: take collided labels' names from the CSI exported from the same mapping, so the two exports agree) |
 | `ui` | Start the Relational-to-Graph Studio web UI (requires the `ui` extra) |
 | `mcp` | Start the R2G MCP server for AI agent integration (requires the `mcp` extra) |
 
