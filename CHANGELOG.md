@@ -54,6 +54,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image sets it), `status` reported a file that did not exist and `init` wrote a second
   key the catalog never read. Both now resolve the directory as the catalog does;
   `R2G_CATALOG_DIR` is documented in the README and `.env.example`.
+- **CSV-direct import scripts build composite keys with the mapping's
+  `key_separator`.** `r2g generate-csv-import` and the Studio's CSV-mode import
+  preview joined composite primary and foreign keys with a hardcoded `_`, while every
+  other load path uses the mapping's separator. With any other separator a CSV-direct
+  load wrote documents and edge endpoints that a later stream or CDC run could not
+  find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
+  is now refused with a pointer to JSONL mode.
 
 ## [0.11.1] — 2026-11-19
 
