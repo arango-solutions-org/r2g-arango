@@ -36,6 +36,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+### Fixed
+
+- **CSV-direct import scripts build composite keys with the mapping's
+  `key_separator`.** `r2g generate-csv-import` and the Studio's CSV-mode import
+  preview joined composite primary and foreign keys with a hardcoded `_`, while every
+  other load path uses the mapping's separator. With any other separator a CSV-direct
+  load wrote documents and edge endpoints that a later stream or CDC run could not
+  find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
+  is now refused with a pointer to JSONL mode.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added
