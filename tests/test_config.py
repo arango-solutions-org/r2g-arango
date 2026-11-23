@@ -535,3 +535,6 @@ class TestValidateConfig:
         issues = validate_config(pkless_schema, config)
         assert len(issues) == 1
         assert "no primary key" in issues[0]
+        assert "keyed by all column values" in issues[0]
+        assert "identical rows collapse to one document" in issues[0]
+        assert "auto-generated" not in issues[0]
