@@ -145,7 +145,7 @@ r2g export-r2rml --config mapping.yaml --schema schema.json --output analytics.r
 - **Environment variable support** -- connection parameters (`PG_CONN`, `ARANGO_ENDPOINT`, `ARANGO_DB`, `ARANGO_USER`, `ARANGO_PASSWORD`) can be set via environment variables or a `.env` file; CLI flags override env vars when both are provided
 - **Skip existing** -- `stream --skip-existing` skips collections that already contain data, enabling resumption of partial streaming runs without re-importing completed collections
 - **Incremental streaming** -- `stream --since 2026-04-01T00:00:00` filters rows by a timestamp column (auto-detects `updated_at`/`created_at` or use `--since-column`); combine with `--on-duplicate=replace` for basic incremental updates
-- **PK-less table keys** -- a table without a primary key is warned during validation and streaming, and each row is keyed by every column in schema order (NULL written as `%null`, keys over 200 characters hashed), so its edges load; identical rows collapse to one document. The CSV-direct path (`generate-csv-import`) still gives such a table no edges
+- **PK-less table keys** -- a table without a primary key is warned during validation and streaming, and each row is keyed by every column in schema order (NULL written as `%null`, keys over 200 characters hashed), so its edges load; identical rows collapse to one document, and so do distinct rows whose values join to the same key (`('x_y', 'z')` and `('x', 'y_z')` with the default `_` separator), as composite primary keys already do. The CSV-direct path (`generate-csv-import`) still gives such a table no edges
 - **CDC (Change Data Capture)** -- near real-time PostgreSQL→ArangoDB sync via logical replication. `PGReplicationListener` manages replication slots, polls `pg_logical_slot_get_changes`, parses output via `test_decoding` (built-in) or `wal2json` plugins. `DeltaTransformer` converts row-level changes to graph mutations (document upserts/deletes + edge recalculation). `CDCHandler` orchestrates event processing with transaction grouping and stats tracking. Configurable conflict resolution policies: `source_wins` (default), `last_write_wins`, `log_and_skip`, `fail`. CLI commands: `cdc-setup`, `cdc-teardown`, `cdc-status`, `cdc-start`
 - **Composite foreign key support** -- multi-column foreign keys are correctly introspected from `pg_catalog`, represented in mappings, and transformed into composite `_key` / `_from` / `_to` values using a configurable separator
 - **Multi-schema support** -- `--pg-schema` option on `ingest-schema`, `dump-tables`, and `stream` commands allows introspection and import from any PostgreSQL schema, not just `public`
@@ -664,7 +664,7 @@ r2g cdc-start --pg-conn "..." schema.json mapping.yaml \
 
 A conflict summary table is printed at the end of each CDC session showing counts by conflict type.
 
-For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values. A table without a primary key needs it for deletes: its documents are keyed by every column, so a DELETE without the full old row deletes nothing:
+For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values. A table without a primary key needs it for deletes: its documents are keyed by every column, so a DELETE without the full old row deletes nothing. For the same reason an UPDATE to a row of such a table changes its key: change capture writes a new document and the old one stays (known limitation):
 
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;

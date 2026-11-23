@@ -302,8 +302,8 @@ def validate_config(schema: Schema, config: MappingConfig) -> list[str]:
         if src in schema.tables and not schema.tables[src].primary_key:
             issues.append(
                 f"Collection '{key}': source table '{src}' has no primary key; "
-                f"documents will receive auto-generated _key values and edges "
-                f"referencing this table may produce broken links"
+                f"documents are keyed by all column values; identical rows "
+                f"collapse to one document"
             )
 
     for idx, edge in enumerate(config.edges):

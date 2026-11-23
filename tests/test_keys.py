@@ -120,3 +120,13 @@ class TestKeylessTableGetsEdges:
         key = NodeTransformer(table).transform_row({"body": "x" * 500})["_key"]
         assert len(key) <= 254 and all(ch in _LEGAL for ch in key)
         assert key == NodeTransformer(table).transform_row({"body": "x" * 500})["_key"]
+
+    def test_distinct_rows_joining_to_the_same_key_collapse(self):
+        # Documented limitation, shared with composite PKs: the separator is not escaped.
+        table = Table(
+            name="pairs",
+            columns=[Column(name="a", data_type="text"), Column(name="b", data_type="text")],
+            primary_key=[],
+        )
+        nt = NodeTransformer(table)
+        assert nt.transform_row({"a": "x_y", "b": "z"})["_key"] == nt.transform_row({"a": "x", "b": "y_z"})["_key"]

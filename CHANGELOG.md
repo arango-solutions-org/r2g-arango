@@ -49,11 +49,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   known edge cases).** Each row is keyed by every column in schema order, with NULL written as
   `%null` and keys over 200 characters hashed. Vertices, the edges that reference them and
   PostgreSQL change capture build the key the same way, so a DELETE carrying the full old row
-  (`REPLICA IDENTITY FULL`) now removes the document. Identical rows collapse to one document.
-  The CSV-direct path still gives such a table no edges, and Snowflake stream recovery still
-  refuses such an object. **Upgrade:** a graph loaded before this change holds these documents
-  under keys ArangoDB generated; reload keyless tables with `--drop-collections`, otherwise
-  every document exists twice.
+  (`REPLICA IDENTITY FULL`) now removes the document. Identical rows collapse to one document,
+  and so do distinct rows whose values join to the same key (`('x_y', 'z')` and `('x', 'y_z')`
+  with the default `_` separator), as composite primary keys already do. An UPDATE to such a
+  row changes its key, so change capture writes a new document and the old one stays (known
+  limitation). The CSV-direct path still gives such a table no edges, and Snowflake stream
+  recovery still refuses such an object. **Upgrade:** a graph loaded before this change holds
+  these documents under keys ArangoDB generated; reload keyless tables and the edges that start
+  from them with `--drop-collections`, otherwise every document exists twice. In the `lpg`
+  layout `--drop-collections` drops the shared node and edge collections, so an `lpg` graph
+  needs a full reload.
 
 ### Fixed
 

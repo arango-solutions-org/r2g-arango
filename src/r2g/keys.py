@@ -72,7 +72,9 @@ def row_key(table: Any, row: Mapping[str, Any], separator: str) -> str:
             parts.append(sanitize_key_component(val))
         return separator.join(parts)
     # shortcut: identical rows of a key-less table share one key and collapse to one
-    # document; key by a source row id instead if such a table must keep duplicates.
+    # document, as do distinct rows whose values join to the same key (("x_y", "z") and
+    # ("x", "y_z")), as composite PKs already do; key by a source row id instead if such
+    # a table must keep duplicates.
     key = separator.join(
         _NULL_COMPONENT if row.get(c.name) is None else sanitize_key_component(row[c.name])
         for c in table.columns
