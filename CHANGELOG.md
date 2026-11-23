@@ -36,6 +36,15 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+### Fixed
+
+- **`r2g secrets init` and `r2g secrets status` use the catalog's directory.** They
+  hardwired `~/.r2g/secret.key`, while the catalog reads `secret.key` from its own
+  directory and honours `R2G_CATALOG_DIR`. With that variable set (the control-plane
+  image sets it), `status` reported a file that did not exist and `init` wrote a second
+  key the catalog never read. Both now resolve the directory as the catalog does;
+  `R2G_CATALOG_DIR` is documented in the README and `.env.example`.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added

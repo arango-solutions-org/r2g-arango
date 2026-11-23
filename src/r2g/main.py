@@ -4316,17 +4316,17 @@ def secrets_init(
     on-disk key file is not touched and this command is a no-op.
     """
     import os
-    from pathlib import Path
 
     from cryptography.fernet import Fernet
 
+    from r2g.catalog import default_catalog_dir
     from r2g.security import SECRET_ENV, SECRET_FILENAME
 
     if os.environ.get(SECRET_ENV):
         console.print(f"[yellow]{SECRET_ENV} is set; on-disk key is ignored while it is present.[/yellow]")
         return
 
-    path = Path.home() / ".r2g" / SECRET_FILENAME
+    path = default_catalog_dir() / SECRET_FILENAME
     if path.exists() and not force:
         console.print(f"[yellow]Secret key already exists at {path} (use --force to replace).[/yellow]")
         return
@@ -4361,14 +4361,14 @@ def secrets_migrate() -> None:
 def secrets_status() -> None:
     """Show where the active secret key is coming from."""
     import os
-    from pathlib import Path
 
+    from r2g.catalog import default_catalog_dir
     from r2g.security import SECRET_ENV, SECRET_FILENAME
 
     if os.environ.get(SECRET_ENV):
         console.print(f"[green]Using {SECRET_ENV} environment variable.[/green]")
         return
-    path = Path.home() / ".r2g" / SECRET_FILENAME
+    path = default_catalog_dir() / SECRET_FILENAME
     if path.exists():
         console.print(f"[green]Using key file {path}.[/green]")
     else:
