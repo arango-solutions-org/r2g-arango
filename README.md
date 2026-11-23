@@ -664,7 +664,7 @@ r2g cdc-start --pg-conn "..." schema.json mapping.yaml \
 
 A conflict summary table is printed at the end of each CDC session showing counts by conflict type.
 
-For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values:
+For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values. A table without a primary key needs it for deletes: its documents are keyed by every column, so a DELETE without the full old row deletes nothing:
 
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;

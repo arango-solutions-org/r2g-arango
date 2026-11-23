@@ -160,6 +160,38 @@ class TestDeleteTransform:
         assert deltas[1].is_edge
 
 
+class TestKeylessTableDelete:
+    """A keyless table is keyed by every column, on delete as on insert."""
+
+    @staticmethod
+    def _xform() -> DeltaTransformer:
+        schema = Schema(tables={"hero_power": Table(
+            name="hero_power",
+            columns=[Column(name="hero_id", data_type="integer"), Column(name="power_id", data_type="integer")],
+            primary_key=[],
+        )})
+        config = MappingConfig(collections={
+            "hero_power": CollectionMapping(source_table="hero_power", target_collection="hero_power"),
+        })
+        return DeltaTransformer(schema, config)
+
+    def test_delete_with_full_old_row_deletes_the_inserted_document(self):
+        # Regression: the insert was keyed hero_power/1_7, the delete produced nothing.
+        xform = self._xform()
+        row = {"hero_id": 1, "power_id": 7}
+        [ins] = xform.transform(ChangeEvent(operation=ChangeOperation.INSERT, table_name="hero_power", new_row=row))
+        [dele] = xform.transform(ChangeEvent(operation=ChangeOperation.DELETE, table_name="hero_power", old_row=row))
+        assert (ins.collection, ins.key) == ("hero_power", "1_7")
+        assert (dele.operation, dele.collection, dele.key) == (ArangoOperation.DELETE, "hero_power", "1_7")
+
+    def test_delete_without_full_old_row_deletes_nothing(self):
+        # Without REPLICA IDENTITY FULL the old row is partial; a guessed key could hit another row.
+        xform = self._xform()
+        for old in (None, {"hero_id": 1}):
+            evt = ChangeEvent(operation=ChangeOperation.DELETE, table_name="hero_power", old_row=old)
+            assert xform.transform(evt) == []
+
+
 class TestUnmappedTable:
     def test_unmapped_table_produces_no_deltas(self, schema, config):
         xform = DeltaTransformer(schema, config)
