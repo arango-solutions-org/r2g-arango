@@ -36,6 +36,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+### Changed
+
+- **Under a control plane, a project sees only its own source, target and catalog (#61, PRD
+  P14.16).** Once the transformation project the control plane opens exists, the source, target
+  and catalog lists show only its source, the target its loads write to and the catalog its
+  source was imported from. A route about another one answers "not found", as for a name the
+  tenant does not have. Shared-key inference reads only the project's sources. Before the
+  project exists, the Studio still creates it from the tenant's sources. Without
+  `CONTROL_PLANE_URL` nothing changes.
+
 ### Fixed
 
 - **CSV-direct import scripts build composite keys with the mapping's
