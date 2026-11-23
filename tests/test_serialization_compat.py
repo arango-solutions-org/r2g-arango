@@ -27,6 +27,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from r2g.catalog import CatalogManager
 from r2g.classification import annotate_schema
 from r2g.types import (
@@ -264,6 +266,20 @@ class TestSchemaByteStability:
         # Partition metadata.
         assert loaded.tables["events"].is_partitioned is True
         assert loaded.tables["events_2026"].partition_of == "events"
+
+
+class TestViewStatusSerialization:
+    @pytest.mark.parametrize("status", [True, False], ids=["view", "table"])
+    def test_known_status_is_written_last_and_reloads(self, status):
+        table = Table(name="t", columns=[], is_view=status)
+        dumped = table.model_dump()
+        assert list(dumped)[-1] == "is_view"
+        assert Table.model_validate(dumped).is_view is status
+
+    def test_unknown_status_is_not_written(self):
+        table = Table(name="t", columns=[])
+        assert table.is_view is None
+        assert "is_view" not in table.model_dump()
 
 
 class TestMappingConfigByteStability:

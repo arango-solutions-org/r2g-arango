@@ -36,6 +36,15 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+### Fixed
+
+- **Snowflake snapshots record which objects are views (related to #91, PRD P6.1, P6.10).** A
+  captured schema now keeps `is_view`: `true` for a view or materialized view, `false` for a base
+  table, and absent when unknown. Existing snapshots reload unchanged and stay unknown, with no new
+  snapshot format. Newly captured Snowflake schemas serialize different bytes, and one containing a
+  view gets a new physical-schema fingerprint. `source suggest-keys` no longer proposes keys for
+  recognized Snowflake views and reports them as not evaluated, so give them a reviewed key overlay.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added

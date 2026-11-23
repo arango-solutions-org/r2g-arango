@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from r2g.catalog import CatalogManager
+from r2g.catalog import CURRENT_SCHEMA_FORMAT, CatalogManager
 from r2g.snapshot import (
     build_source_schema,
     capture_source_snapshot,
     overlay_fingerprint,
+    read_schema_file,
 )
 from r2g.types import Column, Schema, Table
 
@@ -397,3 +400,111 @@ def test_latest_snapshot_warns_when_it_lost_overlay_unique_keys(monkeypatch, tmp
 
     assert mgr.get_latest_snapshot("wh").id == "old"
     assert warnings == ["snapshot_lost_overlay_unique_keys"]
+
+
+# ── Table or view: true, false, and unknown stay distinct ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected"),
+    [({}, None), ({"is_view": False}, False), ({"is_view": True}, True)],
+    ids=["absent", "false", "true"],
+)
+def test_offline_schema_file_keeps_view_status_through_reload(tmp_path, recorded, expected):
+    path = tmp_path / "schema.json"
+    table = {"name": "X", "columns": [{"name": "A", "data_type": "text"}], **recorded}
+    path.write_text(json.dumps({"tables": {"X": table}}), encoding="utf-8")
+    mgr = CatalogManager(tmp_path / "catalog")
+    mgr.add_source("wh", "snowflake", "snowflake://user:password@account/DB/SCHEMA")
+
+    capture_source_snapshot(
+        mgr, "wh", schema_name="PUBLIC", schema_file=read_schema_file(path)
+    )
+    reloaded = CatalogManager(tmp_path / "catalog").get_latest_snapshot("wh")
+
+    assert reloaded.schema_data.tables["X"].is_view is expected
+    persisted = reloaded.model_dump(mode="json")["schema_data"]["tables"]["X"]
+    assert persisted.get("is_view") is expected
+    assert ("is_view" in persisted) is (expected is not None)
+    assert reloaded.schema_format_version == CURRENT_SCHEMA_FORMAT == 2
+
+
+def test_key_overlay_keeps_view_status(monkeypatch, tmp_path):
+    columns = [Column(name="ID", data_type="number", is_nullable=False)]
+    schema = Schema(
+        tables={
+            "V": Table(name="V", columns=columns, is_view=True),
+            "T": Table(name="T", columns=columns, is_view=False),
+            "U": Table(name="U", columns=columns),
+        }
+    )
+    overlay = {
+        "version": 1,
+        "tables": {name: {"primaryKey": ["ID"]} for name in ("V", "T", "U")},
+    }
+    mgr = CatalogManager(tmp_path)
+    mgr.add_source(
+        "wh", "snowflake", "snowflake://user:password@account/DB/SCHEMA", key_overlay=overlay
+    )
+    monkeypatch.setattr(
+        "r2g.connectors.base.create_source_connector",
+        lambda *args, **kwargs: _Connector(schema),
+    )
+
+    capture_source_snapshot(mgr, "wh", schema_name="PUBLIC")
+    tables = CatalogManager(tmp_path).get_latest_snapshot("wh").schema_data.tables
+
+    assert {n: t.is_view for n, t in tables.items()} == {"V": True, "T": False, "U": None}
+    assert all(t.primary_key == ["ID"] for t in tables.values())
+
+
+def test_legacy_snapshot_reloads_as_unknown_and_resaves_byte_identically():
+    from r2g.catalog import SchemaSnapshot
+
+    legacy = {
+        "id": "old",
+        "source_name": "wh",
+        "schema_data": {
+            "tables": {
+                "X": {
+                    "name": "X",
+                    "columns": [
+                        {
+                            "name": "A",
+                            "data_type": "text",
+                            "is_nullable": True,
+                            "is_primary_key": False,
+                            "classification": None,
+                        }
+                    ],
+                    "primary_key": [],
+                    "foreign_keys": [],
+                    "is_partitioned": False,
+                    "partition_of": None,
+                }
+            }
+        },
+        "captured_at": "2026-01-01T00:00:00Z",
+        "pg_schema": "public",
+        "key_overlay_summary": {},
+        "key_overlay_source": None,
+        "key_overlay_fingerprint": None,
+    }
+    snap = SchemaSnapshot.model_validate(legacy)
+
+    assert snap.schema_data.tables["X"].is_view is None
+    assert snap.schema_format_version == 1
+    saved = snap.model_dump(mode="json")
+    assert saved["schema_data"] == legacy["schema_data"]
+    assert "schema_format_version" not in saved
+
+
+def test_fingerprint_changes_only_for_a_known_view():
+    from relational_schema_analyzer.metadata import fingerprint_physical_schema
+
+    def fingerprint(**status) -> str:
+        table = Table(name="X", columns=[Column(name="A", data_type="text")], **status)
+        return fingerprint_physical_schema(Schema(tables={"X": table}))
+
+    assert fingerprint() == fingerprint(is_view=False)
+    assert fingerprint() != fingerprint(is_view=True)

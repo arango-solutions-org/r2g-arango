@@ -171,3 +171,41 @@ def test_a_sampler_that_cannot_connect_fails_loudly_and_writes_nothing(warehouse
     assert result.exit_code == 1, result.output
     assert "could not connect" in result.output
     assert not (warehouse / "wh.keys.draft.json").exists()
+
+
+def _mark_views(monkeypatch, *names: str) -> None:
+    """fakesnow lists no views, so mark them where r2g's connector returns them."""
+    from r2g.connectors.snowflake import SnowflakeConnector
+
+    real = SnowflakeConnector.get_schema
+
+    def get_schema(self):
+        schema = real(self)
+        for table in schema.tables.values():
+            table.is_view = table.name in names
+        return schema
+
+    monkeypatch.setattr(SnowflakeConnector, "get_schema", get_schema)
+
+
+def test_a_view_is_not_evaluated_and_a_base_table_keeps_its_key(warehouse, monkeypatch):
+    _mark_views(monkeypatch, "ORDERS")
+    result = runner.invoke(app, ["source", "suggest-keys", "wh"])
+    assert result.exit_code == 0, result.output
+
+    draft = json.loads((warehouse / "wh.keys.draft.json").read_text())
+    assert draft["tables"]["CUSTOMERS"]["primaryKey"] == ["CUSTOMER_ID"]
+    assert "primaryKey" not in draft["tables"].get("ORDERS", {})
+    assert "view: uniqueness of a view is not a key" in " ".join(result.output.split())
+
+
+def test_a_view_only_schema_writes_an_empty_draft_and_says_why(warehouse, monkeypatch):
+    _mark_views(monkeypatch, "CUSTOMERS", "ORDERS")
+    result = runner.invoke(app, ["source", "suggest-keys", "wh"])
+    assert result.exit_code == 0, result.output
+
+    draft = json.loads((warehouse / "wh.keys.draft.json").read_text())
+    assert not any("primaryKey" in spec for spec in draft["tables"].values())
+    output = " ".join(result.output.split())
+    assert "CUSTOMERS: view: uniqueness of a view is not a key" in output
+    assert "ORDERS: view: uniqueness of a view is not a key" in output

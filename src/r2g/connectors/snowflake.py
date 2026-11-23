@@ -230,6 +230,7 @@ class SnowflakeConnector:
             columns=columns,
             primary_key=pks,
             foreign_keys=fks,
+            is_view=is_view,
         )
 
     def _fetch_columns(self, conn: Any, table_name: str) -> list[Column]:
