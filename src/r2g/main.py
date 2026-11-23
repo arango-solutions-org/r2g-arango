@@ -742,6 +742,13 @@ def export_r2rml(
     allow_unapplied_labels: bool = typer.Option(
         False, "--allow-unapplied-labels", help=_ALLOW_UNAPPLIED_HELP
     ),
+    csi_file: Optional[str] = typer.Option(
+        None,
+        "--csi",
+        help="CSI JSON written by export-csi from the same mapping: each column predicate "
+        "takes the name the CSI's label-collision renames gave it, so every CSI property "
+        "backed by a column has a predicate map. Without it, a collided label keeps its bare name.",
+    ),
 ) -> None:
     """Emit an R2RML mapping (relational -> RDF) for SPARQL->SQL pushdown via Ontop.
 
@@ -749,7 +756,8 @@ def export_r2rml(
     relational database with no data movement. Concept IRIs default to the same
     namespace the AQL leg uses, so both federation legs share one vocabulary.
     ``--curated-labels`` must be the same file given to ``export-csi``, or the
-    two legs will name concepts differently.
+    two legs will name concepts differently. ``--csi`` makes the predicates
+    follow that CSI's label-collision renames (r2g-arango#17).
     """
     from r2g.csi import curated_plan_for_mapping
     from r2g.curated_labels import load_curated_labels
@@ -767,6 +775,7 @@ def export_r2rml(
                     f"(--allow-unapplied-labels to write anyway).[/red]"
                 )
                 raise typer.Exit(code=1)
+        csi = json.loads(Path(csi_file).read_text(encoding="utf-8")) if csi_file else None
         ttl = mapping_to_r2rml(
             mapping,
             schema,
@@ -774,6 +783,7 @@ def export_r2rml(
             resource_base=resource_base,
             source_type=source_type,
             curated_labels=curated,
+            csi=csi,
         )
         Path(output).write_text(ttl, encoding="utf-8")
         n_entities = sum(

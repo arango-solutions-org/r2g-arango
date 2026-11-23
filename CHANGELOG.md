@@ -75,6 +75,18 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load wrote documents and edge endpoints that a later stream or CDC run could not
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
+- **The R2RML can name collided labels as the CSI does (#17).** `export-csi` qualifies an
+  attribute label two entities share (`name` becomes `accountName` on `Account`) and records the
+  rename in `provenance.labelCollisions`; `export-r2rml` kept the bare label, so a consumer joining
+  the two files on the predicate found no column map for every renamed property. `export-r2rml
+  --csi FILE` (`mapping_to_r2rml(..., csi=...)`) now renames each column predicate as that CSI's
+  `renamedTo` renamed it for the entity, so every CSI property backed by a column has a
+  predicate map under every `--label-policy`. Relationship predicates, `rr:tableName` and
+  `rr:column` are unchanged. A CSI that renames a property of an entity the mapping does not emit
+  (another mapping, or other `--curated-labels`) is refused, as is a malformed `labelCollisions`
+  or a new name that is not a lowerCamel identifier (including one export-csi writes for a column
+  named wholly in a non-Latin script; curate it first). **What changes for a caller:** nothing without
+  `--csi`; the output is byte-identical to before.
 
 ## [0.11.1] — 2026-11-19
 

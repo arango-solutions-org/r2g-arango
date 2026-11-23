@@ -19,7 +19,7 @@ forward-CSI emitter in :mod:`r2g.csi`.
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .types import MappingConfig, Schema, Table
 
@@ -166,6 +166,49 @@ def _xsd_datatype(sql_type: str) -> Optional[str]:
     return None
 
 
+def _csi_renames(csi: Dict[str, Any]) -> Dict[Tuple[str, str], str]:
+    """``(entity, label) -> name`` for each rename a CSI's ``provenance.labelCollisions`` records.
+
+    Only ``renamedTo`` is read, so whatever label policy exported the CSI
+    (``qualify``, ``roles``, ``warn``, ``off``), the R2RML follows it without
+    repeating the collision logic of :func:`r2g.csi._resolve_label_collisions`.
+    """
+    from .curated_labels import explicit_identifier
+
+    if not isinstance(csi, dict):
+        raise R2RMLError(f"csi must be a CSI document (a JSON object), not {type(csi).__name__}")
+    provenance = csi.get("provenance", {})
+    if not isinstance(provenance, dict):
+        raise R2RMLError("csi provenance must be an object")
+    records = provenance.get("labelCollisions", [])
+    if not isinstance(records, list):
+        raise R2RMLError("csi provenance.labelCollisions must be a list")
+    renames: Dict[Tuple[str, str], str] = {}
+    for i, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise R2RMLError(f"csi provenance.labelCollisions[{i}] must be an object")
+        renamed = record.get("renamedTo")
+        if renamed is None:
+            continue  # reported, identity, unresolved or join_key: the label stays as it is
+        label = record.get("label")
+        if (
+            not isinstance(label, str)
+            or not isinstance(renamed, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in renamed.items())
+        ):
+            raise R2RMLError(
+                f"csi provenance.labelCollisions[{i}] needs a string label and a renamedTo "
+                f"object of entity -> new label"
+            )
+        for entity, new_label in renamed.items():
+            # The new name goes into a predicate IRI: only a CC-12 lowerCamel name, never raw text.
+            _, why = explicit_identifier(new_label, "property")
+            if why:
+                raise R2RMLError(f"csi provenance.labelCollisions[{i}] renamedTo {entity}: {why}")
+            renames[(entity, label)] = new_label
+    return renames
+
+
 def _mapped_columns(cm, table: Table) -> List[Tuple[str, str, str]]:
     """(source_column, target_property, sql_type) for each emitted column."""
     include = set(cm.include_fields) if cm.include_fields is not None else None
@@ -189,6 +232,7 @@ def mapping_to_r2rml(
     resource_base: str = DEFAULT_RESOURCE_BASE,
     source_type: str = "relational",
     curated_labels: Optional[dict] = None,
+    csi: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Serialize an r2g mapping to an R2RML Turtle document.
 
@@ -204,13 +248,23 @@ def mapping_to_r2rml(
             predicates and relationships take their curated names from the same
             plan :func:`r2g.csi.mapping_to_csi` applies, so the two legs agree;
             rr:tableName / rr:column keep the physical names.
+        csi: an optional CSI document exported from the same mapping by
+            :func:`r2g.csi.mapping_to_csi` (r2g-arango#17). Each column
+            predicate takes the name the CSI's ``provenance.labelCollisions``
+            ``renamedTo`` gave it on that entity, so every CSI property backed
+            by a column has a predicate map under any ``label_policy``. Relationship predicates,
+            rr:tableName and rr:column are unchanged. Without it the output is
+            byte-identical to before. Give the same ``curated_labels`` as the
+            CSI's export.
 
     Returns:
         An R2RML Turtle document as a string.
 
     Raises:
         R2RMLError: when a document entity's source table is absent from the
-            schema (R2RML cannot be emitted without it).
+            schema (R2RML cannot be emitted without it), or when ``csi`` is
+            malformed or renames a property of an entity this mapping does not
+            emit (a CSI from another mapping or other curated labels).
     """
     # Conceptual entity name per source table (CC-12: singular PascalCase —
     # the class IRI the fabric queries with), for resolving FK edge endpoints
@@ -229,8 +283,11 @@ def mapping_to_r2rml(
     def _entity(generated: str) -> str:
         return plan.entity(generated) if plan is not None else generated
 
+    renames = _csi_renames(csi) if csi is not None else {}
+
     def _predicate(generated_entity: str, generated: str) -> str:
-        return plan.prop(generated_entity, generated) if plan is not None else generated
+        name = plan.prop(generated_entity, generated) if plan is not None else generated
+        return renames.get((_entity(generated_entity), name), name)
 
     def _relationship(generated: str) -> str:
         return plan.relationship(generated) if plan is not None else generated
@@ -240,6 +297,12 @@ def mapping_to_r2rml(
         for cm in config.collections.values()
         if cm.collection_type != "edge" and not cm.is_join_table
     }
+    strangers = sorted({entity for entity, _ in renames} - set(entity_by_source.values()))
+    if strangers:
+        raise R2RMLError(
+            f"the CSI renames properties of {', '.join(strangers)}, which this mapping does not "
+            f"emit; pass the CSI exported from this mapping, with the same curated labels"
+        )
 
     # Group FK relationships by the entity that hosts the referencing object
     # map (the "from" side — the table carrying the foreign key).

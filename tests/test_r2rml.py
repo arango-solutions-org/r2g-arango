@@ -404,3 +404,241 @@ def test_export_r2rml_cli(tmp_path):
     assert result.exit_code == 0, result.output
     g = _parse(out.read_text(encoding="utf-8"))
     assert set(_triples_maps(g)) == {"User", "Order"}
+
+
+# --- names from a CSI (r2g-arango#17) ---------------------------------------------------------
+
+
+def _colliding_config() -> MappingConfig:
+    """Two entities sharing ``acctNo`` (Account's key, Contact's reference), ``name`` and
+    ``created``, so every label policy has something to do."""
+    return MappingConfig(
+        source_schema="crm",
+        collections={
+            "accounts": CollectionMapping(source_table="accounts", target_collection="Account"),
+            "contacts": CollectionMapping(source_table="contacts", target_collection="Contact"),
+        },
+        edges=[
+            EdgeDefinition(
+                edge_collection="works_at",
+                from_collection="contacts",
+                to_collection="accounts",
+                from_fields=["acct_no"],
+                to_fields=["acct_no"],
+            ),
+        ],
+    )
+
+
+def _colliding_schema() -> Schema:
+    return Schema(
+        tables={
+            "accounts": Table(
+                name="accounts",
+                columns=[
+                    Column(name="acct_no", data_type="integer", is_primary_key=True),
+                    Column(name="name", data_type="text"),
+                    Column(name="created", data_type="date"),
+                ],
+                primary_key=["acct_no"],
+            ),
+            "contacts": Table(
+                name="contacts",
+                columns=[
+                    Column(name="contact_no", data_type="integer", is_primary_key=True),
+                    Column(name="acct_no", data_type="integer"),
+                    Column(name="name", data_type="text"),
+                    Column(name="created", data_type="date"),
+                ],
+                primary_key=["contact_no"],
+            ),
+        }
+    )
+
+
+def _unmapped_csi_properties(csi: dict, ttl: str) -> list:
+    """CSI properties with no predicate map on their entity's TriplesMap."""
+    g = _parse(ttl)
+    tms = _triples_maps(g)
+    return sorted(
+        f"{e['name']}.{p['name']}"
+        for e in csi["conceptualModel"]["entities"]
+        for p in e["properties"]
+        if p["name"] not in _poms(g, tms[e["name"]])
+    )
+
+
+@pytest.mark.parametrize("policy", ["qualify", "roles", "warn", "off"])
+def test_csi_names_map_every_csi_property(policy):
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    csi = mapping_to_csi(config, schema, label_policy=policy)
+    assert _unmapped_csi_properties(csi, mapping_to_r2rml(config, schema, csi=csi)) == []
+
+
+def test_without_csi_collided_labels_stay_bare():
+    """The gap #17 reports, kept as the default: no CSI, no renames."""
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    csi = mapping_to_csi(config, schema)  # qualify
+    assert "Account.accountName" in _unmapped_csi_properties(csi, mapping_to_r2rml(config, schema))
+
+
+def test_csi_renames_only_the_column_predicates_it_names():
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    csi = mapping_to_csi(config, schema, label_policy="roles")
+    g = _parse(mapping_to_r2rml(config, schema, csi=csi))
+    tms = _triples_maps(g)
+    account, contact = _poms(g, tms["Account"]), _poms(g, tms["Contact"])
+    # roles: Account owns acctNo and keeps it; the referencing Contact is qualified.
+    assert set(account) == {"acctNo", "accountName", "accountCreated"}
+    assert set(contact) == {"contactNo", "contactAcctNo", "contactName", "contactCreated", "worksAt"}
+    # Physical names and the relationship predicate are untouched.
+    assert str(g.value(contact["contactAcctNo"], RR.column)) == "acct_no"
+    assert str(g.value(account["accountName"], RR.column)) == "name"
+    assert g.value(contact["worksAt"], RR.parentTriplesMap) is not None
+
+
+def test_csi_without_renames_leaves_output_byte_identical():
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    for policy in ("warn", "off"):
+        csi = mapping_to_csi(config, schema, label_policy=policy)
+        assert mapping_to_r2rml(config, schema, csi=csi) == mapping_to_r2rml(config, schema)
+    # And on the module's other fixture, which has no collision a CSI would rename.
+    plain = {"provenance": {}}
+    assert mapping_to_r2rml(_config(), _schema(), csi=plain) == mapping_to_r2rml(_config(), _schema())
+
+
+def test_csi_names_with_curated_labels_match_the_csi():
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    labels = {
+        "curatedLabelsVersion": "1",
+        "entities": [{"name": "Contact", "label": "Person"}],
+        "properties": [{"entity": "Contact", "name": "contactNo", "label": "Person Number"}],
+    }
+    csi = mapping_to_csi(config, schema, curated_labels=labels)
+    ttl = mapping_to_r2rml(config, schema, curated_labels=labels, csi=csi)
+    assert _unmapped_csi_properties(csi, ttl) == []
+    g = _parse(ttl)
+    assert {"personNumber", "personName"} <= set(_poms(g, _triples_maps(g)["Person"]))
+
+
+def test_csi_from_another_mapping_is_refused():
+    from r2g.csi import mapping_to_csi
+
+    config, schema = _colliding_config(), _colliding_schema()
+    labels = {"curatedLabelsVersion": "1", "entities": [{"name": "Contact", "label": "Person"}]}
+    csi = mapping_to_csi(config, schema, curated_labels=labels)
+    with pytest.raises(R2RMLError, match="Person"):
+        mapping_to_r2rml(config, schema, csi=csi)  # curated labels not given to the R2RML
+
+
+@pytest.mark.parametrize(
+    "csi",
+    [
+        [],
+        {"provenance": []},
+        {"provenance": {"labelCollisions": {}}},
+        {"provenance": {"labelCollisions": [{"label": 1, "renamedTo": {"Account": "x"}}]}},
+        {"provenance": {"labelCollisions": [{"label": "name", "renamedTo": ["Account"]}]}},
+        {"provenance": {"labelCollisions": [{"label": "name", "renamedTo": {"Account": ""}}]}},
+        {"provenance": {"labelCollisions": [["name"]]}},
+        {"provenance": {"labelCollisions": [{"label": "name", "renamedTo": {"Account": "a b"}}]}},
+        {
+            "provenance": {
+                "labelCollisions": [
+                    {"label": "name", "renamedTo": {"Account": "x> a rr:TriplesMap; <http://e/i"}}
+                ]
+            }
+        },
+    ],
+)
+def test_malformed_csi_is_refused(csi):
+    with pytest.raises(R2RMLError):
+        mapping_to_r2rml(_colliding_config(), _colliding_schema(), csi=csi)
+
+
+def test_csi_renames_leave_a_relationship_named_like_a_collided_label():
+    """An edge ``owner`` beside a collided ``owner`` column: only the column is renamed."""
+    from r2g.csi import mapping_to_csi
+
+    config = MappingConfig(
+        source_schema="crm",
+        collections={
+            "accounts": CollectionMapping(source_table="accounts", target_collection="Account"),
+            "contacts": CollectionMapping(source_table="contacts", target_collection="Contact"),
+        },
+        edges=[
+            EdgeDefinition(
+                edge_collection="owner",
+                from_collection="contacts",
+                to_collection="accounts",
+                from_fields=["acct_no"],
+                to_fields=["acct_no"],
+            ),
+        ],
+    )
+    schema = Schema(
+        tables={
+            "accounts": Table(
+                name="accounts",
+                columns=[
+                    Column(name="acct_no", data_type="integer", is_primary_key=True),
+                    Column(name="owner", data_type="text"),
+                ],
+                primary_key=["acct_no"],
+            ),
+            "contacts": Table(
+                name="contacts",
+                columns=[
+                    Column(name="contact_no", data_type="integer", is_primary_key=True),
+                    Column(name="acct_no", data_type="integer"),
+                    Column(name="owner", data_type="text"),
+                ],
+                primary_key=["contact_no"],
+            ),
+        }
+    )
+    csi = mapping_to_csi(config, schema, label_policy="qualify")
+    g = _parse(mapping_to_r2rml(config, schema, csi=csi))
+    contact = _poms(g, _triples_maps(g)["Contact"])
+    assert str(g.value(contact["contactOwner"], RR.column)) == "owner"
+    assert g.value(contact["owner"], RR.parentTriplesMap) is not None
+
+
+def test_export_r2rml_cli_csi(tmp_path):
+    import json
+
+    from typer.testing import CliRunner
+
+    from r2g.config import ConfigManager
+    from r2g.csi import mapping_to_csi
+    from r2g.main import app
+
+    config, schema = _colliding_config(), _colliding_schema()
+    schema_path, config_path = tmp_path / "schema.json", tmp_path / "mapping.yaml"
+    schema.save_to_file(str(schema_path))
+    ConfigManager.save_config(config, str(config_path))
+    csi = mapping_to_csi(config, schema)
+    csi_path = tmp_path / "m.csi.json"
+    csi_path.write_text(json.dumps(csi), encoding="utf-8")
+    base = ["export-r2rml", "--config", str(config_path), "--schema", str(schema_path)]
+
+    out = tmp_path / "m.ttl"
+    result = CliRunner().invoke(app, [*base, "-o", str(out), "--csi", str(csi_path)])
+    assert result.exit_code == 0, result.output
+    assert _unmapped_csi_properties(csi, out.read_text(encoding="utf-8")) == []
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    result = CliRunner().invoke(app, [*base, "-o", str(tmp_path / "x.ttl"), "--csi", str(bad)])
+    assert result.exit_code == 1
+    assert not (tmp_path / "x.ttl").exists()
