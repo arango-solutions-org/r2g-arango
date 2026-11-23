@@ -15,7 +15,9 @@ import io
 import itertools
 import json
 import math
+import os
 import random
+import shutil
 import tracemalloc
 from collections import Counter
 from pathlib import Path
@@ -727,6 +729,292 @@ class TestBulk:
             write_bulk(plan, "postgres", rows(), str(tmp_path), seed=0)
         assert not (tmp_path / BULK_MANIFEST_FILE).exists()
         assert not (tmp_path / "forge.bulk.sql").exists()
+
+    # ── a run replaces what Forge wrote before, and nothing else (#94) ──
+
+    @staticmethod
+    def _files(out: Path) -> Dict[str, bytes]:
+        return {str(p.relative_to(out)): p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
+
+    @staticmethod
+    def _failing_rows():
+        yield "departments", {"id": 1, "dept_name": "x"}
+        raise RuntimeError("source died")
+
+    def _run(self, out: Path, employees: int) -> Dict[str, Any]:
+        scale = ForgeScale.from_document({"rows": {"Department": 2, "Employee": employees}})
+        ontology = ForgeOntology.from_conceptual(org_conceptual())
+        return generate_bulk(ontology, str(out), "postgres", 5, scale=scale, chunk_rows=5)
+
+    def test_a_second_run_replaces_the_first_whole(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        manifest = self._run(out, 3)
+        listed = {f["path"] for t in manifest["targets"] for f in t["files"]}
+        on_disk = {p for p in self._files(out) if p.startswith("data/")}
+        assert on_disk == listed == {"data/departments.00000.csv", "data/employees.00000.csv"}
+        assert json.loads((out / BULK_MANIFEST_FILE).read_text()) == manifest
+        assert sorted(p.name for p in out.iterdir()) == ["data", "forge.bulk.json", "forge.bulk.sql", "forge.sql"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+    def test_a_failed_run_leaves_the_earlier_run_untouched(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        before = self._files(out)
+        with pytest.raises(RuntimeError):
+            write_bulk(org_plan(), "postgres", self._failing_rows(), str(out), seed=0, chunk_rows=1)
+        assert self._files(out) == before
+        assert not (out / ".forge-staging").exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+    def test_a_failed_first_run_leaves_nothing(self, tmp_path):
+        with pytest.raises(RuntimeError):
+            write_bulk(org_plan(), "postgres", self._failing_rows(), str(tmp_path / "out"), seed=0)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_failed_run_into_an_existing_empty_dir_keeps_the_dir(self, tmp_path):
+        (tmp_path / "out").mkdir()
+        with pytest.raises(RuntimeError):
+            write_bulk(org_plan(), "postgres", self._failing_rows(), str(tmp_path / "out"), seed=0)
+        assert list((tmp_path / "out").iterdir()) == []
+
+    def test_a_failure_while_closing_leaves_the_earlier_run_untouched(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        before = self._files(out)
+        dialect = get_dialect("postgres")
+
+        def broken_loader(plan, manifest):
+            raise RuntimeError("loader failed")
+
+        monkeypatch.setattr(dialect, "render_bulk_loader", broken_loader)
+        with pytest.raises(RuntimeError, match="loader failed"):
+            self._run(out, 3)
+        assert self._files(out) == before
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+    def test_a_failure_while_moving_in_leaves_no_manifest(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if dst.endswith("employees.00000.csv"):
+                raise OSError("disk full")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", replace)
+        with pytest.raises(OSError, match="disk full"):
+            self._run(out, 3)
+        assert not (out / BULK_MANIFEST_FILE).exists()
+        assert not (out / ".forge-staging").exists()
+
+    def test_forge_output_of_another_mode_or_dialect_is_replaced(self, tmp_path):
+        out = tmp_path / "out"
+        ontology = ForgeOntology.from_conceptual(org_conceptual())
+        generate(ontology, "arango", 5).write_to(str(out))
+        self._run(out, 3)
+        assert not (out / "forge.rows.json").exists()
+        assert not (out / "forge.collections.json").exists()
+        assert not (out / "forge.load.py").exists()
+        assert (out / "forge.bulk.sql").exists()
+
+    @pytest.mark.parametrize(
+        "foreign",
+        [
+            "notes.txt",
+            "data/notes.txt",
+            "scripts/load.sh",
+            ".DS_Store",
+            "data/.DS_Store",
+            "forge.notes.md",
+            "data/departments.00009.csv",
+            "data/export.00001.csv",
+        ],
+    )
+    @pytest.mark.parametrize("first_run", [False, True])
+    def test_a_file_forge_did_not_write_is_kept(self, tmp_path, foreign, first_run):
+        out = tmp_path / "out"
+        if first_run:
+            self._run(out, 23)
+        (out / foreign).parent.mkdir(parents=True, exist_ok=True)
+        (out / foreign).write_text("mine\n")
+        manifest = self._run(out, 3)
+        assert (out / foreign).read_text() == "mine\n"
+        listed = {f["path"] for t in manifest["targets"] for f in t["files"]}
+        assert {p for p in self._files(out) if p.startswith("data/")} - {foreign} == listed
+
+    @pytest.mark.parametrize("path", ["../victim.txt", "data/../../victim.txt", "victim.txt", "data/sub/x.00000.csv"])
+    def test_a_manifest_path_outside_data_is_never_removed(self, tmp_path, path):
+        out = tmp_path / "out"
+        self._run(out, 3)
+        victim = (out / path).resolve()
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_text("mine\n")
+        # The victim's real SHA-256, so only the path rule can keep it.
+        doc = json.loads((out / BULK_MANIFEST_FILE).read_text())
+        doc["targets"][0]["files"].append(
+            {"path": path, "rows": 1, "sha256": hashlib.sha256(b"mine\n").hexdigest()}
+        )
+        (out / BULK_MANIFEST_FILE).write_text(json.dumps(doc))
+        self._run(out, 3)
+        assert victim.read_text() == "mine\n"
+
+    def test_an_unreadable_manifest_removes_no_chunk(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        (out / BULK_MANIFEST_FILE).write_text("{not json")
+        self._run(out, 3)
+        assert (out / "data/employees.00004.csv").exists()
+
+    def test_a_manifest_entry_whose_path_is_not_a_string_is_ignored(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        doc = json.loads((out / BULK_MANIFEST_FILE).read_text())
+        doc["targets"][0]["files"].append({"path": 5, "rows": 1, "sha256": "0" * 64})
+        (out / BULK_MANIFEST_FILE).write_text(json.dumps(doc))
+        manifest = self._run(out, 3)
+        listed = {f["path"] for t in manifest["targets"] for f in t["files"]}
+        assert {p for p in self._files(out) if p.startswith("data/")} == listed
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs a non-root POSIX user")
+    def test_an_unreadable_listed_chunk_is_kept(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        chunk = out / "data/employees.00004.csv"
+        chunk.chmod(0)
+        try:
+            manifest = self._run(out, 3)
+        finally:
+            chunk.chmod(0o600)
+        assert chunk.exists()  # not provably the earlier run's, so not removed
+        assert json.loads((out / BULK_MANIFEST_FILE).read_text()) == manifest
+
+    @pytest.mark.parametrize("path", ["forge.sql", "forge.bulk.sql", "data/employees.00000.csv", BULK_MANIFEST_FILE])
+    def test_a_directory_where_the_run_writes_a_file_is_refused_before_anything_moves(self, tmp_path, path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        (out / path).unlink()
+        (out / path).mkdir()
+        (out / path / "mine.txt").write_text("mine\n")
+        before = self._files(out)
+        with pytest.raises(ForgeError, match="has a directory where this run writes a file"):
+            self._run(out, 3)
+        assert self._files(out) == before
+        assert not (out / ".forge-staging").exists()
+
+    def test_a_directory_at_a_fixed_name_the_run_does_not_write_is_kept(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        (out / "forge.load.py").mkdir()  # an arango-mode fixed name; this run is postgres bulk
+        (out / "forge.load.py" / "mine.txt").write_text("mine\n")
+        manifest = self._run(out, 3)
+        assert (out / "forge.load.py" / "mine.txt").read_text() == "mine\n"
+        assert json.loads((out / BULK_MANIFEST_FILE).read_text()) == manifest
+
+    def test_a_data_that_is_a_file_fails_before_the_earlier_manifest_goes(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        shutil.rmtree(out / "data")
+        (out / "data").write_text("mine\n")
+        before = self._files(out)
+        with pytest.raises(FileExistsError):
+            self._run(out, 3)
+        assert self._files(out) == before
+        assert BULK_MANIFEST_FILE in before
+
+    @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs a non-root POSIX user")
+    def test_a_non_writable_data_is_refused_before_anything_changes(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        before = self._files(out)
+        (out / "data").chmod(0o500)
+        try:
+            with pytest.raises(ForgeError, match="needs writable directories"):
+                self._run(out, 3)
+        finally:
+            (out / "data").chmod(0o700)
+        assert self._files(out) == before
+        assert BULK_MANIFEST_FILE in before
+        assert not (out / ".forge-staging").exists()
+
+    def test_a_repointed_data_symlink_keeps_the_new_targets_files(self, tmp_path):
+        out, d1, d2 = tmp_path / "out", tmp_path / "d1", tmp_path / "d2"
+        for d in (out, d1, d2):
+            d.mkdir()
+        (out / "data").symlink_to(d1, target_is_directory=True)
+        self._run(out, 23)
+        (out / "data").unlink()
+        (out / "data").symlink_to(d2, target_is_directory=True)
+        (d2 / "employees.00004.csv").write_text("mine\n")  # a path the earlier manifest lists
+        self._run(out, 3)
+        assert (d2 / "employees.00004.csv").read_text() == "mine\n"
+        assert (d1 / "employees.00004.csv").exists()  # no longer under out_dir: not touched
+
+    def test_a_listed_chunk_a_user_overwrote_is_kept(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        (out / "data/employees.00004.csv").write_text("mine\n")
+        manifest = self._run(out, 3)
+        assert (out / "data/employees.00004.csv").read_text() == "mine\n"
+        listed = {f["path"] for t in manifest["targets"] for f in t["files"]}
+        assert {p for p in self._files(out) if p.startswith("data/")} == listed | {"data/employees.00004.csv"}
+
+    def test_a_staging_cleanup_failure_after_publishing_is_not_raised(self, tmp_path, monkeypatch):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path, ignore_errors=False, **kw):
+            if os.path.basename(path) != ".forge-staging":
+                return real_rmtree(path, ignore_errors=ignore_errors, **kw)
+            if not ignore_errors:
+                raise OSError("device busy")  # what a failed removal raises without ignore_errors
+
+        monkeypatch.setattr(shutil, "rmtree", rmtree)
+        manifest = self._run(out, 3)
+        assert json.loads((out / BULK_MANIFEST_FILE).read_text()) == manifest
+
+    def test_a_killed_runs_staging_is_removed_by_the_next_run(self, tmp_path):
+        out = tmp_path / "out"
+        self._run(out, 23)
+        before = self._files(out)
+        writer = BulkWriter(org_plan(), "postgres", str(out), seed=0)
+        writer.write("departments", {"id": 1, "dept_name": "x"})
+        writer._close_files()  # abandoned: no close(), no with block
+        assert self._files(out) == {**before, ".forge-staging/data/departments.00000.csv": b'1,"x"\n'}
+        self._run(out, 3)
+        assert not (out / ".forge-staging").exists()
+
+    def test_out_dir_needs_no_writable_parent(self, tmp_path):
+        out = tmp_path / "parent" / "out"
+        self._run(out, 23)
+        (tmp_path / "parent").chmod(0o500)
+        try:
+            manifest = self._run(out, 3)
+        finally:
+            (tmp_path / "parent").chmod(0o700)
+        assert json.loads((out / BULK_MANIFEST_FILE).read_text()) == manifest
+
+    def test_an_out_dir_that_is_a_file_is_refused(self, tmp_path):
+        (tmp_path / "out").write_text("mine\n")
+        with pytest.raises(ForgeError, match="not a directory"):
+            self._run(tmp_path / "out", 3)
+        assert (tmp_path / "out").read_text() == "mine\n"
+
+    def test_out_dir_gets_the_mode_a_new_directory_gets(self, tmp_path):
+        (tmp_path / "plain").mkdir()
+        self._run(tmp_path / "out", 3)
+        assert (tmp_path / "out").stat().st_mode == (tmp_path / "plain").stat().st_mode
+
+    def test_a_symlinked_out_dir_keeps_its_link(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+        self._run(tmp_path / "link", 23)
+        manifest = self._run(tmp_path / "link", 3)
+        assert (tmp_path / "link").is_symlink()
+        assert json.loads((tmp_path / "real" / BULK_MANIFEST_FILE).read_text()) == manifest
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["link", "real"]
 
 
 def test_csv_reader_round_trip_of_values():
