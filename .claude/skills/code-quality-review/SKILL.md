@@ -33,7 +33,7 @@ reading, found all of them. Clear `__pycache__` before trusting a red or a green
 ## Start from the previous audit
 
 `docs/internal/PLAN-code-quality-remediation.md` is the output of the last audit
-(re-audited 2026-06-05, baseline 1000 tests / 80% coverage). Before fanning out:
+(rewritten 2026-11-22, baseline 4022 unit tests / 87% coverage). Before fanning out:
 
 1. Check each of its **open** items against the current code — fixed, still open, or
    moot — and verify, don't assume.
@@ -45,9 +45,9 @@ reading, found all of them. Clear `__pycache__` before trusting a red or a green
 ## Method
 
 Fan out one subagent per dimension in parallel, then verify their headline claims
-yourself before any of it reaches the user. r2g is ~28k lines of Python under
-`src/r2g`, a large single-file Studio front end (`src/r2g/ui/static/index.html`), ~6k
-lines of Markdown under `docs/`, and a 1,200-line PRD; serial review in the main thread
+yourself before any of it reaches the user. r2g is ~34k lines of Python under
+`src/r2g`, a large single-file Studio front end (`src/r2g/ui/static/index.html`), ~7k
+lines of Markdown under `docs/`, and a 1,280-line (259k-character) PRD; serial review in the main thread
 does not fit.
 
 Give each agent the repo context below, and tell it explicitly: rank by consequence,
@@ -122,7 +122,7 @@ reconciles it against the code, so do not re-run that here.
   reading the file end to end? Requirements should be atomic and citable by their
   marker (`P13.3`, `P5c.1.4`, …), because the code and the drift ledger cite them that
   way. A requirement that is really three cannot be closed independently, so it never is.
-- **Bloat.** At ~1,200 lines the PRD is past the 1,000-line ceiling contextual-data-fabric
+- **Bloat.** At ~1,280 lines (and 259k characters, so lines are long) the PRD is past the 1,000-line ceiling contextual-data-fabric
   holds its own documents to, so length here is a real signal, not just density. Look
   for status narrative and dated history that belongs in `CHANGELOG.md` or a plan,
   implementation detail (file paths, line numbers) that has grown into requirement text,
@@ -161,7 +161,7 @@ duplication, exploit paths, judgment calls.
 - **The repo is public and published to PyPI.** Nothing committed is private, now or
   retroactively.
 - **Depends on relational-schema-analyzer (RSA)**, pinned to a band in `pyproject.toml`
-  (`>=0.9.5,<0.10.0` at the time of writing — read the file). Introspection types,
+  (read the file; never quote the band here). Introspection types,
   FK inference, samplers and key overlays come from RSA. A defect may belong upstream.
 - **Consumed by contextual-data-fabric**, which pins r2g exactly in
   `deploy/pins/r2g-arango.txt`. A breaking change here is a coordinated bump there.
@@ -175,11 +175,31 @@ duplication, exploit paths, judgment calls.
 
 ## Known clean
 
-Nothing is recorded as known clean for this skill yet. **Do not inherit
-contextual-data-fabric's list** — it describes a different codebase. The previous plan's
-"Verified safe (no action)" section (`PLAN-code-quality-remediation.md` §1) is a
-starting point to re-check, dated 2026-06-05. After the first run, record here what was
-verified clean, with the date, so the next run can skip it and re-check only what moved.
+Verified on **2026-11-22** against `main` at `b1f2a56`. Skip these next run unless the
+code they name has moved since; `git log --since=2026-11-22 -- <path>` says whether it has.
+
+- **Security:** table preview in Studio and MCP (`sql.Identifier`, snapshot allowlist);
+  Forge DDL refuses hostile identifiers; Snowflake streams/CDC SQL quoting and
+  connection-error scrubbing; AQL in CDC resync, the temporal applier and selective
+  reload uses bind variables; arangoimport command arguments are `shlex.quote`d; no
+  `eval`/`exec`/`subprocess`/`shell=True`/`pickle`/`yaml.load` in `src`; `catalog.json`
+  and `secret.key` are 0600; a cross-site `text/plain` POST gets 422; control-plane
+  routing only (another project 404s, unknown non-GET routes refused, MCP refuses to
+  start) — the rest of project isolation is not known clean;
+  credentials redacted in API responses; CI uses `pull_request`, release uses OIDC.
+- **Duplication:** `naming.py` matches RSA exactly (38,198-word differential); offline
+  sources are refused on every connection path (`require_connection_string`); every
+  surface scrubs errors through `scrub_dsn_credentials`; CDC edge deletes reuse
+  `EdgeTransformer`; Python `_resolve_target` and JS `_resolveProjectTarget` agree.
+- **Hardwired values:** Studio port 8501, MCP SSE port 8502, bulk batch size 10000,
+  CDC batch sizes, the `key_separator` default `_` (except the CSV generator, plan unit
+  7), sampling defaults, MySQL/SQL Server/ClickHouse test DSNs.
+- **Docs:** every fenced `r2g` command in `README.md` and the examples parses; every
+  option named in CHANGELOG [Unreleased], 0.11.1 and 0.11.0 exists; every MCP tool the
+  docs name is registered; Python 3.10+ is stated consistently; RSA band is not quoted
+  in user-facing docs.
+- **PRD:** no duplicate markers; no dangling marker citations in the repo; all 154
+  `file:line` citations pass `check_evidence.py`.
 
 ## Rewrite what you retire
 
