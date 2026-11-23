@@ -527,3 +527,139 @@ class TestTheMcpServerDoesNotRunHere:
                            env=env, capture_output=True, text=True)
         assert (p.returncode != 0) is refused
         assert ("CONTROL_PLANE_URL is set" in p.stderr) is refused
+
+
+# --- P14.16: once its project exists, a project sees its own sources, targets, catalogs ---
+
+
+class OpensOneNotYetCreated(FakeControlPlane):
+    def project(self, identity: control_plane.Identity) -> control_plane.Project:
+        return control_plane.Project("equity", "Equity research", "new-one")
+
+
+def _tenant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake: FakeControlPlane) -> TestClient:
+    """Two projects in one tenant, each with its own source (imported from its own catalog,
+    with a snapshot) and its own target."""
+    from r2g.types import Schema
+
+    monkeypatch.setenv("CONTROL_PLANE_URL", "http://cp.test/api")
+    monkeypatch.setenv("R2G_TENANT", "local")
+    monkeypatch.delenv("AOE_URL", raising=False)
+    control_plane.set_instance(fake)
+    catalog = CatalogManager(tmp_path)
+    for name, project in (("crm", "customer-360"), ("hr", "someone-elses")):
+        catalog.add_catalog(f"{name}-catalog", "openmetadata", "http://om.test")
+        catalog.add_source(name, "csv", str(tmp_path), catalog_name=f"{name}-catalog")
+        catalog.create_snapshot(name, Schema())
+        catalog.add_target(f"{name}-graph", database=name)
+        (tmp_path / f"{project}.yaml").write_text("collections: {}\nedges: []\n")
+        catalog.create_project(project, name, str(tmp_path / f"{project}.yaml"))
+        catalog.update_project(project, target_name=f"{name}-graph")
+    return TestClient(create_app(catalog_dir=str(tmp_path), host="0.0.0.0"))
+
+
+@pytest.fixture
+def tenant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    yield _tenant(tmp_path, monkeypatch, FakeControlPlane())
+    control_plane.set_instance(None)
+
+
+@pytest.fixture
+def before_its_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    yield _tenant(tmp_path, monkeypatch, OpensOneNotYetCreated())
+    control_plane.set_instance(None)
+
+
+def _names(client: TestClient, path: str) -> list[str]:
+    r = client.get(path, headers=bearer())
+    assert r.status_code == 200, r.text
+    return sorted(item["name"] for item in r.json())
+
+
+def test_the_lists_show_only_the_projects_own(tenant):
+    assert _names(tenant, "/api/sources") == ["crm"]
+    assert _names(tenant, "/api/targets") == ["crm-graph"]
+    assert _names(tenant, "/api/catalogs") == ["crm-catalog"]
+
+
+@pytest.mark.parametrize("method, path", [
+    ("GET", "/api/sources/{source}/schema"),
+    ("POST", "/api/sources/{source}/infer-fks"),
+    ("POST", "/api/sources/{source}/analyze-denorm"),
+    ("GET", "/api/sources/{source}/preview/t"),
+    ("DELETE", "/api/sources/{source}"),
+    ("POST", "/api/targets/{target}/introspect"),
+    ("DELETE", "/api/targets/{target}"),
+    ("GET", "/api/catalogs/{catalog}/browse"),
+    ("DELETE", "/api/catalogs/{catalog}"),
+])
+def test_another_projects_is_not_found_like_one_the_tenant_lacks(tenant, method, path):
+    def ask(name: str):
+        url = path.format(source=name, target=name, catalog=name)
+        return tenant.request(method, url, headers=bearer(),
+                              json=None if method in ("GET", "DELETE") else {})
+
+    theirs = ask({"source": "hr", "target": "hr-graph", "catalog": "hr-catalog"}[
+        path.split("/")[2][:-1]])
+    nobodys = ask("no-such-name")
+    assert theirs.status_code == nobodys.status_code == 404
+    assert theirs.json() == nobodys.json()
+
+
+def test_its_own_are_served(tenant):
+    assert tenant.get("/api/sources/crm/schema", headers=bearer()).status_code == 200
+    r = tenant.post("/api/sources/crm/infer-fks", headers=bearer(), json={})
+    assert r.status_code == 200, r.text
+
+
+def test_shared_key_inference_reads_only_the_projects_sources(tenant):
+    # The project sees one source, so there is nothing to infer across; the other
+    # project's source is not counted, whether asked for by name or not.
+    for sources in (None, ["crm", "hr"]):
+        r = tenant.post("/api/shared-keys/infer", headers=bearer(),
+                        json={} if sources is None else {"sources": sources})
+        assert r.status_code == 400 and "got 1" in r.json()["detail"], r.text
+    theirs = tenant.post("/api/shared-keys/infer", headers=bearer(),
+                         json={"sources": ["crm", "hr"]})
+    nobodys = tenant.post("/api/shared-keys/infer", headers=bearer(),
+                          json={"sources": ["crm", "no-such-name"]})
+    assert theirs.json() == nobodys.json()
+
+
+def test_shared_key_inference_names_no_other_projects_source(tenant, tmp_path, monkeypatch):
+    # A project that sees two sources (one r2g project has one; the control plane may
+    # attach more): inferring across them by default neither reads nor names the others.
+    from r2g.types import Schema
+    from r2g.ui import server
+
+    catalog = CatalogManager(tmp_path)
+    catalog.add_source("crm2", "csv", str(tmp_path))
+    catalog.create_snapshot("crm2", Schema())
+    real = server._what_it_sees
+    monkeypatch.setattr(server, "_what_it_sees", lambda c, opens: {
+        **real(c, opens), "sources": {"crm", "crm2"}})
+    r = tenant.post("/api/shared-keys/infer", headers=bearer(), json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["skipped"] == []
+
+
+def test_before_its_project_exists_the_tenants_sources_are_offered(before_its_project):
+    client = before_its_project
+    assert _names(client, "/api/sources") == ["crm", "hr"]
+    assert client.get("/api/sources/hr/schema", headers=bearer()).status_code == 200
+    # Creating it narrows what it sees to its own from then on.
+    r = client.post("/api/projects", headers=bearer(),
+                    json={"name": "new-one", "source_name": "crm"})
+    assert r.status_code == 201, r.text
+    assert _names(client, "/api/sources") == ["crm"]
+    assert client.get("/api/sources/hr/schema", headers=bearer()).status_code == 404
+
+
+def test_without_a_control_plane_every_project_sees_the_tenants(tmp_path, monkeypatch):
+    client = _tenant(tmp_path, monkeypatch, FakeControlPlane())
+    monkeypatch.delenv("CONTROL_PLANE_URL")
+    control_plane.set_instance(None)
+    client = TestClient(create_app(catalog_dir=str(tmp_path)))
+    assert _names(client, "/api/sources") == ["crm", "hr"]
+    assert _names(client, "/api/targets") == ["crm-graph", "hr-graph"]
+    assert client.get("/api/sources/hr/schema").status_code == 200

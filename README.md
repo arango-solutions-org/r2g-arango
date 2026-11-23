@@ -311,6 +311,23 @@ each snapshot. r2g never invents those keys. Name-based FK suggestions work for
 Snowflake, but value-overlap sampling is not yet implemented for Snowflake and
 falls back to name-only evidence.
 
+### A source you cannot connect to
+
+When a partner hands over its schema rather than a connection, register the
+source offline and take its snapshot from a schema file:
+
+```bash
+r2g source add --name partner --type snowflake --offline --key-overlay ./keys.overlay.json
+r2g source snapshot partner --pg-schema SCHEMA --from-file ./schema.json
+```
+
+The file is RSA `PhysicalSchema` JSON, the format `r2g ingest-schema` writes. It
+goes through the same key-overlay and classification steps as an introspected
+schema, and the snapshot records the file's path and SHA-256. An offline source
+stores no connection string, so anything that would read from it directly
+(`source dump`, `source suggest-keys`, `stream`, `cdc-start`, value sampling) refuses with that reason. Raw
+DDL is not read here: convert it to `PhysicalSchema` JSON first.
+
 Export CSV files or stream directly from the registered source:
 
 ```bash
@@ -538,10 +555,10 @@ r2g stream --dry-run \
 
 | Command | Description |
 |---|---|
-| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic) |
+| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic); `--offline` registers one with no connection |
 | `source list` | List all registered data sources |
 | `source remove` | Remove a registered data source |
-| `source snapshot` | Introspect the schema from a source and save a snapshot |
+| `source snapshot` | Introspect the schema from a source and save a snapshot (`--from-file` reads it from a schema file instead; required for an `--offline` source) |
 | `source dump` | Dump every table in a cataloged source to CSV files (source-agnostic replacement for `dump-tables`) |
 | `source infer-fks` | Propose foreign keys for a source's latest schema snapshot (`--sample` for value-overlap scoring, `--accept` to write back) |
 | `source analyze-denorm` | Detect denormalization smells (repeating column groups; embedded lookups via `--sample`) and recommend graph remedies — advisory, read-only (`--min-confidence`, `--no-sample-columns`, `--json`) |
@@ -772,7 +789,7 @@ r2g is a reference application (see the Status note near the top): well-tested, 
 - **Incremental + change capture** -- `stream --since` filters rows by a timestamp column for basic incremental loads; full change capture is available via the CDC (`cdc-start`) and Kafka (`kafka-start`) pipelines with configurable conflict resolution, and `mapping-diff` / `selective-reload` reconcile mapping changes against an already-loaded target.
 - **Self-referential FKs** -- these work but produce edges within the same collection (e.g., `orders.referrer_id -> customers.id` creates `orders_to_customers_referrer_id`). This is correct but may be unexpected.
 - **ArangoDB write path** -- the `stream` command connects directly to ArangoDB via python-arango, but the file-based paths (`generate-csv-import`, `generate-import`) still require `arangoimport` installed separately.
-- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `~/.r2g/secret.key` (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
+- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `secret.key` in the catalog directory, `~/.r2g` unless `R2G_CATALOG_DIR` says otherwise (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
 
 ## Testing
 
@@ -833,8 +850,9 @@ environment variables (see [.env.example](.env.example)):
 |---|---|
 | `R2G_API_TOKEN` | Require `Authorization: Bearer <token>` on the UI API and the MCP SSE transport. A token is auto-generated and printed when binding to a non-loopback address. |
 | `R2G_CORS_ORIGINS` | Comma-separated allow-list of CORS origins for the UI (default: same-origin only). |
+| `R2G_CATALOG_DIR` | Directory holding the catalog (`catalog.json`), its `secret.key` and the dead-letter queue (default: `~/.r2g`). |
 | `R2G_CSV_BASE_DIR` | Confine CSV sources to a trusted directory tree; paths outside it (including via symlinks/`..`) are rejected. |
-| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `~/.r2g/secret.key`). |
+| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `secret.key` in the catalog directory). |
 
 The MCP `stdio` transport (Cursor / Claude Desktop) is local-only and needs no
 token; only the network-exposed SSE transport is gated.

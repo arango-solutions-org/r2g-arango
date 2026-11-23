@@ -128,6 +128,38 @@ _OPEN_PATHS = frozenset({"", "/", "/api/health", "/api/mode"})
 #: (graph-data, which carries each element's ontology term), and nothing else.
 _SERVICE_READS = re.compile(r"^/api/projects/[^/]+/graph-data$")
 _OPEN_PREFIXES = ("/static/",)
+#: A route about one source, target or catalog: ``/api/<kind>/<name>[/...]``.
+_SHARED_ROUTE = re.compile(r"^/api/(sources|targets|catalogs)/([^/]+)")
+
+
+def _project_target(catalog: CatalogManager, project: Any) -> Any:
+    """The target a project's loads write to: the one it names, else the one at its
+    endpoint and database, else none."""
+    target_name = getattr(project, "target_name", None)
+    if target_name and (target := catalog.get_target(target_name)) is not None:
+        return target
+    for t in catalog.list_targets():
+        if t.endpoint == project.arango_endpoint and t.database == project.arango_database:
+            return t
+    return None
+
+
+def _what_it_sees(catalog: CatalogManager, opens: str | None) -> dict[str, set[str]] | None:
+    """Under a control plane, the sources, targets and catalogs the transformation project
+    ``opens`` sees once it exists (P14.16): its source, the target its loads write to, and
+    the catalog its source was imported from. ``None`` until it exists: the Studio creates
+    it from the tenant's list."""
+    project = catalog.get_project(opens) if opens else None
+    if project is None:
+        return None
+    source = catalog.get_source(project.source_name)
+    target = _project_target(catalog, project)
+    return {
+        "sources": {project.source_name},
+        "targets": {target.name} if target is not None else set(),
+        "catalogs": ({source.catalog_name} if source is not None and source.catalog_name
+                     else set()),
+    }
 
 
 def _redact_token_in_query(target: str) -> str:
@@ -157,10 +189,11 @@ class _RedactTokenInQuery(logging.Filter):
 _REDACT_TOKEN_IN_QUERY = _RedactTokenInQuery()
 
 
-def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
+def _add_control_plane_auth(app: FastAPI, *, cors: bool, catalog: CatalogManager) -> None:
     """Under a control plane: a context token on every ``/api`` call (``?token=`` on the
     load-progress stream, which cannot carry a header), from this deployment's tenant,
-    and only the transformation project the control-plane project opens here."""
+    only the transformation project the control-plane project opens here, and once that
+    exists, only the sources, targets and catalogs it sees."""
     tenant = os.environ.get("R2G_TENANT", "").strip()
     if not tenant:
         # Without it every tenant's context would get in, sharing one catalog.
@@ -218,6 +251,14 @@ def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
         if m and m.group(1) != project.opens:  # scope['path'] is already decoded
             # Another project is not visible here, the way a foreign one is not found.
             return JSONResponse({"detail": "Project not found"}, status_code=404)
+        s = _SHARED_ROUTE.match(path)
+        if s and project.opens:
+            # P14.16: any name the project does not see is not found, whether or not the
+            # tenant has it, so a route added later is limited too.
+            seen = await run_in_threadpool(_what_it_sees, catalog, project.opens)
+            if seen is not None and s.group(2) not in seen[s.group(1)]:
+                kind_name = s.group(1)[:-1].capitalize()
+                return JSONResponse({"detail": f"{kind_name} not found"}, status_code=404)
         kind, why = governing.classify(request.method, path)
         if kind == "refused":  # P14.12: not governed, so not available here
             return JSONResponse({"detail": why}, status_code=403)
@@ -252,11 +293,13 @@ def create_app(
             allow_headers=["*"],
         )
 
+    catalog = CatalogManager(catalog_dir)
+
     # ── Under a control plane, its context token is the only credential. ──
     governed = control_plane.mode()
     app.state.control_plane = governed
     if governed:
-        _add_control_plane_auth(app, cors=bool(cors_origins))
+        _add_control_plane_auth(app, cors=bool(cors_origins), catalog=catalog)
 
     # ── Otherwise, optional Bearer-token auth. ──
     token = (api_token or os.environ.get("R2G_API_TOKEN") or "").strip()
@@ -281,7 +324,6 @@ def create_app(
                     return JSONResponse({"detail": "Unauthorized"}, status_code=401)
             return await call_next(request)
 
-    catalog = CatalogManager(catalog_dir)
     # Mapping files for API-created projects are confined here, never to a
     # client-supplied path (prevents path traversal / arbitrary file writes).
     _projects_root = catalog.dir.expanduser() / "projects"
@@ -323,15 +365,7 @@ def create_app(
         Prefers an explicitly linked target, then a target matching the project's
         endpoint+database, falling back to the project fields + env credentials.
         """
-        target = None
-        target_name = getattr(project, "target_name", None)
-        if target_name:
-            target = catalog.get_target(target_name)
-        if target is None:
-            for _tgt in catalog.list_targets():
-                if _tgt.endpoint == project.arango_endpoint and _tgt.database == project.arango_database:
-                    target = _tgt
-                    break
+        target = _project_target(catalog, project)
         if target is not None:
             return target.endpoint, target.database, target.username, target.password
         return (
@@ -691,9 +725,15 @@ def create_app(
 
     # ── Source endpoints ──────────────────────────────────────────────
 
+    def _seen(request: Request) -> dict[str, set[str]] | None:
+        """What the open project sees under a control plane (P14.16); ``None`` for all."""
+        return _what_it_sees(catalog, request.state.cp_project.opens) if governed else None
+
     @app.get("/api/sources")
-    async def list_sources():
+    async def list_sources(request: Request):
         sources = catalog.list_sources()
+        if (seen := _seen(request)) is not None:
+            sources = [s for s in sources if s.name in seen["sources"]]
         return [_redact_source(s.model_dump()) for s in sources]
 
     @app.post("/api/sources", status_code=201)
@@ -829,7 +869,8 @@ def create_app(
         }
 
     @app.post("/api/shared-keys/infer")
-    async def infer_shared_keys_endpoint(body: InferSharedKeysRequest | None = None):
+    async def infer_shared_keys_endpoint(request: Request,
+                                         body: InferSharedKeysRequest | None = None):
         """Propose cross-source shared-key relationships (PRD P6.7).
 
         Unlike ``/api/sources/{name}/infer-fks`` this is *not* source-scoped:
@@ -844,12 +885,18 @@ def create_app(
         from r2g.xsk import SharedKeyOptions, infer_shared_keys
 
         req = body or InferSharedKeysRequest()
-        wanted = req.sources if req.sources else [s.name for s in catalog.list_sources()]
+        # P14.16: under a control plane, only the sources the open project sees; another
+        # is skipped as one the tenant does not have.
+        seen = _seen(request)
+        everything = ([s.name for s in catalog.list_sources()] if seen is None
+                      else sorted(seen["sources"]))
+        wanted = req.sources if req.sources else everything
 
         schemas: dict[str, Any] = {}
         skipped: list[dict[str, str]] = []
         for source_name in wanted:
-            source = catalog.get_source(source_name)
+            source = (catalog.get_source(source_name)
+                      if seen is None or source_name in seen["sources"] else None)
             if source is None:
                 skipped.append({"source": source_name, "reason": "not found in catalog"})
                 continue
@@ -1024,6 +1071,8 @@ def create_app(
             return {"table": table, "rows": rows, "count": len(rows)}
         except HTTPException:
             raise
+        except ValueError as e:  # an offline source: nothing to connect to (P6.17)
+            raise HTTPException(status_code=400, detail=_safe_detail(e))
         except Exception as e:
             logger.warning("preview_table_failed", source=name, table=table, error=str(e))
             raise HTTPException(status_code=500, detail="Failed to preview table data")
@@ -2237,8 +2286,11 @@ def create_app(
     # ── Target endpoints ───────────────────────────────────────────────
 
     @app.get("/api/targets")
-    async def list_targets():
-        return [_redact_target(t.model_dump()) for t in catalog.list_targets()]
+    async def list_targets(request: Request):
+        targets = catalog.list_targets()
+        if (seen := _seen(request)) is not None:
+            targets = [t for t in targets if t.name in seen["targets"]]
+        return [_redact_target(t.model_dump()) for t in targets]
 
     @app.post("/api/targets", status_code=201)
     async def add_target(body: TargetCreateRequest):
@@ -2302,8 +2354,11 @@ def create_app(
         )
 
     @app.get("/api/catalogs")
-    async def list_catalogs():
-        return [_redact_catalog(c.model_dump()) for c in catalog.list_catalogs()]
+    async def list_catalogs(request: Request):
+        catalogs = catalog.list_catalogs()
+        if (seen := _seen(request)) is not None:
+            catalogs = [c for c in catalogs if c.name in seen["catalogs"]]
+        return [_redact_catalog(c.model_dump()) for c in catalogs]
 
     @app.post("/api/catalogs", status_code=201)
     async def add_catalog(body: CatalogCreateRequest):

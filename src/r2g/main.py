@@ -1784,6 +1784,7 @@ def cdc_start(
         if source is None:
             console.print(f"[red]Source '{source_name}' not found in catalog.[/red]")
             raise typer.Exit(code=1)
+        _refuse_offline(source, "cdc-start")
         source_type = (source.source_type or "postgresql").lower()
         source_conn = source.connection_string
         if source_type not in ("postgresql", "snowflake"):
@@ -2320,6 +2321,18 @@ def mcp_cmd(
 # ── Source commands ───────────────────────────────────────────────────
 
 
+def _refuse_offline(source: Any, needs: str) -> None:
+    """Exit with the reason when *needs* would read from an offline source."""
+    from r2g.snapshot import is_offline
+
+    if is_offline(source):
+        console.print(
+            f"[red]Source '{source.name}' is offline (registered without a connection), "
+            f"so {needs} cannot read from it.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+
 def _get_catalog():
     from r2g.catalog import CatalogManager
     return CatalogManager()
@@ -2336,7 +2349,9 @@ def source_add(
             "clickhouse, csv, or kafka"
         ),
     ),
-    conn: str = typer.Option(..., "--conn", help="Connection string"),
+    conn: Optional[str] = typer.Option(
+        None, "--conn", help="Connection string (omit with --offline)"
+    ),
     description: str = typer.Option("", "--description", help="Description"),
     owner: str = typer.Option("", "--owner", help="Owner"),
     key_overlay: Optional[str] = typer.Option(
@@ -2344,8 +2359,24 @@ def source_add(
         "--key-overlay",
         help="Reviewed PK/FK overlay JSON or YAML (parsed and stored with the source)",
     ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help=(
+            "Register a source we cannot connect to: no connection string, and "
+            "snapshots are read from a schema file (source snapshot --from-file)"
+        ),
+    ),
 ) -> None:
     """Register a new data source."""
+    if offline and conn:
+        console.print("[red]--offline registers a source with no connection; drop --conn.[/red]")
+        raise typer.Exit(code=1)
+    if not offline and not conn:
+        console.print(
+            "[red]Give --conn, or --offline for a source we cannot connect to.[/red]"
+        )
+        raise typer.Exit(code=1)
     try:
         mgr = _get_catalog()
         overlay_data = None
@@ -2355,16 +2386,25 @@ def source_add(
 
             overlay_data = load_key_overlay(key_overlay)
             overlay_source = str(Path(key_overlay).expanduser().resolve())
+        from r2g.snapshot import OFFLINE_PARAM
+
         source = mgr.add_source(
             name,
             source_type,
-            conn,
+            conn or "",
             description=description,
             owner=owner,
+            source_params={OFFLINE_PARAM: True} if offline else None,
             key_overlay=overlay_data,
             key_overlay_source=overlay_source,
         )
-        console.print(f"[green]Source '{source.name}' added.[/green]")
+        if offline:
+            console.print(
+                f"[green]Offline source '{source.name}' added.[/green] "
+                f"Take its snapshot with: r2g source snapshot {source.name} --from-file <schema.json>"
+            )
+        else:
+            console.print(f"[green]Source '{source.name}' added.[/green]")
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1)
@@ -2388,8 +2428,11 @@ def source_list() -> None:
     table.add_column("Description")
     table.add_column("Owner")
     table.add_column("Updated")
+    from r2g.snapshot import is_offline
+
     for s in sources:
-        table.add_row(s.name, s.source_type, s.description, s.owner, s.updated_at.isoformat())
+        kind = f"{s.source_type} (offline)" if is_offline(s) else s.source_type
+        table.add_row(s.name, kind, s.description, s.owner, s.updated_at.isoformat())
     console.print(table)
 
 
@@ -2418,19 +2461,46 @@ def source_snapshot(
         ),
     ),
     compare_last: bool = typer.Option(False, "--compare-last", help="Diff against previous snapshot"),
+    from_file: Optional[str] = typer.Option(
+        None,
+        "--from-file",
+        help=(
+            "Read the schema from this file (RSA PhysicalSchema JSON, as "
+            "ingest-schema writes) instead of connecting. Required for an "
+            "offline source."
+        ),
+    ),
 ) -> None:
     """Introspect the schema from the source and save a snapshot.
 
     Uses the source's ``source_type`` (``postgresql``, ``mysql``,
     ``sqlserver``, ``snowflake``, ``clickhouse``, or ``csv``) to pick the
-    right connector.
+    right connector. With ``--from-file`` the schema is read from a file
+    instead, and goes through the same key-overlay and classification steps.
     """
-    from r2g.snapshot import capture_source_snapshot
+    from r2g.snapshot import (
+        SchemaFileError,
+        capture_source_snapshot,
+        is_offline,
+        read_schema_file,
+    )
 
     mgr = _get_catalog()
     source = mgr.get_source(name)
     if source is None:
         console.print(f"[red]Source '{name}' not found.[/red]")
+        raise typer.Exit(code=1)
+    if from_file is None and is_offline(source):
+        console.print(
+            f"[red]Source '{name}' is offline (registered without a connection).[/red] "
+            f"Take its snapshot with --from-file <schema.json>."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        schema_file = read_schema_file(from_file) if from_file is not None else None
+    except SchemaFileError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(code=1)
 
     try:
@@ -2439,12 +2509,19 @@ def source_snapshot(
             mgr,
             name,
             schema_name=pg_schema,
+            schema_file=schema_file,
         )
         schema = result.schema
+        captured = "read from file" if schema_file is not None else "captured"
         console.print(
             f"[green]Snapshot created:[/green] {snap.id}\n"
-            f"  {len(schema.tables)} tables captured at {snap.captured_at.isoformat()}"
+            f"  {len(schema.tables)} tables {captured} at {snap.captured_at.isoformat()}"
         )
+        if schema_file is not None:
+            console.print(
+                f"  [dim]Schema file {escape(schema_file.source)} "
+                f"(sha256 {schema_file.fingerprint[:12]}…)[/dim]"
+            )
         if result.classifications_applied:
             console.print(
                 f"  [cyan]Annotated {result.classifications_applied} column(s) "
@@ -2879,6 +2956,7 @@ def source_infer_fks(
 
     sampler = None
     if sample:
+        _refuse_offline(source, "--sample")
         sampler = create_value_sampler(
             source.source_type,
             source.connection_string,
@@ -2955,8 +3033,9 @@ def source_infer_fks(
             records.append(c.accepted_record())
             accepted += 1
         if accepted:
-            # Carry the overlay record forward: this snapshot is the previous one
-            # plus accepted keys, so it was still built on that reviewed overlay.
+            # Carry the overlay and schema-file records forward: this snapshot is
+            # the previous one plus accepted keys, so it was still built on that
+            # reviewed overlay and read from the same file.
             mgr.create_snapshot(
                 name,
                 schema,
@@ -2965,6 +3044,8 @@ def source_infer_fks(
                 key_overlay_source=snap.key_overlay_source,
                 key_overlay_fingerprint=snap.key_overlay_fingerprint,
                 inferred_keys=records,
+                schema_file_source=snap.schema_file_source,
+                schema_file_fingerprint=snap.schema_file_fingerprint,
             )
             console.print(
                 f"[green]Accepted {accepted} candidate(s); wrote a new snapshot "
@@ -3204,6 +3285,7 @@ def source_analyze_denorm(
 
     sampler = None
     if sample:
+        _refuse_offline(source, "--sample")
         sampler = create_value_sampler(
             source.source_type,
             source.connection_string,
@@ -4234,17 +4316,17 @@ def secrets_init(
     on-disk key file is not touched and this command is a no-op.
     """
     import os
-    from pathlib import Path
 
     from cryptography.fernet import Fernet
 
+    from r2g.catalog import default_catalog_dir
     from r2g.security import SECRET_ENV, SECRET_FILENAME
 
     if os.environ.get(SECRET_ENV):
         console.print(f"[yellow]{SECRET_ENV} is set; on-disk key is ignored while it is present.[/yellow]")
         return
 
-    path = Path.home() / ".r2g" / SECRET_FILENAME
+    path = default_catalog_dir() / SECRET_FILENAME
     if path.exists() and not force:
         console.print(f"[yellow]Secret key already exists at {path} (use --force to replace).[/yellow]")
         return
@@ -4279,14 +4361,14 @@ def secrets_migrate() -> None:
 def secrets_status() -> None:
     """Show where the active secret key is coming from."""
     import os
-    from pathlib import Path
 
+    from r2g.catalog import default_catalog_dir
     from r2g.security import SECRET_ENV, SECRET_FILENAME
 
     if os.environ.get(SECRET_ENV):
         console.print(f"[green]Using {SECRET_ENV} environment variable.[/green]")
         return
-    path = Path.home() / ".r2g" / SECRET_FILENAME
+    path = default_catalog_dir() / SECRET_FILENAME
     if path.exists():
         console.print(f"[green]Using key file {path}.[/green]")
     else:

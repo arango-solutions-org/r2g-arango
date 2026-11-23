@@ -90,6 +90,21 @@ SUPPORTED_SOURCE_TYPES: tuple[str, ...] = (
 )
 
 
+def require_connection_string(connection_string: str | None, source_type: str | None) -> None:
+    """Refuse an empty connection string with the reason.
+
+    An offline source (``source add --offline``) is stored with no connection
+    string. Anything that would read from it directly fails here, naming why,
+    instead of inside a database driver.
+    """
+    if not (connection_string or "").strip():
+        raise ValueError(
+            f"This {source_type or 'source'} source has no connection string. A source "
+            "registered with --offline has no connection: its snapshots are read from a "
+            "schema file, and nothing can be read from it directly."
+        )
+
+
 def create_source_connector(
     source_type: str,
     connection_string: str,
@@ -111,6 +126,7 @@ def create_source_connector(
 
     key = normalize_source_type(source_type)
     params = source_params or {}
+    require_connection_string(connection_string, key)
     # Resolve $VAR / ${VAR} credential references (env / r2g secrets) so the
     # catalog never has to store secrets and imported sources connect cleanly.
     connection_string = expand_env_vars(connection_string)

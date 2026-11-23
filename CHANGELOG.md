@@ -9,6 +9,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
+  `r2g source add --offline` registers a source with no connection string, and
+  `r2g source snapshot NAME --from-file schema.json` takes its snapshot from RSA `PhysicalSchema`
+  JSON through the same key-overlay and classification steps as introspection. The snapshot records
+  the file's path and SHA-256. Commands that would read from an offline source refuse with the
+  reason instead of failing in a driver. Not yet: offline registration in the Studio and MCP, and
+  reading raw DDL (convert it to `PhysicalSchema` JSON first).
 - **Snowflake change capture through standard streams (#65, PRD P6.16).** `r2g cdc-start --source
   <snowflake source>` keeps an ArangoDB copy current from one Snowflake stream per mapped table,
   view or dynamic table, with no full reload. Inserts, updates and deletes go through the same
@@ -28,6 +35,32 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run instead.
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
+
+### Changed
+
+- **Under a control plane, a project sees only its own source, target and catalog (#61, PRD
+  P14.16).** Once the transformation project the control plane opens exists, the source, target
+  and catalog lists show only its source, the target its loads write to and the catalog its
+  source was imported from. A route about another one answers "not found", as for a name the
+  tenant does not have. Shared-key inference reads only the project's sources. Before the
+  project exists, the Studio still creates it from the tenant's sources. Without
+  `CONTROL_PLANE_URL` nothing changes.
+
+### Fixed
+
+- **`r2g secrets init` and `r2g secrets status` use the catalog's directory.** They
+  hardwired `~/.r2g/secret.key`, while the catalog reads `secret.key` from its own
+  directory and honours `R2G_CATALOG_DIR`. With that variable set (the control-plane
+  image sets it), `status` reported a file that did not exist and `init` wrote a second
+  key the catalog never read. Both now resolve the directory as the catalog does;
+  `R2G_CATALOG_DIR` is documented in the README and `.env.example`.
+- **CSV-direct import scripts build composite keys with the mapping's
+  `key_separator`.** `r2g generate-csv-import` and the Studio's CSV-mode import
+  preview joined composite primary and foreign keys with a hardcoded `_`, while every
+  other load path uses the mapping's separator. With any other separator a CSV-direct
+  load wrote documents and edge endpoints that a later stream or CDC run could not
+  find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
+  is now refused with a pointer to JSONL mode.
 
 ## [0.11.1] — 2026-11-19
 
