@@ -625,3 +625,84 @@ def test_an_empty_identifier_is_a_shape_problem():
         _labels(entities=[{"name": "Account", "label": "Sales", "identifier": " "}])
     )
     assert any("identifier must be a non-empty string" in p for p in problems)
+
+
+# ── A label on a property that include/exclude removed ──────────────────────
+
+
+def _filtered_config(**filters) -> MappingConfig:
+    config = _config()
+    accounts = config.collections["accounts"]
+    accounts.field_mappings = {"cust_nm": "holderName"}
+    for field, value in filters.items():
+        setattr(accounts, field, value)
+    return config
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [{"exclude_fields": ["cust_nm"]}, {"include_fields": ["account_id", "renewal_date"]}],
+    ids=["exclude", "include"],
+)
+@pytest.mark.parametrize("with_schema", [True, False], ids=["schema", "no-schema"])
+def test_label_on_a_filtered_rename_is_unmatched_and_recorded(filters, with_schema):
+    entry = {"entity": "Account", "name": "holderName", "label": "Holder", "decidedBy": "steward"}
+    doc = mapping_to_csi(
+        _filtered_config(**filters),
+        _schema() if with_schema else None,
+        label_policy="warn",
+        curated_labels=_labels(properties=[entry]),
+    )
+    validate_csi(doc)
+    record = _record(doc, "holderName")
+    assert record["resolution"] == "unmatched"
+    assert record["decidedBy"] == "steward"
+    assert "holderName" not in _prop_names(doc, "Account")
+    assert "holder" not in _prop_names(doc, "Account")
+
+
+@pytest.mark.parametrize("command", ["export-csi", "export-r2rml"])
+def test_cli_refuses_a_label_on_a_filtered_rename_unless_allowed(tmp_path, command):
+    from typer.testing import CliRunner
+
+    from r2g.main import app
+
+    labels = _labels(properties=[{"entity": "Account", "name": "holderName", "label": "Holder"}])
+    config, schema, labels_path = _write_inputs(tmp_path, labels)
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write(
+            "source_schema: crm\n"
+            "collections:\n"
+            "  accounts:\n"
+            "    source_table: accounts\n"
+            "    target_collection: accounts\n"
+            "    field_mappings:\n"
+            "      cust_nm: holderName\n"
+            "    exclude_fields:\n"
+            "      - cust_nm\n"
+            "  contracts:\n"
+            "    source_table: contracts\n"
+            "    target_collection: contracts\n"
+        )
+    out = tmp_path / "out"
+    args = [command, "-c", config, "-s", schema, "--curated-labels", labels_path, "-o", str(out)]
+
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1, result.output
+    assert "unmatched" in result.output
+    assert not out.exists()
+
+    result = CliRunner().invoke(app, [*args, "--allow-unapplied-labels"])
+    assert result.exit_code == 0, result.output
+    assert "holderName" not in re.sub(r'"curatedLabels".*', "", out.read_text(encoding="utf-8"), flags=re.S)
+
+
+def test_a_filtered_rename_no_longer_reserves_its_label_in_either_export():
+    # The removed property no longer holds the predicate, so another property
+    # may take that name, and both exporters agree because they share the plan.
+    labels = _labels(properties=[{"entity": "Contract", "name": "amt", "label": "Holder Name"}])
+    config = _filtered_config(exclude_fields=["cust_nm"])
+    doc = mapping_to_csi(config, _schema(), label_policy="warn", curated_labels=labels)
+    assert _record(doc, "amt")["resolution"] == "applied"
+    assert "holderName" in _prop_names(doc, "Contract")
+    assert "holderName" in _r2rml_predicates(mapping_to_r2rml(config, _schema(), curated_labels=labels))
