@@ -789,7 +789,7 @@ r2g is a reference application (see the Status note near the top): well-tested, 
 - **Incremental + change capture** -- `stream --since` filters rows by a timestamp column for basic incremental loads; full change capture is available via the CDC (`cdc-start`) and Kafka (`kafka-start`) pipelines with configurable conflict resolution, and `mapping-diff` / `selective-reload` reconcile mapping changes against an already-loaded target.
 - **Self-referential FKs** -- these work but produce edges within the same collection (e.g., `orders.referrer_id -> customers.id` creates `orders_to_customers_referrer_id`). This is correct but may be unexpected.
 - **ArangoDB write path** -- the `stream` command connects directly to ArangoDB via python-arango, but the file-based paths (`generate-csv-import`, `generate-import`) still require `arangoimport` installed separately.
-- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `~/.r2g/secret.key` (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
+- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `secret.key` in the catalog directory, `~/.r2g` unless `R2G_CATALOG_DIR` says otherwise (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
 
 ## Testing
 
@@ -850,8 +850,9 @@ environment variables (see [.env.example](.env.example)):
 |---|---|
 | `R2G_API_TOKEN` | Require `Authorization: Bearer <token>` on the UI API and the MCP SSE transport. A token is auto-generated and printed when binding to a non-loopback address. |
 | `R2G_CORS_ORIGINS` | Comma-separated allow-list of CORS origins for the UI (default: same-origin only). |
+| `R2G_CATALOG_DIR` | Directory holding the catalog (`catalog.json`), its `secret.key` and the dead-letter queue (default: `~/.r2g`). |
 | `R2G_CSV_BASE_DIR` | Confine CSV sources to a trusted directory tree; paths outside it (including via symlinks/`..`) are rejected. |
-| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `~/.r2g/secret.key`). |
+| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `secret.key` in the catalog directory). |
 
 The MCP `stdio` transport (Cursor / Claude Desktop) is local-only and needs no
 token; only the network-exposed SSE transport is gated.
