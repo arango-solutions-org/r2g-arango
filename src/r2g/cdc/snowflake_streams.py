@@ -851,9 +851,9 @@ class SnowflakeStreamListener:
         * **A conflict policy other than** ``source_wins``. ``log_and_skip``
           skips the insert, leaving every changed row as it was, and
           ``fail`` raises on the first row the copy holds.
-        * **An object with no primary key.** Its documents carry keys
-          ArangoDB generated, so each row would be inserted a second time
-          and no document could be matched to a row.
+        * **An object with no primary key.** Its documents are keyed by
+          every column, so identical rows collapse to one document and the
+          sweep could not tell those rows apart.
         """
         if self.handler.temporal:
             return (
@@ -868,8 +868,8 @@ class SnowflakeStreamListener:
             )
         if not self.schema.tables[target.source_object].primary_key:
             return (
-                f"{target.source_object} has no primary key in the schema, so its "
-                "documents cannot be matched to its rows."
+                f"{target.source_object} has no primary key in the schema, so identical "
+                "rows share one document and a resync could not tell them apart."
             )
         return ""
 

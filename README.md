@@ -734,7 +734,8 @@ run naming the stream, as with `--no-recover-streams`:
 - with `--temporal`, where an insert never replaces an existing version;
 - under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
   `fail` would stop at the first row the copy already holds;
-- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
+- for an object with no primary key in the schema, whose identical rows collapse to one document, so
+  the sweep could not tell them apart.
 
 One case a resync does not correct. The stream is recreated and the object is read a moment later. A
 row that changes between the two and changes back before the next cycle, or is inserted and then
