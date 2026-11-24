@@ -595,6 +595,15 @@ def export_csi(
     allow_unapplied_labels: bool = typer.Option(
         False, "--allow-unapplied-labels", help=_ALLOW_UNAPPLIED_HELP
     ),
+    publisher_uri: Optional[str] = typer.Option(
+        None,
+        "--publisher-uri",
+        help=(
+            "Publish mapping ids under this absolute http(s) URI (no query or fragment; "
+            "a trailing / is dropped). Ids are deterministic for the same names; a rename "
+            "changes them. Refused when two physical sources would share one conceptual name."
+        ),
+    ),
 ) -> None:
     """Emit a forward CSI v1 interchange document from an r2g mapping.
 
@@ -609,10 +618,15 @@ def export_csi(
     qualifies them.
 
     ``--curated-labels`` applies a curator's names (P12.12) before that check.
+
+    ``--publisher-uri`` gives every mapping entry a publisher-scoped id
+    (r2g-arango#91). ``--no-validate`` skips the JSON Schema only: mapping-id
+    integrity is checked whenever the document carries ids.
     """
     from datetime import datetime, timezone
 
     from r2g.csi import mapping_to_csi, validate_csi
+    from r2g.csi_identities import carries_identity, require_identity_integrity
     from r2g.curated_labels import CuratedPlan, load_curated_labels
 
     # Validated before the try: typer.Exit is an Exception, so raising it inside
@@ -654,9 +668,14 @@ def export_csi(
                 getattr(schema, "predecessor_fingerprint", None) if schema is not None else None
             ),
             curated_labels=curated,
+            publisher_uri=publisher_uri,
         )
         if validate:
             validate_csi(doc)
+        elif publisher_uri is not None or carries_identity(doc):
+            # --no-validate skips the JSON Schema, never mapping-id integrity:
+            # an id published wrong is referenced by every consumer that read it.
+            require_identity_integrity(doc)
         if curated is not None:
             plan = CuratedPlan(records=doc["provenance"]["curatedLabels"])
             if not _report_curated_plan(plan) and not allow_unapplied_labels:

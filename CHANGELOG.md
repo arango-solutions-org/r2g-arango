@@ -9,6 +9,15 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Publisher-scoped mapping ids in CSI (#91, PRD P12.17).** `export-csi --publisher-uri URI` (and
+  `mapping_to_csi(publisher_uri=...)`) gives every entity, relationship and property mapping a
+  deterministic id under the URI, records it as `provenance.publisher.uri` and writes the mapping
+  again as `physicalMapping`, as arangodb-schema-analyzer 0.21 does. Ids already in a document are
+  kept. Ids follow names: the same inputs give the same ids, but a change to the schema, label
+  policy, curated labels or naming rules can change them (carrying ids across a rename is the
+  analyzer's #52). An export that would give two tables or two edge definitions one conceptual name
+  is refused, naming them. `--no-validate` skips the JSON Schema only; id integrity is always
+  checked. Without `--publisher-uri` the output is unchanged.
 - **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
   `r2g source add --offline` registers a source with no connection string, and
   `r2g source snapshot NAME --from-file schema.json` takes its snapshot from RSA `PhysicalSchema`
