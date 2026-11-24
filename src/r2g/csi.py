@@ -27,6 +27,13 @@ from collections import Counter
 from importlib import resources
 from typing import Any, Dict, List, Optional, Tuple
 
+from .csi_identities import (
+    CsiIdentityError,  # noqa: F401  (re-exported: raised by mapping_to_csi)
+    identity_issues,
+    normalize_publisher_uri,
+    publish_identities,
+    refuse_collapsed_mappings,
+)
 from .types import (
     CollectionMapping,
     MappingConfig,
@@ -676,6 +683,7 @@ def mapping_to_csi(
     valid_time_source: Optional[str] = None,
     predecessor_fingerprint: Optional[str] = None,
     curated_labels: Optional[Dict[str, Any]] = None,
+    publisher_uri: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Emit a forward ``CSI v1`` document from an r2g :class:`MappingConfig`.
 
@@ -709,12 +717,26 @@ def mapping_to_csi(
             ``description`` / ``altLabels`` onto the renamed concept, and are
             recorded in ``provenance.curatedLabels``. Physical fields are never
             renamed.
+        publisher_uri: optional publisher namespace (r2g-arango#91). With it,
+            every mapping entry gets a deterministic id under it, the mapping is
+            also written as ``physicalMapping`` and the URI is recorded as
+            ``provenance.publisher.uri`` (see :mod:`r2g.csi_identities`). Ids
+            are minted last, from the final names. Two physical sources that
+            would share one conceptual name are refused rather than published
+            under one id. Without it the document is exactly what it was before.
 
     Returns:
         A ``CSI v1``-valid ``dict`` (validate with :func:`validate_csi`).
+
+    Raises:
+        CsiIdentityError: ``publisher_uri`` is malformed, or would identify
+            two physical mappings by one id.
     """
     if producer_version is None:
         from . import __version__ as producer_version  # local import: avoid cycle
+    if publisher_uri is not None:
+        # Fail fast on a malformed URI, before any work is done.
+        normalize_publisher_uri(publisher_uri)
 
     tables = schema.tables if schema is not None else {}
     # The physical layout this mapping targets (P13). When set, entities and
@@ -731,6 +753,18 @@ def mapping_to_csi(
     # behind each conceptual property, used by the "roles" label policy.
     pk_columns, fk_columns = _structural_columns(config, schema)
     property_roles: Dict[tuple, str] = {}
+    # Curated labels (P12.12) are planned here, from the inputs alone, so a
+    # publisher export can check the final names below before building anything.
+    plan = (
+        curated_plan_for_mapping(config, schema, curated_labels)
+        if curated_labels is not None
+        else None
+    )
+    if publisher_uri is not None:
+        # The physical mappings below are keyed by conceptual name, so a second
+        # source with the same name overwrites the first. Legacy exports keep
+        # that behaviour; a publisher export would mint one id for both.
+        refuse_collapsed_mappings(*_mapping_sources(config, generated_names, plan))
     for cm in config.collections.values():
         if cm.collection_type == "edge" or cm.is_join_table:
             # Join tables / edge collections are relationships, not entities.
@@ -792,11 +826,6 @@ def mapping_to_csi(
 
     # Curated labels (P12.12) go first, so the collision check below sees the
     # names a curator chose — a curated rename can itself resolve a collision.
-    plan = (
-        curated_plan_for_mapping(config, schema, curated_labels)
-        if curated_labels is not None
-        else None
-    )
     if plan is not None:
         _apply_curated_plan(
             plan, conceptual_entities, physical_entities, property_roles, entity_name_by_collection
@@ -951,7 +980,7 @@ def mapping_to_csi(
     if join_keys:
         conceptual_model["joinKeys"] = join_keys
 
-    return {
+    document: Dict[str, Any] = {
         "csiVersion": csi_version_for(physical_entities),
         "conceptualModel": conceptual_model,
         "arangoPhysicalMapping": {
@@ -960,6 +989,43 @@ def mapping_to_csi(
         },
         "provenance": provenance,
     }
+    # Last, so ids are minted from the final names: after conceptual naming,
+    # curated labels, label-collision renames and the physical mapping.
+    if publisher_uri is not None:
+        document = publish_identities(document, publisher_uri)
+    return document
+
+
+def _mapping_sources(
+    config: MappingConfig, generated_names: Dict[str, str], plan
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """Each final conceptual entity name and relationship type -> its distinct physical sources.
+
+    Names are resolved exactly as :func:`mapping_to_csi` resolves them —
+    generated, then curated — so :func:`refuse_collapsed_mappings` sees the keys
+    the physical mapping will be built under.
+    """
+    entities: Dict[str, List[str]] = {}
+    for cm in config.collections.values():
+        if cm.collection_type == "edge" or cm.is_join_table:
+            continue
+        name = generated_names[cm.target_collection]
+        final = plan.entity(name) if plan is not None else name
+        source = f"table {cm.source_table!r} -> collection {cm.target_collection!r}"
+        if source not in entities.setdefault(final, []):
+            entities[final].append(source)
+    relationships: Dict[str, List[str]] = {}
+    for edge in config.edges:
+        generated_type = owl_property_name(edge.edge_collection)
+        final = plan.relationship(generated_type) if plan is not None else generated_type
+        source = (
+            f"edge collection {edge.edge_collection!r} "
+            f"({edge.from_collection}.{','.join(edge.from_fields)} -> "
+            f"{edge.to_collection}.{','.join(edge.to_fields)})"
+        )
+        if source not in relationships.setdefault(final, []):
+            relationships[final].append(source)
+    return entities, relationships
 
 
 def csi_schema() -> Dict[str, Any]:
@@ -1080,7 +1146,10 @@ def validate_csi(document: Dict[str, Any]) -> None:
     """Validate ``document`` against the ``CSI v1`` schema (see :func:`csi_schema`).
 
     Also enforces the ``uniqueConstraints`` rules the schema itself cannot express
-    (see :func:`_unique_constraint_errors`).
+    (see :func:`_unique_constraint_errors`), and the mapping-id and
+    ``physicalMapping`` alias rules (:func:`r2g.csi_identities.identity_issues`),
+    which find nothing in a document that carries no ids — as the analyzer's
+    ``validate_csi`` does.
 
     Raises:
         jsonschema.ValidationError: if the document is not CSI-valid.
@@ -1092,3 +1161,7 @@ def validate_csi(document: Dict[str, Any]) -> None:
     faults = _unique_constraint_errors(document)
     if faults:
         raise jsonschema.ValidationError("uniqueConstraints is malformed:\n  - " + "\n  - ".join(faults))
+
+    issues = identity_issues(document)
+    if issues:
+        raise jsonschema.ValidationError("mapping identity is invalid:\n  - " + "\n  - ".join(issues))

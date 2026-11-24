@@ -1,0 +1,116 @@
+{
+  "csiVersion": "1",
+  "conceptualModel": {
+    "entities": [
+      {
+        "name": "User",
+        "labels": [
+          "User"
+        ],
+        "properties": [
+          {
+            "name": "name"
+          },
+          {
+            "name": "id"
+          },
+          {
+            "name": "eMailAddr"
+          }
+        ]
+      },
+      {
+        "name": "Order",
+        "labels": [
+          "Order"
+        ],
+        "properties": [
+          {
+            "name": "id"
+          },
+          {
+            "name": "userId"
+          }
+        ]
+      },
+      {
+        "name": "Tag",
+        "labels": [
+          "Tag"
+        ],
+        "properties": []
+      }
+    ],
+    "relationships": [
+      {
+        "type": "placedBy",
+        "fromEntity": "Order",
+        "toEntity": "User"
+      }
+    ]
+  },
+  "arangoPhysicalMapping": {
+    "entities": {
+      "User": {
+        "style": "COLLECTION",
+        "collectionName": "User",
+        "properties": {
+          "name": {
+            "field": "name"
+          },
+          "id": {
+            "field": "id"
+          },
+          "eMailAddr": {
+            "field": "e mail/addr"
+          }
+        }
+      },
+      "Order": {
+        "style": "COLLECTION",
+        "collectionName": "Order",
+        "properties": {
+          "id": {
+            "field": "id"
+          },
+          "userId": {
+            "field": "user_id"
+          }
+        }
+      },
+      "Tag": {
+        "style": "COLLECTION",
+        "collectionName": "Tag",
+        "properties": {}
+      }
+    },
+    "relationships": {
+      "placedBy": {
+        "style": "DEDICATED_COLLECTION",
+        "edgeCollectionName": "placed_by"
+      }
+    }
+  },
+  "provenance": {
+    "producer": "r2g",
+    "producerVersion": "test",
+    "direction": "forward",
+    "source": {
+      "kind": "relational",
+      "ref": "shop",
+      "fingerprint": null
+    },
+    "generatedAt": "2026-01-01T00:00:00+00:00",
+    "labelCollisions": [
+      {
+        "label": "id",
+        "entities": [
+          "Order",
+          "User"
+        ],
+        "resolution": "unresolved",
+        "reason": "qualifying would collide with an existing label: userId"
+      }
+    ]
+  }
+}
