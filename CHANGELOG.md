@@ -87,6 +87,17 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory, and `r2g generate-csv-import` one that would make its script read a file
   from outside the data directory.
 
+- **Names in generated scripts and mappings stay inside their comments and strings.**
+  The arangoimport scripts (`r2g generate-import`, `r2g generate-csv-import`, and the
+  Studio's import preview) wrote table, column and collection names into `#` comment
+  lines as they were; a newline in a name ended the comment, and the operator running
+  the script ran the rest of the name. Every control and line-separator character in
+  a comment is now written as its escape. R2RML mappings (`r2g export-r2rml`) had the
+  same flaw in their comments on skipped edges and computed properties, where a newline
+  let a name add a triples map whose `rr:sqlQuery` the mapping engine would run against
+  the source. The OPA/Rego policy stub now writes collection and edge names as escaped
+  string literals, so a quote in one cannot end its string.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added

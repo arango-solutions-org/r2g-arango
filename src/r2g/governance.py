@@ -428,7 +428,9 @@ def policy_rego(report: EntitlementReport, *, package: str = "r2g.authz") -> str
     )
     if levels:
         coll_lines = ",\n".join(
-            f'    "{c}": "{lvl}"' for c, lvl in sorted(levels.items())
+            # JSON string escaping is Rego's own: a quote or newline in a name stays
+            # inside its string.
+            f"    {json.dumps(c)}: {json.dumps(lvl)}" for c, lvl in sorted(levels.items())
         )
     else:
         coll_lines = ""
