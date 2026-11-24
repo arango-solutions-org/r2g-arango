@@ -12,7 +12,7 @@ from r2g.expressions import (
     extract_bind_references,
     rewrite_bind_params,
 )
-from r2g.keys import sanitize_key_component
+from r2g.keys import row_key
 from r2g.log import get_logger
 from r2g.types import CollectionMapping, Column, FieldExpression, LpgLayout, Table
 
@@ -178,15 +178,7 @@ class NodeTransformer:
         return str(value)
 
     def _generate_key(self, row: Dict[str, Any]) -> Optional[str]:
-        if not self.table_def.primary_key:
-            return None
-        pk_values: list[str] = []
-        for pk_col in self.table_def.primary_key:
-            val = row.get(pk_col)
-            if val is None:
-                raise ValueError(f"Row missing PK value for column '{pk_col}': {row}")
-            pk_values.append(sanitize_key_component(val))
-        key = self.key_separator.join(pk_values)
+        key = row_key(self.table_def, row, self.key_separator)
         if self.lpg is not None:
             # ``customers/1`` and ``orders/1`` are distinct in the pg layout but
             # both become ``nodes/1`` once collapsed into one collection — the

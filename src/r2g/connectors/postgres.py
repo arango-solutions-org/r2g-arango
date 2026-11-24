@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row, tuple_row
 
 from r2g.types import Column, ForeignKey, Schema, Table
@@ -107,10 +108,11 @@ def preview_table_rows(
     quoting bugs, not against previewing an arbitrary table. Shared by the UI
     and MCP preview endpoints.
     """
-    from psycopg import sql
+    from r2g.connectors.base import require_connection_string, serialize_rows
 
-    from r2g.connectors.base import serialize_rows
-
+    # An empty string would make psycopg connect to the environment's default
+    # database (PGHOST, the local socket), not refuse.
+    require_connection_string(connection_string, "postgresql")
     query = sql.SQL("SELECT * FROM {}.{} LIMIT %s").format(
         sql.Identifier(schema_name),
         sql.Identifier(table_name),
@@ -124,6 +126,11 @@ def preview_table_rows(
 
 class PostgresConnector:
     def __init__(self, connection_string: str, schema_name: str = "public") -> None:
+        from r2g.connectors.base import require_connection_string
+
+        # Built directly by StreamingPipeline's pg_conn_string shim, not only by the
+        # factory; an empty string would connect to the environment's default database.
+        require_connection_string(connection_string, "postgresql")
         self.connection_string = connection_string
         self.schema_name = schema_name
 
@@ -312,17 +319,18 @@ class PostgresSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> int:
-        qualified = f'"{self.schema_name}"."{table}"'
+        qualified = sql.Identifier(self.schema_name, table)
         conn = self.connection
         with conn.cursor(row_factory=tuple_row) as cur:
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT count(*) FROM {qualified} '  # noqa: S608
-                    f'WHERE "{since_column}" >= %s',
+                    sql.SQL("SELECT count(*) FROM {} WHERE {} >= %s").format(
+                        qualified, sql.Identifier(since_column)
+                    ),
                     (since_value,),
                 )
             else:
-                cur.execute(f"SELECT count(*) FROM {qualified}")  # noqa: S608
+                cur.execute(sql.SQL("SELECT count(*) FROM {}").format(qualified))
             row = cur.fetchone()
             return int(row[0]) if row else 0
 
@@ -334,19 +342,20 @@ class PostgresSession:
         since_column: Optional[str] = None,
         since_value: Optional[str] = None,
     ) -> Iterator[dict[str, Any]]:
-        qualified = f'"{self.schema_name}"."{table}"'
-        cursor_name = f"r2g_{table}"
+        qualified = sql.Identifier(self.schema_name, table)
+        cursor_name = f"r2g_{table}"  # psycopg quotes a server cursor's name itself
         conn = self.connection
         with conn.cursor(name=cursor_name, row_factory=dict_row) as cur:
             cur.itersize = max(1, batch_size)
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT * FROM {qualified} '  # noqa: S608
-                    f'WHERE "{since_column}" >= %s',
+                    sql.SQL("SELECT * FROM {} WHERE {} >= %s").format(
+                        qualified, sql.Identifier(since_column)
+                    ),
                     (since_value,),
                 )
             else:
-                cur.execute(f"SELECT * FROM {qualified}")  # noqa: S608
+                cur.execute(sql.SQL("SELECT * FROM {}").format(qualified))
             yield from cur
 
     def dump_table_to_csv(
@@ -362,9 +371,10 @@ class PostgresSession:
         fetching. Returns the number of data rows written (i.e.
         excluding the header).
         """
-        qualified = f'"{self.schema_name}"."{table}"'
-        header_clause = "CSV HEADER" if header else "CSV"
-        copy_sql = f"COPY {qualified} TO STDOUT WITH {header_clause}"  # noqa: S608
+        header_clause = sql.SQL("CSV HEADER" if header else "CSV")
+        copy_sql = sql.SQL("COPY {} TO STDOUT WITH {}").format(
+            sql.Identifier(self.schema_name, table), header_clause
+        )
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self.connection

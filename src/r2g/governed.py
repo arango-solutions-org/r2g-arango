@@ -73,8 +73,8 @@ READS: tuple[tuple[str, str], ...] = tuple(("POST", p) for p in (
     r"/api/targets/[^/]+/introspect",
 ))
 
-_SHARED = ("{} are shared by every project in the tenant, so a change here would reach the "
-           "others; an administrator changes them with r2g's command line")
+_SHARED = ("{} are shared by the tenant's projects, so a change here could reach another; "
+           "an administrator changes them with r2g's command line")
 
 #: Change routes refused under a control plane, with why.
 REFUSED: tuple[tuple[str, str, str], ...] = (
@@ -93,11 +93,10 @@ REFUSED: tuple[tuple[str, str, str], ...] = (
      "a demo preset adds a source, and " + _SHARED.format("sources")),
     ("POST", f"{_PROJECT}/governance/emit",
      "governance files are written to the server's disk outside the policy"),
-    # A read, but of the source's rows, of any source in the tenant: the policy decides on
-    # mapping items, not on reading data, so nothing would check who sees them.
+    # A read, but of the source's rows: the policy decides on mapping items, not on reading
+    # data, so nothing would check who sees them.
     ("GET", r"/api/sources/[^/]+/preview/[^/]+",
-     "a table preview returns the source's rows, which the policy does not govern; sources "
-     "are shared by every project in the tenant, so it would show any of them"),
+     "a table preview returns the source's rows, which the policy does not govern"),
 )
 
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})

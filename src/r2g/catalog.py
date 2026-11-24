@@ -101,6 +101,17 @@ class TargetConfig(BaseModel):
     description: str = ""
     created_at: datetime
     updated_at: datetime
+    #: The one transformation project this target is registered for, under a control
+    #: plane (``r2g target add --project``, P14.18): no other project is created on it
+    #: or loads to it. Written only when set, so existing targets re-save unchanged.
+    project: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("project") is None:
+            out.pop("project", None)
+        return out
 
 
 class CatalogProviderConfig(BaseModel):
@@ -138,6 +149,11 @@ class SchemaSnapshot(BaseModel):
     #: ``enforced=False``; this keeps what a ``ForeignKey`` has no field for.
     #: Written only when non-empty, so every other snapshot re-saves byte-identically.
     inferred_keys: list[dict[str, Any]] = Field(default_factory=list)
+    #: The schema file this snapshot was read from instead of a connection
+    #: (``source snapshot --from-file``) and the SHA-256 of its bytes. Written
+    #: only when set, so introspected snapshots re-save byte-identically.
+    schema_file_source: str | None = None
+    schema_file_fingerprint: str | None = None
     # Defaults to the legacy format so anything not deliberately stamped by
     # create_snapshot is treated as unable to hold UNIQUE keys -- the safe reading.
     schema_format_version: int = 1
@@ -157,6 +173,9 @@ class SchemaSnapshot(BaseModel):
             out.pop("schema_format_version")
         if not out.get("inferred_keys"):
             out.pop("inferred_keys", None)
+        for name in ("schema_file_source", "schema_file_fingerprint"):
+            if out.get(name) is None:
+                out.pop(name, None)
         return out
 
     @property
@@ -286,13 +305,21 @@ def _writes(
     return locked
 
 
+def default_catalog_dir() -> Path:
+    """The catalog directory when none is given: ``R2G_CATALOG_DIR``, else ``~/.r2g``.
+
+    A deployment serving several tenants gives each its own directory. Everything kept
+    beside the catalog (its ``secret.key``, the dead-letter queue) lives here, so every
+    command that names one of those files must resolve it through this function.
+    """
+    env_dir = os.environ.get("R2G_CATALOG_DIR", "").strip()
+    return Path(env_dir).expanduser() if env_dir else Path.home() / ".r2g"
+
+
 class CatalogManager:
     def __init__(self, catalog_dir: str | Path | None = None):
         if catalog_dir is None:
-            # R2G_CATALOG_DIR, as the MCP server already honours, else ~/.r2g. A deployment
-            # serving several tenants gives each its own directory.
-            env_dir = os.environ.get("R2G_CATALOG_DIR", "").strip()
-            self._dir = Path(env_dir).expanduser() if env_dir else Path.home() / ".r2g"
+            self._dir = default_catalog_dir()
         else:
             self._dir = Path(catalog_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -551,6 +578,8 @@ class CatalogManager:
         key_overlay_source: str | None = None,
         key_overlay_fingerprint: str | None = None,
         inferred_keys: list[dict[str, Any]] | None = None,
+        schema_file_source: str | None = None,
+        schema_file_fingerprint: str | None = None,
     ) -> SchemaSnapshot:
         catalog = self._load()
         snap = SchemaSnapshot(
@@ -563,6 +592,8 @@ class CatalogManager:
             key_overlay_source=key_overlay_source,
             key_overlay_fingerprint=key_overlay_fingerprint,
             inferred_keys=list(inferred_keys or []),
+            schema_file_source=schema_file_source,
+            schema_file_fingerprint=schema_file_fingerprint,
             schema_format_version=CURRENT_SCHEMA_FORMAT,
         )
         catalog.snapshots[snap.id] = snap
@@ -773,6 +804,7 @@ class CatalogManager:
         username: str = "root",
         password: str = "",
         description: str = "",
+        project: str | None = None,
     ) -> TargetConfig:
         catalog = self._load()
         if name in catalog.targets:
@@ -787,6 +819,7 @@ class CatalogManager:
             description=description,
             created_at=now,
             updated_at=now,
+            project=project,
         )
         catalog.targets[name] = target
         self._save(catalog)

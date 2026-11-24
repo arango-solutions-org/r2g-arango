@@ -897,3 +897,55 @@ class TestTextColumns:
 
         assert plan.warnings == ()
         assert "# WARNING" not in plan.script
+
+
+# ── composite keys use the mapping's key_separator ──────────────────────────────
+
+
+@pytest.mark.parametrize("sep", ["_", "-", "::"])
+def test_composite_key_merge_uses_the_mapping_separator(ecommerce_config, ecommerce_schema, sep):
+    """A CSV-direct load must build the _key the transformers build for the same row,
+    or a later stream or CDC run writes a second document beside it."""
+    from r2g.transformers.node_transformer import NodeTransformer
+
+    config = ecommerce_config.model_copy(update={"key_separator": sep})
+    gen = CsvImportGenerator(config, ecommerce_schema, data_dir="./dumps")
+    cmd = " ".join(gen._build_doc_command("order_items", "order_items").split())
+    assert f"_key=[order_id]{sep}[product_id]" in cmd
+
+    # What the script's merge produces for a row equals what NodeTransformer produces.
+    row = {"order_id": 7, "product_id": 9}
+    merged = f"[order_id]{sep}[product_id]".replace("[order_id]", "7").replace("[product_id]", "9")
+    table = ecommerce_schema.tables["order_items"]
+    nt = NodeTransformer(table, config.collections["order_items"], key_separator=sep)
+    assert nt.transform_row(row)["_key"] == merged
+
+
+@pytest.mark.parametrize("sep", ["-", "::"])
+def test_composite_edge_endpoints_use_the_mapping_separator(
+    ecommerce_config, ecommerce_schema, sep,
+):
+    config = ecommerce_config.model_copy(update={"key_separator": sep})
+    gen = CsvImportGenerator(config, ecommerce_schema, data_dir="./dumps")
+    cmd = " ".join(gen._build_edge_command(
+        "orders", "test_edge", "orders", "targets", ["customer_id", "referrer_id"]).split())
+    assert f"_to=[customer_id]{sep}[referrer_id]" in cmd
+
+
+@pytest.mark.parametrize("table", ["../x", "a/b", "..", "a\\b"])
+def test_a_table_name_that_leaves_the_data_dir_is_refused(ecommerce_config, ecommerce_schema,
+                                                          table):
+    """The script reads <data_dir>/<table>.csv; a source table named ``../x`` would make
+    it load a file from outside the directory, so the names the dumps refuse are
+    refused here too."""
+    gen = CsvImportGenerator(ecommerce_config, ecommerce_schema, data_dir="./dumps")
+    with pytest.raises(ValueError, match="cannot be used as a file name"):
+        gen._csv_file_path(table)
+    assert gen._csv_file_path("orders") == "./dumps/orders.csv"
+
+
+def test_a_separator_with_a_bracket_is_refused(ecommerce_config, ecommerce_schema):
+    config = ecommerce_config.model_copy(update={"key_separator": "]["})
+    gen = CsvImportGenerator(config, ecommerce_schema, data_dir="./dumps")
+    with pytest.raises(ValueError, match="bracket"):
+        gen._build_doc_command("order_items", "order_items")

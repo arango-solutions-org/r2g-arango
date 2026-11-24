@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -225,3 +226,24 @@ def redact_connection_string(url: str) -> str:
     return urlunparse(
         parsed._replace(netloc=new_netloc, query=query)
     )
+
+
+#: Bind addresses that listen only on this machine, where the Studio and the MCP server
+#: run without a token. Not ``""``: an empty bind address listens on every interface.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+def one_line(text: str) -> str:
+    """``text`` with every control or line-separator character written as its escape.
+
+    Names from a source or a mapping are written into ``#`` comment lines of files an
+    operator runs or a tool reads: generated import scripts, R2RML mappings. A newline
+    in one would end the comment and make the rest of the name a command, or a triple.
+    Escaping (``\\n``, ``\\x00``, ``\\u2028``) keeps it on its line and still readable.
+    """
+    out = []
+    for ch in text:
+        if unicodedata.category(ch)[0] == "C" or ch in "\u2028\u2029":
+            out.append(ch.encode("unicode_escape").decode("ascii"))
+        else:
+            out.append(ch)
+    return "".join(out)

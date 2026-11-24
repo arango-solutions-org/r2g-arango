@@ -32,6 +32,7 @@ from r2g.generators.arangoimport import (
     ImportCommandSpec,
 )
 from r2g.log import get_logger
+from r2g.security import LOOPBACK_HOSTS
 from r2g.security import redact_source_dump as _redact_source
 from r2g.security import redact_target_dump as _redact_target
 from r2g.streaming.pipeline import StreamingPipeline
@@ -114,7 +115,29 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _running_loads: dict[str, dict[str, Any]] = {}  # load_id -> {"thread", "queue", "pipeline"}
 
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+#: Host names a loopback-bound, open Studio answers to (see ``_local_host_only``).
+_LOCAL_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _host_name(header: str) -> str:
+    """The host name in a ``Host`` header, lower-cased and without its port
+    (``[::1]:8501`` gives ``::1``, ``LocalHost:8501`` gives ``localhost``). A header
+    that is not a host and optional port is returned whole, so it names no host."""
+    h = header.strip().lower()
+    if h.startswith("["):
+        name, bracket, rest = h[1:].partition("]")
+        return name if bracket and (rest == "" or re.fullmatch(r":\d+", rest)) else h
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _origin_parts(origin: str) -> tuple[str, str] | None:
+    """The scheme and the host and port of an ``Origin`` header, lower-cased
+    (``http://LocalHost:8501`` gives ``("http", "localhost:8501")``), or ``None`` for
+    ``null`` or anything that is not an origin."""
+    scheme, sep, rest = origin.strip().partition("://")
+    if not sep or scheme.lower() not in ("http", "https") or not rest or "/" in rest:
+        return None
+    return scheme.lower(), rest.lower()
 
 
 #: A route about one transformation project: ``/api/projects/<name>[/...]``.
@@ -128,6 +151,56 @@ _OPEN_PATHS = frozenset({"", "/", "/api/health", "/api/mode"})
 #: (graph-data, which carries each element's ontology term), and nothing else.
 _SERVICE_READS = re.compile(r"^/api/projects/[^/]+/graph-data$")
 _OPEN_PREFIXES = ("/static/",)
+#: A route about one source, target or catalog: ``/api/<kind>/<name>[/...]``.
+_SHARED_ROUTE = re.compile(r"^/api/(sources|targets|catalogs)/([^/]+)")
+
+
+def _project_target(catalog: CatalogManager, project: Any) -> Any:
+    """The target a project's loads write to: the one it names, else the one at its
+    endpoint and database, else none."""
+    target_name = getattr(project, "target_name", None)
+    if target_name and (target := catalog.get_target(target_name)) is not None:
+        return target
+    for t in catalog.list_targets():
+        if t.endpoint == project.arango_endpoint and t.database == project.arango_database:
+            return t
+    return None
+
+
+def _target_free_for(catalog: CatalogManager, target: Any, name: str) -> bool:
+    """Whether the project ``name`` may be bound to ``target`` under a control plane
+    (P14.18): the target is not registered for another project, and no other project is
+    bound to it."""
+    return target.project in (None, name) and not any(
+        (held := _project_target(catalog, p)) is not None and held.name == target.name
+        for p in catalog.list_projects() if p.name != name)
+
+
+def _what_it_sees(catalog: CatalogManager, opens: str | None) -> dict[str, set[str]]:
+    """Under a control plane, the sources, targets and catalogs the transformation project
+    ``opens`` sees once it exists (P14.16): its source, the target its loads write to, and
+    the catalog its source was imported from. Before it exists the Studio creates it from
+    the tenant's list: every source and catalog, and the targets it could be bound to
+    (P14.18), not another project's. A context that opens no transformation project sees
+    none of them."""
+    if not opens:
+        return {"sources": set(), "targets": set(), "catalogs": set()}
+    project = catalog.get_project(opens)
+    if project is None:
+        return {
+            "sources": {s.name for s in catalog.list_sources()},
+            "targets": {t.name for t in catalog.list_targets()
+                        if _target_free_for(catalog, t, opens)},
+            "catalogs": {c.name for c in catalog.list_catalogs()},
+        }
+    source = catalog.get_source(project.source_name)
+    target = _project_target(catalog, project)
+    return {
+        "sources": {project.source_name},
+        "targets": {target.name} if target is not None else set(),
+        "catalogs": ({source.catalog_name} if source is not None and source.catalog_name
+                     else set()),
+    }
 
 
 def _redact_token_in_query(target: str) -> str:
@@ -157,10 +230,11 @@ class _RedactTokenInQuery(logging.Filter):
 _REDACT_TOKEN_IN_QUERY = _RedactTokenInQuery()
 
 
-def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
+def _add_control_plane_auth(app: FastAPI, *, cors: bool, catalog: CatalogManager) -> None:
     """Under a control plane: a context token on every ``/api`` call (``?token=`` on the
     load-progress stream, which cannot carry a header), from this deployment's tenant,
-    and only the transformation project the control-plane project opens here."""
+    only the transformation project the control-plane project opens here, and once that
+    exists, only the sources, targets and catalogs it sees."""
     tenant = os.environ.get("R2G_TENANT", "").strip()
     if not tenant:
         # Without it every tenant's context would get in, sharing one catalog.
@@ -218,6 +292,15 @@ def _add_control_plane_auth(app: FastAPI, *, cors: bool) -> None:
         if m and m.group(1) != project.opens:  # scope['path'] is already decoded
             # Another project is not visible here, the way a foreign one is not found.
             return JSONResponse({"detail": "Project not found"}, status_code=404)
+        s = _SHARED_ROUTE.match(path)
+        if s:
+            # P14.16: any name the project does not see is not found, whether or not the
+            # tenant has it, so a route added later is limited too; a context that opens
+            # no project sees none.
+            seen = await run_in_threadpool(_what_it_sees, catalog, project.opens)
+            if s.group(2) not in seen[s.group(1)]:
+                kind_name = s.group(1)[:-1].capitalize()
+                return JSONResponse({"detail": f"{kind_name} not found"}, status_code=404)
         kind, why = governing.classify(request.method, path)
         if kind == "refused":  # P14.12: not governed, so not available here
             return JSONResponse({"detail": why}, status_code=403)
@@ -252,20 +335,58 @@ def create_app(
             allow_headers=["*"],
         )
 
+    catalog = CatalogManager(catalog_dir)
+
     # ── Under a control plane, its context token is the only credential. ──
     governed = control_plane.mode()
     app.state.control_plane = governed
     if governed:
-        _add_control_plane_auth(app, cors=bool(cors_origins))
+        _add_control_plane_auth(app, cors=bool(cors_origins), catalog=catalog)
 
     # ── Otherwise, optional Bearer-token auth. ──
     token = (api_token or os.environ.get("R2G_API_TOKEN") or "").strip()
-    loopback = host in _LOOPBACK_HOSTS
+    loopback = host in LOOPBACK_HOSTS
     require_auth = not governed and (bool(token) or not loopback)
     if require_auth and not token:
         token = secrets.token_urlsafe(32)
     app.state.api_token = token
     app.state.api_auth_required = require_auth
+
+    if loopback and not require_auth and not governed:
+        # An open Studio trusts that only this machine can reach it. A web page can
+        # rebind its own host name to 127.0.0.1 and then call the API same-origin, so the
+        # open Studio answers only requests addressed to a local name. A token, or a
+        # control plane's context, already stops such a page, so neither needs this, and
+        # a reverse proxy in front of them keeps working.
+        allowed = _LOCAL_HOST_NAMES | {
+            h.strip().lower()
+            for h in os.environ.get("R2G_ALLOWED_HOSTS", "").split(",") if h.strip()
+        }
+
+        @app.middleware("http")
+        async def _local_host_only(request: Request, call_next):
+            if _host_name(request.headers.get("host", "")) not in allowed:
+                return JSONResponse(
+                    {"detail": "This Studio answers only requests addressed to localhost; "
+                               "set R2G_ALLOWED_HOSTS to add another name"},
+                    status_code=400,
+                )
+            # Nor does a page on another site get to change anything: a browser names the
+            # page a request comes from, and a form or a script elsewhere can still send
+            # a request to localhost without being able to read the answer.
+            # Its own pages are same-origin: the Origin names the scheme, host and port
+            # the request was sent to. Another local app (a dev server, a notebook) is not,
+            # unless R2G_CORS_ORIGINS lets it in.
+            origin = request.headers.get("origin")
+            if (origin is not None and request.method not in ("GET", "HEAD", "OPTIONS")
+                    and _origin_parts(origin) != (request.url.scheme,
+                                                  request.headers.get("host", "").strip().lower())
+                    and origin.strip() not in cors_origins):
+                return JSONResponse(
+                    {"detail": "This Studio accepts changes only from its own pages"},
+                    status_code=403,
+                )
+            return await call_next(request)
 
     if require_auth:
         @app.middleware("http")
@@ -281,7 +402,6 @@ def create_app(
                     return JSONResponse({"detail": "Unauthorized"}, status_code=401)
             return await call_next(request)
 
-    catalog = CatalogManager(catalog_dir)
     # Mapping files for API-created projects are confined here, never to a
     # client-supplied path (prevents path traversal / arbitrary file writes).
     _projects_root = catalog.dir.expanduser() / "projects"
@@ -317,29 +437,94 @@ def create_app(
         entry = _running_loads.get(load_id)
         return entry if entry is not None and entry.get("project") == name else None
 
+    def _target_at(endpoint: str, database: str) -> Any:
+        """The registered target at ``endpoint`` and ``database``, if any."""
+        for _tgt in catalog.list_targets():
+            if (_tgt.endpoint.rstrip("/") == (endpoint or "").rstrip("/")
+                    and _tgt.database == database):
+                return _tgt
+        return None
+
     def _resolve_target(project: Any) -> tuple[str, str, str, str]:
         """Resolve (endpoint, database, username, password) for a project's target.
 
         Prefers an explicitly linked target, then a target matching the project's
-        endpoint+database, falling back to the project fields + env credentials.
+        endpoint+database. Outside a control plane it falls back to the project fields +
+        the server's env credentials, which are the local user's own. Under one it never
+        does: a request does not get to send the server's credentials anywhere, so a
+        project with no registered target cannot write.
         """
-        target = None
-        target_name = getattr(project, "target_name", None)
-        if target_name:
-            target = catalog.get_target(target_name)
-        if target is None:
-            for _tgt in catalog.list_targets():
-                if _tgt.endpoint == project.arango_endpoint and _tgt.database == project.arango_database:
-                    target = _tgt
-                    break
+        target = _project_target(catalog, project)
+        if governed and target is not None and target.project not in (None, project.name):
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: the target this project writes "
+                "to is registered for another project"))
         if target is not None:
             return target.endpoint, target.database, target.username, target.password
+        if governed:
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: this project writes to no "
+                "registered target, and the server's own credentials are not used for it"))
         return (
             project.arango_endpoint,
             project.arango_database,
             os.environ.get("ARANGO_USER", "root"),
             os.environ.get("ARANGO_PASSWORD", ""),
         )
+
+    def _refuse_a_target_not_free(target: Any, name: str) -> None:
+        """Under a control plane, a project is not created on a target registered for
+        another project (``r2g target add --project``), nor on one another project is
+        bound to (P14.18)."""
+        if not _target_free_for(catalog, target, name):
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: that target is not "
+                "available to this project"))
+
+    def _refuse_a_looser_gate(allow_sensitive: bool, threshold: str) -> None:
+        """Under a control plane the sensitive-field gate may be made stricter, never
+        turned off or loosened (P14.18): it is the control plane's, not the request's."""
+        from r2g.classification import sensitivity_rank
+        from r2g.governance import DEFAULT_THRESHOLD
+
+        if allow_sensitive or sensitivity_rank(threshold) > sensitivity_rank(DEFAULT_THRESHOLD):
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: the sensitive-field gate "
+                f"excludes fields at '{DEFAULT_THRESHOLD}' or above, and a load may "
+                "make it stricter but not looser"))
+
+    def _refuse_sensitive_keys(config: MappingConfig, snap: Any, threshold: str,
+                               include: list[str] | None = None,
+                               exclude: list[str] | None = None) -> None:
+        """Under a control plane, refuse a load or migration that would write a sensitive
+        column into a document or edge key (P14.18): keys are built from the row's
+        values, so the gate, which removes properties, cannot keep them out."""
+        from r2g.governance import key_exposures
+
+        found = key_exposures(config, snap.schema_data, threshold=threshold,
+                              include=include, exclude=exclude)
+        if found:
+            named = ", ".join(sorted({f"{e.source_table}.{e.column} ({e.level}, in the keys "
+                                      f"of {e.collection})" for e in found}))
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: these sensitive columns would be "
+                f"written into document or edge keys, which the gate cannot remove: {named}. "
+                "Register a reviewed key overlay that names a key that is not sensitive "
+                "(r2g source set-key-overlay), or leave the table or edge out."))
+
+    def _gated_for_migration(config: MappingConfig, snap: Any, name: str,
+                             allow_sensitive: bool, threshold: str) -> MappingConfig:
+        """The saved mapping as a migration writes it: gated as a load is (Phase 9b).
+        A load records its mapping gated, so the two compare only once both are."""
+        from r2g.governance import apply_sensitivity_gate, build_entitlement_report
+
+        gated, _ = apply_sensitivity_gate(
+            config,
+            build_entitlement_report(config, snap.schema_data, threshold=threshold,
+                                     project=name),
+            allow_sensitive=allow_sensitive,
+        )
+        return gated
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
@@ -691,9 +876,15 @@ def create_app(
 
     # ── Source endpoints ──────────────────────────────────────────────
 
+    def _seen(request: Request) -> dict[str, set[str]] | None:
+        """What the open project sees under a control plane (P14.16); ``None`` for all."""
+        return _what_it_sees(catalog, request.state.cp_project.opens) if governed else None
+
     @app.get("/api/sources")
-    async def list_sources():
+    async def list_sources(request: Request):
         sources = catalog.list_sources()
+        if (seen := _seen(request)) is not None:
+            sources = [s for s in sources if s.name in seen["sources"]]
         return [_redact_source(s.model_dump()) for s in sources]
 
     @app.post("/api/sources", status_code=201)
@@ -829,7 +1020,8 @@ def create_app(
         }
 
     @app.post("/api/shared-keys/infer")
-    async def infer_shared_keys_endpoint(body: InferSharedKeysRequest | None = None):
+    async def infer_shared_keys_endpoint(request: Request,
+                                         body: InferSharedKeysRequest | None = None):
         """Propose cross-source shared-key relationships (PRD P6.7).
 
         Unlike ``/api/sources/{name}/infer-fks`` this is *not* source-scoped:
@@ -844,12 +1036,18 @@ def create_app(
         from r2g.xsk import SharedKeyOptions, infer_shared_keys
 
         req = body or InferSharedKeysRequest()
-        wanted = req.sources if req.sources else [s.name for s in catalog.list_sources()]
+        # P14.16: under a control plane, only the sources the open project sees; another
+        # is skipped as one the tenant does not have.
+        seen = _seen(request)
+        everything = ([s.name for s in catalog.list_sources()] if seen is None
+                      else sorted(seen["sources"]))
+        wanted = req.sources if req.sources else everything
 
         schemas: dict[str, Any] = {}
         skipped: list[dict[str, str]] = []
         for source_name in wanted:
-            source = catalog.get_source(source_name)
+            source = (catalog.get_source(source_name)
+                      if seen is None or source_name in seen["sources"] else None)
             if source is None:
                 skipped.append({"source": source_name, "reason": "not found in catalog"})
                 continue
@@ -1024,6 +1222,8 @@ def create_app(
             return {"table": table, "rows": rows, "count": len(rows)}
         except HTTPException:
             raise
+        except ValueError as e:  # an offline source: nothing to connect to (P6.17)
+            raise HTTPException(status_code=400, detail=_safe_detail(e))
         except Exception as e:
             logger.warning("preview_table_failed", source=name, table=table, error=str(e))
             raise HTTPException(status_code=500, detail="Failed to preview table data")
@@ -1053,6 +1253,24 @@ def create_app(
             validate_project_name(body.name)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        # The target the project writes to. Named, it must exist. Under a control plane
+        # it must be registered (an administrator adds targets) and not be another
+        # project's: the target is bound here, at creation, and no request changes it.
+        bound = None
+        if body.target_name:
+            bound = catalog.get_target(body.target_name)
+            if bound is None:
+                raise HTTPException(status_code=400,
+                                    detail=f"Target '{body.target_name}' not found")
+        elif governed:
+            bound = _target_at(body.arango_endpoint, body.arango_database)
+        if governed:
+            if bound is None:
+                raise HTTPException(status_code=403, detail=(
+                    "Not available under the control plane: a project writes only to a "
+                    "target an administrator registered, and none is registered at that "
+                    "endpoint and database"))
+            _refuse_a_target_not_free(bound, body.name)
         # The mapping file is always confined to <catalog>/projects/<name>/.
         # If the client passed a path to an existing, parseable mapping, import
         # its contents into the safe location (read-only); otherwise start empty.
@@ -1089,16 +1307,22 @@ def create_app(
             seed_items = save_changes(None, seed)
             if seed_items:
                 seeded = await _govern(request, body.name, "mapping.update", seed_items)
+        if governed and bound is not None:
+            # Again, with no await between it and the binding: another creation may
+            # have bound the target while this one waited for the control plane.
+            _refuse_a_target_not_free(bound, body.name)
         try:
             project = catalog.create_project(
                 name=body.name,
                 source_name=body.source_name,
                 mapping_config_path=str(safe_path),
-                arango_endpoint=body.arango_endpoint,
-                arango_database=body.arango_database,
+                arango_endpoint=bound.endpoint if bound else body.arango_endpoint,
+                arango_database=bound.database if bound else body.arango_database,
                 mapping_name=body.mapping_name,
                 mapping_description=body.mapping_description,
             )
+            if bound is not None:
+                project = catalog.update_project(body.name, target_name=bound.name)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         if not safe_path.exists():
@@ -1124,6 +1348,10 @@ def create_app(
         fields = {k: v for k, v in body.model_dump(exclude_none=True).items()}
         if not fields:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
+        if governed and "target_name" in fields:
+            raise HTTPException(status_code=403, detail=(
+                "Not available under the control plane: a project's target is set when "
+                "the project is created; an administrator changes it"))
         details = governing.Item("project", (None,), tuple(sorted(fields)))
         g = await _govern(request, name, "transformation.update", [details]) \
             if governed else None
@@ -1409,7 +1637,8 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/projects/{name}/migration-plan")
-    async def migration_plan(name: str):
+    async def migration_plan(name: str, allow_sensitive: bool = False,
+                             sensitivity_threshold: str = "confidential"):
         """Diff the *live* database state (last loaded mapping) against the
         current saved mapping, returning the change-management plan.
 
@@ -1429,9 +1658,14 @@ def create_app(
 
         from r2g.mapping_diff import diff_mappings
 
+        if governed:
+            _refuse_a_looser_gate(allow_sensitive, sensitivity_threshold)
         try:
             old_config = MappingConfig.model_validate(loaded)
-            new_config = ConfigManager.load_config(project.mapping_config_path)
+            # Gated as the migration it plans would be, so it plans what that does.
+            new_config = _gated_for_migration(
+                ConfigManager.load_config(project.mapping_config_path), snap, name,
+                allow_sensitive, sensitivity_threshold)
             plan = diff_mappings(old_config, new_config, snap.schema_data)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -1462,8 +1696,23 @@ def create_app(
         from r2g.mapping_diff import diff_mappings
         from r2g.selective_reload import SelectiveReloader
 
+        if governed:
+            _resolve_target(project)  # refuses a project bound to no registered target
+            _refuse_a_looser_gate(body.allow_sensitive, body.sensitivity_threshold)
         old_config = MappingConfig.model_validate(loaded)
         new_config = ConfigManager.load_config(project.mapping_config_path)
+        # Checked as a load checks it: an expression that cannot be evaluated here would
+        # otherwise be sent to ArangoDB as AQL, unchecked by the gate or the policy.
+        issues = validate_config(snap.schema_data, new_config)
+        if issues:
+            raise HTTPException(status_code=400, detail={"validation_errors": issues})
+        if governed:
+            _refuse_sensitive_keys(new_config, snap, body.sensitivity_threshold)
+        # The same gate as a load: what was loaded is the gated mapping, so the saved one
+        # is gated before the two are compared. Otherwise every gated field reads as a
+        # change, and the reload would write it.
+        new_config = _gated_for_migration(new_config, snap, name, body.allow_sensitive,
+                                          body.sensitivity_threshold)
         plan = diff_mappings(old_config, new_config, snap.schema_data)
         if not plan.actions:
             return {"migrated": True, "report": {"actions_executed": [], "actions_skipped": [], "errors": []}}
@@ -1945,9 +2194,14 @@ def create_app(
         if governed:  # P14.10: every table and relationship it writes, on its class
             from r2g.mapping_changes import graph_items, load_collections, load_items
 
+            _resolve_target(project)  # refuses a project bound to no registered target
+
             if body.emit_governance:
                 raise HTTPException(status_code=403, detail=governing.classify(
                     "POST", f"/api/projects/{name}/governance/emit")[1])
+            _refuse_a_looser_gate(body.allow_sensitive, body.sensitivity_threshold)
+            _refuse_sensitive_keys(config, snap, body.sensitivity_threshold,
+                                   body.include_tables, body.exclude_tables)
             written = load_items(config, body.include_tables, body.exclude_tables,
                                  drop=body.drop_collections)
             if not body.dry_run:  # it ends by declaring the named graph: checked if it changes
@@ -2237,8 +2491,11 @@ def create_app(
     # ── Target endpoints ───────────────────────────────────────────────
 
     @app.get("/api/targets")
-    async def list_targets():
-        return [_redact_target(t.model_dump()) for t in catalog.list_targets()]
+    async def list_targets(request: Request):
+        targets = catalog.list_targets()
+        if (seen := _seen(request)) is not None:
+            targets = [t for t in targets if t.name in seen["targets"]]
+        return [_redact_target(t.model_dump()) for t in targets]
 
     @app.post("/api/targets", status_code=201)
     async def add_target(body: TargetCreateRequest):
@@ -2302,8 +2559,11 @@ def create_app(
         )
 
     @app.get("/api/catalogs")
-    async def list_catalogs():
-        return [_redact_catalog(c.model_dump()) for c in catalog.list_catalogs()]
+    async def list_catalogs(request: Request):
+        catalogs = catalog.list_catalogs()
+        if (seen := _seen(request)) is not None:
+            catalogs = [c for c in catalogs if c.name in seen["catalogs"]]
+        return [_redact_catalog(c.model_dump()) for c in catalogs]
 
     @app.post("/api/catalogs", status_code=201)
     async def add_catalog(body: CatalogCreateRequest):
@@ -2400,6 +2660,8 @@ class ProjectCreateRequest(BaseModel):
     arango_database: str = "_system"
     mapping_name: str = ""
     mapping_description: str = ""
+    #: A registered target to write to; its endpoint and database replace the two above.
+    target_name: str | None = None
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -2501,6 +2763,10 @@ class MigrateRequest(BaseModel):
     """Parameters for POST /api/projects/{name}/migrate (in-place migration)."""
 
     dry_run: bool = False
+    # The same sensitive-field gate as a load (Phase 9b): what a migration reloads is
+    # gated as a load would be. Under a control plane it may only be made stricter.
+    allow_sensitive: bool = False
+    sensitivity_threshold: str = "confidential"
 
 
 class NamingConventionRequest(BaseModel):

@@ -272,11 +272,11 @@ class PostgresValueSampler(_RsaPostgresValueSampler):
         """Return up to ``limit`` distinct non-null values from a column (or [])."""
         n = max(1, int(limit))
         q = f"""
-            SELECT DISTINCT "{column}" AS v
-            FROM "{self.schema_name}"."{table}"
-            WHERE "{column}" IS NOT NULL
+            SELECT DISTINCT {self._qi(column)} AS v
+            FROM {self._qi(self.schema_name)}.{self._qi(table)}
+            WHERE {self._qi(column)} IS NOT NULL
             LIMIT %s
-        """  # noqa: S608 - identifiers are quoted; schema is from the catalog
+        """  # noqa: S608 - identifiers are quoted with RSA's _qi (embedded quotes doubled)
         try:
             conn = self._conn_lazy()
             with conn.cursor() as cur:
@@ -397,8 +397,10 @@ def create_value_sampler(
         is_postgresql,
         is_sqlserver,
         normalize_source_type,
+        require_connection_string,
     )
 
+    require_connection_string(connection_string, source_type)
     params = source_params or {}
     # Resolve $VAR credential references the same way create_source_connector does.
     connection_string = expand_env_vars(connection_string)

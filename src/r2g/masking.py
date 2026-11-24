@@ -10,10 +10,10 @@ kinds are provided:
 - ``redact``   – constant ``"***"`` (value destroyed)
 - ``nullify``  – ``null`` (value dropped but property kept)
 
-``hash``/``tokenize`` use AQL functions outside the local expression subset, so
-they are evaluated **server-side** by ArangoDB at load (the pipeline's existing
-delegation path) and therefore work for every source type. ``redact``/``nullify``
-compile locally.
+All four compile in the local expression evaluator, so a masked mapping passes
+validation and loads the same way on every path. ``hash``/``tokenize`` digest the
+value's text as ArangoDB's ``MD5``/``SHA512`` do (lower-case hex); a blank value stays
+blank rather than becoming the digest of empty text.
 
 Masking expressions are tagged with a sentinel in ``FieldExpression.description``
 so the entitlement gate can recognise a field as masked (and therefore safe to
@@ -65,8 +65,17 @@ def make_mask_expression(column: str, kind: str) -> FieldExpression:
 
 
 def is_masking_expression(fx: FieldExpression) -> bool:
-    """True when ``fx`` was produced by :func:`make_mask_expression`."""
-    return (fx.description or "").startswith(MASK_SENTINEL)
+    """True when ``fx`` is a mask :func:`make_mask_expression` would write.
+
+    The sentinel names the kind; the expression itself must be that kind's, over the
+    one column it reads. The description is free text anyone editing the mapping can
+    set, so a sentinel on any other expression (an identity copy, say) does not make
+    the field masked: the gate would otherwise load it in clear.
+    """
+    kind = mask_kind_of(fx)
+    if kind not in MASK_KINDS or fx.engine != "aql" or len(fx.sources) != 1:
+        return False
+    return fx.expression == make_mask_expression(fx.sources[0], kind).expression
 
 
 def mask_kind_of(fx: FieldExpression) -> Optional[str]:

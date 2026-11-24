@@ -145,7 +145,7 @@ r2g export-r2rml --config mapping.yaml --schema schema.json --output analytics.r
 - **Environment variable support** -- connection parameters (`PG_CONN`, `ARANGO_ENDPOINT`, `ARANGO_DB`, `ARANGO_USER`, `ARANGO_PASSWORD`) can be set via environment variables or a `.env` file; CLI flags override env vars when both are provided
 - **Skip existing** -- `stream --skip-existing` skips collections that already contain data, enabling resumption of partial streaming runs without re-importing completed collections
 - **Incremental streaming** -- `stream --since 2026-04-01T00:00:00` filters rows by a timestamp column (auto-detects `updated_at`/`created_at` or use `--since-column`); combine with `--on-duplicate=replace` for basic incremental updates
-- **PK-less table safety** -- tables without a primary key are warned during validation and streaming; documents receive auto-generated keys and edges referencing such tables are flagged
+- **PK-less table keys** -- a table without a primary key is warned during validation and streaming, and each row is keyed by every column in schema order (NULL written as `%null`, keys over 200 characters hashed), so its edges load; identical rows collapse to one document, and so do distinct rows whose values join to the same key (`('x_y', 'z')` and `('x', 'y_z')` with the default `_` separator), as composite primary keys already do. The CSV-direct path (`generate-csv-import`) still gives such a table no edges
 - **CDC (Change Data Capture)** -- near real-time PostgreSQL→ArangoDB sync via logical replication. `PGReplicationListener` manages replication slots, polls `pg_logical_slot_get_changes`, parses output via `test_decoding` (built-in) or `wal2json` plugins. `DeltaTransformer` converts row-level changes to graph mutations (document upserts/deletes + edge recalculation). `CDCHandler` orchestrates event processing with transaction grouping and stats tracking. Configurable conflict resolution policies: `source_wins` (default), `last_write_wins`, `log_and_skip`, `fail`. CLI commands: `cdc-setup`, `cdc-teardown`, `cdc-status`, `cdc-start`
 - **Composite foreign key support** -- multi-column foreign keys are correctly introspected from `pg_catalog`, represented in mappings, and transformed into composite `_key` / `_from` / `_to` values using a configurable separator
 - **Multi-schema support** -- `--pg-schema` option on `ingest-schema`, `dump-tables`, and `stream` commands allows introspection and import from any PostgreSQL schema, not just `public`
@@ -310,6 +310,23 @@ overlay; r2g stores the parsed overlay and records its source and fingerprint on
 each snapshot. r2g never invents those keys. Name-based FK suggestions work for
 Snowflake, but value-overlap sampling is not yet implemented for Snowflake and
 falls back to name-only evidence.
+
+### A source you cannot connect to
+
+When a partner hands over its schema rather than a connection, register the
+source offline and take its snapshot from a schema file:
+
+```bash
+r2g source add --name partner --type snowflake --offline --key-overlay ./keys.overlay.json
+r2g source snapshot partner --pg-schema SCHEMA --from-file ./schema.json
+```
+
+The file is RSA `PhysicalSchema` JSON, the format `r2g ingest-schema` writes. It
+goes through the same key-overlay and classification steps as an introspected
+schema, and the snapshot records the file's path and SHA-256. An offline source
+stores no connection string, so anything that would read from it directly
+(`source dump`, `source suggest-keys`, `stream`, `cdc-start`, value sampling) refuses with that reason. Raw
+DDL is not read here: convert it to `PhysicalSchema` JSON first.
 
 Export CSV files or stream directly from the registered source:
 
@@ -538,10 +555,10 @@ r2g stream --dry-run \
 
 | Command | Description |
 |---|---|
-| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic) |
+| `source add` | Register a new data source (PostgreSQL, MySQL / MariaDB, SQL Server, Snowflake, ClickHouse, CSV directory, or Kafka topic); `--offline` registers one with no connection |
 | `source list` | List all registered data sources |
 | `source remove` | Remove a registered data source |
-| `source snapshot` | Introspect the schema from a source and save a snapshot |
+| `source snapshot` | Introspect the schema from a source and save a snapshot (`--from-file` reads it from a schema file instead; required for an `--offline` source) |
 | `source dump` | Dump every table in a cataloged source to CSV files (source-agnostic replacement for `dump-tables`) |
 | `source infer-fks` | Propose foreign keys for a source's latest schema snapshot (`--sample` for value-overlap scoring, `--accept` to write back) |
 | `source analyze-denorm` | Detect denormalization smells (repeating column groups; embedded lookups via `--sample`) and recommend graph remedies — advisory, read-only (`--min-confidence`, `--no-sample-columns`, `--json`) |
@@ -569,6 +586,9 @@ The load API also accepts `emit_governance` / `tier_layout` to drop the artifact
 
 | Command | Description |
 |---|---|
+| `target add` | Register an ArangoDB target (`--name`, `--endpoint`, `--database`, `--username`, `--password`; honours `ARANGO_*`); under a control plane, projects are created only on registered targets, and `--project NAME` registers it for that one project |
+| `target list` | List registered targets (passwords never shown) |
+| `target remove` | Remove a registered target |
 | `secrets init` | Initialize (or replace) the on-disk catalog secret key; respects `R2G_SECRET_KEY` |
 | `secrets migrate` | Force-encrypt every secret in the catalog with the active key |
 | `secrets status` | Show where the active secret key is coming from |
@@ -647,7 +667,7 @@ r2g cdc-start --pg-conn "..." schema.json mapping.yaml \
 
 A conflict summary table is printed at the end of each CDC session showing counts by conflict type.
 
-For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values:
+For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values. A table without a primary key needs it for deletes: its documents are keyed by every column, so a DELETE without the full old row deletes nothing. For the same reason an UPDATE to a row of such a table changes its key: change capture writes a new document and the old one stays (known limitation):
 
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;
@@ -717,7 +737,8 @@ run naming the stream, as with `--no-recover-streams`:
 - with `--temporal`, where an insert never replaces an existing version;
 - under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
   `fail` would stop at the first row the copy already holds;
-- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
+- for an object with no primary key in the schema, whose identical rows collapse to one document, so
+  the sweep could not tell them apart.
 
 One case a resync does not correct. The stream is recreated and the object is read a moment later. A
 row that changes between the two and changes back before the next cycle, or is inserted and then
@@ -772,7 +793,7 @@ r2g is a reference application (see the Status note near the top): well-tested, 
 - **Incremental + change capture** -- `stream --since` filters rows by a timestamp column for basic incremental loads; full change capture is available via the CDC (`cdc-start`) and Kafka (`kafka-start`) pipelines with configurable conflict resolution, and `mapping-diff` / `selective-reload` reconcile mapping changes against an already-loaded target.
 - **Self-referential FKs** -- these work but produce edges within the same collection (e.g., `orders.referrer_id -> customers.id` creates `orders_to_customers_referrer_id`). This is correct but may be unexpected.
 - **ArangoDB write path** -- the `stream` command connects directly to ArangoDB via python-arango, but the file-based paths (`generate-csv-import`, `generate-import`) still require `arangoimport` installed separately.
-- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `~/.r2g/secret.key` (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
+- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `secret.key` in the catalog directory, `~/.r2g` unless `R2G_CATALOG_DIR` says otherwise (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
 
 ## Testing
 
@@ -831,10 +852,12 @@ environment variables (see [.env.example](.env.example)):
 
 | Variable | Effect |
 |---|---|
+| `R2G_ALLOWED_HOSTS` | Extra host names (comma-separated) an open Studio — loopback bind, no token — answers to, beyond `localhost`, `127.0.0.1` and `[::1]`. Requests addressed to any other name are refused, which stops a web page reaching the Studio by DNS rebinding. |
 | `R2G_API_TOKEN` | Require `Authorization: Bearer <token>` on the UI API and the MCP SSE transport. A token is auto-generated and printed when binding to a non-loopback address. |
 | `R2G_CORS_ORIGINS` | Comma-separated allow-list of CORS origins for the UI (default: same-origin only). |
+| `R2G_CATALOG_DIR` | Directory holding the catalog (`catalog.json`), its `secret.key` and the dead-letter queue (default: `~/.r2g`). |
 | `R2G_CSV_BASE_DIR` | Confine CSV sources to a trusted directory tree; paths outside it (including via symlinks/`..`) are rejected. |
-| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `~/.r2g/secret.key`). |
+| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `secret.key` in the catalog directory). |
 
 The MCP `stdio` transport (Cursor / Claude Desktop) is local-only and needs no
 token; only the network-exposed SSE transport is gated.

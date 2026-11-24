@@ -35,6 +35,7 @@ What stays **local to r2g** (and why):
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 # Source-agnostic helpers are shared with RSA (byte-identical; verified by the
@@ -79,6 +80,36 @@ class SourceConnector(Protocol):
         ...
 
 
+def quote_double(name: str) -> str:
+    """Quote an identifier with double quotes, doubling any embedded double quote.
+
+    The ANSI form PostgreSQL and Snowflake share. Table and column names reach
+    queries from introspection, so the source decides them: a name like
+    ``x"; DROP TABLE t; --`` must stay one identifier, never end it.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
+def quote_backtick(name: str) -> str:
+    """Quote a ClickHouse identifier with backticks, escaping ``\\`` and the backtick.
+
+    ClickHouse reads backslash escapes inside a quoted identifier, so the backslash
+    is escaped first; otherwise a name ending in ``\\`` would escape the closing quote.
+    """
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def table_output_file(out_dir: Path, table: str, suffix: str = ".csv") -> Path:
+    """The file a dump of ``table`` is written to, refusing names that leave ``out_dir``.
+
+    Table names come from the source, so a name such as ``../../x`` would otherwise
+    write outside the directory the operator chose.
+    """
+    if not table or table in (".", "..") or any(c in table for c in ("/", "\\", "\0")):
+        raise ValueError(f"table name {table!r} cannot be used as a file name")
+    return Path(out_dir) / f"{table}{suffix}"
+
+
 SUPPORTED_SOURCE_TYPES: tuple[str, ...] = (
     "postgresql",
     "mysql",
@@ -88,6 +119,21 @@ SUPPORTED_SOURCE_TYPES: tuple[str, ...] = (
     "csv",
     "kafka",
 )
+
+
+def require_connection_string(connection_string: str | None, source_type: str | None) -> None:
+    """Refuse an empty connection string with the reason.
+
+    An offline source (``source add --offline``) is stored with no connection
+    string. Anything that would read from it directly fails here, naming why,
+    instead of inside a database driver.
+    """
+    if not (connection_string or "").strip():
+        raise ValueError(
+            f"This {source_type or 'source'} source has no connection string. A source "
+            "registered with --offline has no connection: its snapshots are read from a "
+            "schema file, and nothing can be read from it directly."
+        )
 
 
 def create_source_connector(
@@ -111,6 +157,7 @@ def create_source_connector(
 
     key = normalize_source_type(source_type)
     params = source_params or {}
+    require_connection_string(connection_string, key)
     # Resolve $VAR / ${VAR} credential references (env / r2g secrets) so the
     # catalog never has to store secrets and imported sources connect cleanly.
     connection_string = expand_env_vars(connection_string)

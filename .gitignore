@@ -22,6 +22,7 @@ test_run/
 !.claude/skills/
 .claude/skills/*
 !.claude/skills/code-quality-review/
+!.claude/skills/pr-review/
 CLAUDE.md
 .coverage
 .no-drift-gate

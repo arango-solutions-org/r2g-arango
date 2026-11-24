@@ -386,6 +386,21 @@ class TestValidateConfig:
         assert "ghosts" in issues[0]
         assert "not found" in issues[0]
 
+    def test_a_table_mapped_by_two_document_collections_is_refused(self, schema):
+        """A load writes one document collection per table, so a second is refused
+        rather than silently not loaded; an edge collection beside one is not."""
+        config = MappingConfig(collections={
+            "users": CollectionMapping(source_table="users", target_collection="users"),
+            "people": CollectionMapping(source_table="users", target_collection="people"),
+        })
+        issues = validate_config(schema, config)
+        assert any("more than one document collection" in i and "people" in i
+                   for i in issues), issues
+        config.collections.pop("people")
+        config.collections["user_links"] = CollectionMapping(
+            source_table="users", target_collection="user_links", collection_type="edge")
+        assert not any("more than one" in i for i in validate_config(schema, config))
+
     def test_bad_exclude_field(self, schema):
         config = MappingConfig(
             collections={
@@ -535,3 +550,6 @@ class TestValidateConfig:
         issues = validate_config(pkless_schema, config)
         assert len(issues) == 1
         assert "no primary key" in issues[0]
+        assert "keyed by all column values" in issues[0]
+        assert "identical rows collapse to one document" in issues[0]
+        assert "auto-generated" not in issues[0]
