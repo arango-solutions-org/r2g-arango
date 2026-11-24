@@ -6,6 +6,13 @@ from r2g.types import Column, ForeignKey, Schema, Table
 
 
 @pytest.fixture(autouse=True)
+def _testclient_host(monkeypatch):
+    """FastAPI's TestClient addresses every request to ``testserver``; an open,
+    loopback-bound Studio answers only local names unless told otherwise."""
+    monkeypatch.setenv("R2G_ALLOWED_HOSTS", "testserver")
+
+
+@pytest.fixture(autouse=True)
 def _wide_terminal(monkeypatch):
     """Pin a wide terminal for the whole suite.
 

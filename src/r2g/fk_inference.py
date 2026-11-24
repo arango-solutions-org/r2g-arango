@@ -272,11 +272,11 @@ class PostgresValueSampler(_RsaPostgresValueSampler):
         """Return up to ``limit`` distinct non-null values from a column (or [])."""
         n = max(1, int(limit))
         q = f"""
-            SELECT DISTINCT "{column}" AS v
-            FROM "{self.schema_name}"."{table}"
-            WHERE "{column}" IS NOT NULL
+            SELECT DISTINCT {self._qi(column)} AS v
+            FROM {self._qi(self.schema_name)}.{self._qi(table)}
+            WHERE {self._qi(column)} IS NOT NULL
             LIMIT %s
-        """  # noqa: S608 - identifiers are quoted; schema is from the catalog
+        """  # noqa: S608 - identifiers are quoted with RSA's _qi (embedded quotes doubled)
         try:
             conn = self._conn_lazy()
             with conn.cursor() as cur:

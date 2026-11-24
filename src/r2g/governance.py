@@ -34,6 +34,7 @@ from r2g.classification import (
     sensitivity_rank,
     tier_of,
 )
+from r2g.expressions import extract_bind_references
 from r2g.masking import is_masking_expression, mask_kind_of
 from r2g.types import Classification, MappingConfig, Schema
 
@@ -57,6 +58,22 @@ class EntitlementField(BaseModel):
     excluded: bool = False
 
 
+class KeyExposure(BaseModel):
+    """A sensitive column a load would write into a document or edge key.
+
+    The gate removes properties, not keys: ``_key``, ``_from`` and ``_to`` are built
+    from the row's values, so a sensitive primary key, any column of a table without
+    one, or a sensitive foreign key that an edge follows reaches the graph whatever the
+    gate excludes. The remedy is a reviewed key overlay naming a key that is not
+    sensitive, or leaving the table or edge out.
+    """
+
+    collection: str  # the collection or edge collection whose keys carry it
+    source_table: str
+    column: str
+    level: str
+
+
 class EntitlementReport(BaseModel):
     """Pre-load governance report for a project's mapping."""
 
@@ -65,6 +82,8 @@ class EntitlementReport(BaseModel):
     fields: list[EntitlementField] = Field(default_factory=list)
     collection_levels: dict[str, str] = Field(default_factory=dict)
     edge_levels: dict[str, str] = Field(default_factory=dict)
+    # Sensitive columns that would be written into keys, which the gate cannot remove.
+    key_exposures: list[KeyExposure] = Field(default_factory=list)
 
     @property
     def above_threshold(self) -> list[EntitlementField]:
@@ -131,15 +150,26 @@ def build_entitlement_report(
             c.name: (c.classification or Classification()) for c in table.columns
         }
 
-        # Mask kind per target property (from masking field-expressions).
-        mask_by_target: dict[str, Optional[str]] = {}
-        expr_sources: dict[str, list[str]] = {}
+        # Every expression for each target property: a mapping may hold more than one,
+        # and the transformer writes the last, so a target is rated by all of them.
+        by_target: dict[str, list] = {}
         for fx in cm.field_expressions:
-            if is_masking_expression(fx):
-                mask_by_target[fx.target] = mask_kind_of(fx)
-            expr_sources[fx.target] = fx.sources or (
-                [fx.target] if fx.target in clf_by_col else []
-            )
+            by_target.setdefault(fx.target, []).append(fx)
+        # A target counts as masked only when each of its expressions is a mask.
+        mask_by_target: dict[str, Optional[str]] = {
+            target: mask_kind_of(fxs[-1])
+            for target, fxs in by_target.items()
+            if all(is_masking_expression(fx) for fx in fxs)
+        }
+        # Every column a target reads: the ones its expressions declare, and every column
+        # they reference, which the transformer reads from the row whether declared or not.
+        expr_sources: dict[str, list[str]] = {}
+        for target, fxs in by_target.items():
+            cols: list[str] = []
+            for fx in fxs:
+                cols += fx.sources or ([fx.target] if fx.target in clf_by_col else [])
+                cols += extract_bind_references(fx.expression)
+            expr_sources[target] = list(dict.fromkeys(cols))
 
         # Determine kept source columns (include/exclude lists).
         kept = [c.name for c in table.columns]
@@ -152,7 +182,7 @@ def build_entitlement_report(
 
         # Expression (incl. fan-in) target properties.
         seen_targets: set[str] = set()
-        for fx in cm.field_expressions:
+        for fx in (fxs[-1] for fxs in by_target.values()):
             sources = expr_sources.get(fx.target, [])
             clfs = [clf_by_col.get(s, Classification()) for s in sources]
             level = max_sensitivity(tier_of(c, tag_levels=tag_levels) for c in clfs)
@@ -192,7 +222,74 @@ def build_entitlement_report(
                 )
             )
 
+    report.key_exposures = key_exposures(config, schema, threshold=threshold,
+                                         tag_levels=tag_levels)
     return report
+
+
+def key_exposures(
+    config: MappingConfig,
+    schema: Schema,
+    *,
+    threshold: str = DEFAULT_THRESHOLD,
+    tag_levels: Optional[dict[str, str]] = None,
+    include: Optional[list[str]] = None,
+    exclude: Optional[list[str]] = None,
+) -> list[KeyExposure]:
+    """Every column at or above ``threshold`` that a load of ``config`` would write into
+    a key, for the tables the load writes (filtered by source table, as a load filters
+    them: an empty ``include`` means every table, as it does to the pipeline).
+
+    A document's ``_key`` is its table's key (:func:`r2g.keys.row_key`: the primary key,
+    or every column of a table without one). An edge carries its starting table's key in
+    ``_from`` and its own ``_key``, whether or not that table is mapped as documents, and
+    the values of its ``from_fields`` in ``_to``; those are the key of the row it points
+    at, so each is rated at the higher of its own level and the referenced column's.
+    """
+    inc = set(include) if include else None
+    exc = set(exclude or ())
+
+    def loads(table: str) -> bool:
+        return (inc is None or table in inc) and table not in exc
+
+    def level_of(table_name: str, column: str) -> str:
+        table = schema.tables.get(table_name)
+        col = next((c for c in table.columns if c.name == column), None) if table else None
+        clf = (col.classification if col is not None else None) or Classification()
+        return tier_of(clf, tag_levels=tag_levels)
+
+    def key_of(table_name: str) -> list[str]:
+        table = schema.tables[table_name]
+        return list(table.primary_key) or [c.name for c in table.columns]
+
+    out: list[KeyExposure] = []
+
+    def note(where: str, table_name: str, column: str, level: str) -> None:
+        if exceeds_threshold(level, threshold):
+            out.append(KeyExposure(collection=where, source_table=table_name,
+                                   column=column, level=level))
+
+    for cm in config.collections.values():
+        # Only document collections are written per row; an edge-typed mapping writes
+        # nothing itself (its relationships are the edges below).
+        if (cm.collection_type == "document" and cm.source_table in schema.tables
+                and loads(cm.source_table)):
+            for col in key_of(cm.source_table):
+                note(cm.target_collection, cm.source_table, col,
+                     level_of(cm.source_table, col))
+    for edge in config.edges:
+        start = edge.from_collection
+        if start not in schema.tables or not loads(start):
+            continue
+        for col in key_of(start):  # _from, and the edge's _key
+            note(edge.edge_collection, start, col, level_of(start, col))
+        for i, col in enumerate(edge.from_fields):  # _to, and the edge's _key
+            pointed = edge.to_fields[i] if i < len(edge.to_fields) else None
+            levels = [level_of(start, col)]
+            if pointed is not None:
+                levels.append(level_of(edge.to_collection, pointed))
+            note(edge.edge_collection, start, col, max_sensitivity(levels))
+    return out
 
 
 def apply_sensitivity_gate(
@@ -205,7 +302,8 @@ def apply_sensitivity_gate(
 
     The gate is the migration's refusal to *silently* launder sensitive data: by
     default the contributing source columns of every above-threshold, unmasked
-    field are added to that collection's ``exclude_fields`` for the run. Passing
+    field are added to that collection's ``exclude_fields`` for the run, and the
+    field's expression, if it has one, is removed. Passing
     ``allow_sensitive=True`` is the explicit opt-out (config returned unchanged).
 
     Returns ``(gated_config, excluded_fields)`` where each excluded field has
@@ -217,24 +315,23 @@ def apply_sensitivity_gate(
     gated = config.model_copy(deep=True)
     excluded: list[EntitlementField] = []
     for field in report.above_threshold:
-        key = _collection_key(gated, field.source_table)
-        cm = gated.collections.get(key) if key is not None else None
-        if cm is None:
-            continue
-        for col in field.source_columns:
-            if col not in cm.exclude_fields:
-                cm.exclude_fields.append(col)
+        # The field's own collection: the one that reads its table and writes it.
+        # (Validation refuses two document collections on one table, which a load
+        # could not honour.)
+        for cm in gated.collections.values():
+            if (cm.source_table != field.source_table
+                    or cm.target_collection != field.target_collection):
+                continue
+            for col in field.source_columns:
+                if col not in cm.exclude_fields:
+                    cm.exclude_fields.append(col)
+            # An expression reads its columns from the row, excluded or not, so the
+            # field's expression goes too; otherwise it would load what it computes.
+            cm.field_expressions = [fx for fx in cm.field_expressions
+                                    if fx.target != field.target_property]
         marked = field.model_copy(update={"excluded": True})
         excluded.append(marked)
     return gated, excluded
-
-
-def _collection_key(config: MappingConfig, source_table: str) -> Optional[str]:
-    """Find the collections-dict key whose mapping sources ``source_table``."""
-    for key, cm in config.collections.items():
-        if cm.source_table == source_table:
-            return key
-    return None
 
 
 def lineage_manifest(report: EntitlementReport) -> dict:
@@ -428,7 +525,9 @@ def policy_rego(report: EntitlementReport, *, package: str = "r2g.authz") -> str
     )
     if levels:
         coll_lines = ",\n".join(
-            f'    "{c}": "{lvl}"' for c, lvl in sorted(levels.items())
+            # JSON string escaping is Rego's own: a quote or newline in a name stays
+            # inside its string.
+            f"    {json.dumps(c)}: {json.dumps(lvl)}" for c, lvl in sorted(levels.items())
         )
     else:
         coll_lines = ""

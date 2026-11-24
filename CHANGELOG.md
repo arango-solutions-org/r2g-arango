@@ -7,6 +7,25 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Under a control plane, a migration is checked on everything its reloads rewrite (#124,
+  PRD P14.10).** A reload runs the load for the tables it reloads, so reloading one
+  relationship rewrote its starting table's documents and other relationships, and reloading
+  a collection dropped and rewrote the relationships starting from it, emptying an edge
+  collection that other tables also write to. The policy was asked only about what the plan
+  named. Each is now checked, as a load of those tables is, so a user who may change one class
+  can no longer empty a collection that holds another's.
+- **The Studio's `hash` and `tokenize` masks load (PRD P5c.1.4, P9.6).** "Mask this field" writes
+  `MD5(TO_STRING(@col))` or `SHA512(TO_STRING(@col))`, which only ArangoDB evaluated, so mapping
+  validation refused them and neither a load nor a migration could use either mask; only `redact`
+  and `nullify` worked. r2g now evaluates `MD5` and `SHA512` itself, with ArangoDB's digests
+  (lower-case hex of the value's text; checked against ArangoDB 3.12). One difference: a blank
+  value stays blank, where ArangoDB would digest the empty text. A mapping that used these
+  functions elsewhere now has them evaluated by r2g instead of ArangoDB.
+
+## [0.12.0] — 2026-11-24
+
 ### Added
 
 - **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
@@ -80,6 +99,95 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load wrote documents and edge endpoints that a later stream or CDC run could not
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
+
+### Security
+
+- **Identifiers a source reports are quoted in every query r2g sends back to it.** A
+  table or column name containing a quote character could end its identifier in the
+  row-count, streaming, dump and value-sampling queries for PostgreSQL, Snowflake and
+  ClickHouse, and `r2g dump-tables` did not quote names at all. Each name is now
+  quoted with its embedded quotes doubled (escaped, for ClickHouse). `r2g dump-tables`
+  and `r2g source dump` also refuse a table name that would write outside the output
+  directory, and `r2g generate-csv-import` one that would make its script read a file
+  from outside the data directory.
+
+- **Names in generated scripts and mappings stay inside their comments and strings.**
+  The arangoimport scripts (`r2g generate-import`, `r2g generate-csv-import`, and the
+  Studio's import preview) wrote table, column and collection names into `#` comment
+  lines as they were; a newline in a name ended the comment, and the operator running
+  the script ran the rest of the name. Every control and line-separator character in
+  a comment is now written as its escape. R2RML mappings (`r2g export-r2rml`) had the
+  same flaw in their comments on skipped edges and computed properties, where a newline
+  let a name add a triples map whose `rr:sqlQuery` the mapping engine would run against
+  the source. The OPA/Rego policy stub now writes collection and edge names as escaped
+  string literals, so a quote in one cannot end its string.
+
+- **Under a control plane, a project's load target is bound when the project is
+  created (PRD P14.18).** A request could relink a project to another project's
+  target, or create one at an address of its choosing and have the server's own
+  `ARANGO_*` credentials used there, and a load could turn the sensitive-field gate
+  off. Now:
+  - creation binds a target an administrator registered and no other project holds,
+    or registered for that project (`r2g target add --project`); before the project
+    exists, only such targets are listed or read;
+  - changing a project's target is refused;
+  - a project with no registered target does not load or migrate;
+  - a load or a migration may make the gate stricter, but not looser;
+  - a load or a migration that would write a sensitive column into a document or edge
+    key is refused, naming the column: keys are built from the row's values, so the
+    gate, which removes properties, cannot keep a sensitive primary key, a column of a
+    table without one, the key of the row an edge starts from, or a foreign key an edge
+    follows (rated as the column it points at) out of the graph. A reviewed key overlay
+    that names a key that is not sensitive is the remedy;
+  - a load whose include list is empty, which loads every table, is governed and
+    checked as the load of every table; the policy used to be asked about none.
+
+  Outside a control plane these do not change.
+  **Upgrading a control-plane deployment:** register a target with the new
+  `r2g target add` for every project whose endpoint and database no registered target
+  matches, with `--project` to keep it for that project. `r2g target list` and
+  `r2g target remove` complete it.
+
+- **The sensitive-field gate covers field expressions and migrations.** The gate
+  excluded a sensitive field's source columns, but a field expression reads its
+  columns from the row whether they are excluded or not, so an expression over a
+  sensitive column (`@ssn`, or `CONCAT(@name, @ssn)`) loaded what it computed, and so
+  did one that read a column without declaring it. A field is now rated by every column
+  its expressions reference, and a field the gate excludes loses its expressions too. A
+  field counts as masked only when each of its expressions is the mask the Studio's
+  "mask this field" writes, not because a description carries the mask marker, or
+  because a mask sits beside a second expression for the same property. A mapping that
+  maps one table with two document collections is refused: a load only ever wrote one
+  of them, so the gate could exclude a column from the other, and a migration could ask
+  the policy about one and rewrite the other. A migration
+  (`POST /api/projects/{name}/migrate`) now checks the mapping as a load does, and
+  applies the same gate, taking `allow_sensitive` and `sensitivity_threshold` likewise:
+  it used to reload a gated load's collections without the gate, and to send an
+  expression it could not check to ArangoDB as AQL. The migration plan
+  (`GET /api/projects/{name}/migration-plan`) is gated the same way, so it plans what
+  the migration does. The entitlement report (`r2g entitlements report`, and its
+  `key_exposures` in JSON) names every sensitive column a load would write into a key. A migration after a load with `allow_sensitive` now
+  needs `allow_sensitive` too, or it removes the sensitive fields that load wrote.
+
+- **An open Studio answers only requests addressed to a local name.** Bound to a
+  loopback address with no token, the Studio trusts that only this machine can reach
+  it, but it did not check the `Host` header, so a web page could rebind its own name
+  to 127.0.0.1 and call the API. It now refuses any request not addressed to
+  `localhost`, `127.0.0.1` or `[::1]`. `R2G_ALLOWED_HOSTS` adds names. Nor does it
+  accept a change from a page on another site, another local app included: a request
+  that changes something is refused when it names an `Origin` other than the Studio's
+  own scheme, host and port, or one listed in `R2G_CORS_ORIGINS`. A Studio with a token, or
+  under a control plane, is unchanged. An empty bind address (`--host ""`) listens on
+  every interface, and the Studio and `r2g mcp` no longer treat it as loopback, so it
+  needs a token like any other address others can reach.
+
+- **The Studio escapes a source's names and data.** Column names and each cell's
+  tooltip were written into the table preview's HTML unescaped, so a value stored in a
+  source row could put markup, and script, into the Studio of whoever previewed that
+  table. The table panel's primary-key list and the expression editor's column chips
+  wrote column names the same way, where whoever clicked the table ran it, under a
+  control plane too. All are now escaped, and the preview request encodes the source
+  and table names.
 
 ## [0.11.1] — 2026-11-19
 
@@ -1329,7 +1437,8 @@ Initial phased implementation (not yet published to PyPI):
   pipeline, `r2g source dump` CLI, pure-Python FK inference with
   optional value-overlap sampler.
 
-[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...v0.10.0
