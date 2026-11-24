@@ -475,20 +475,25 @@ def _key_owner(label: str, entities: List[str], roles: Dict[str, str]) -> Option
 def _entity_property_names(cm: CollectionMapping, table: Optional[Table]) -> List[str]:
     """Ordered, de-duplicated target-property names for one collection.
 
-    Prefers the explicit mapping (``field_mappings`` values + ``field_expressions``
-    targets); falls back to the source table's columns (honouring
-    include/exclude) when the mapping doesn't rename anything.
+    Explicit ``field_mappings`` targets whose source column survives
+    include/exclude, then ``field_expressions`` targets (always kept), then the
+    source table's surviving columns when the schema is available.
     """
     names: List[str] = []
     seen: set[str] = set()
+    include = set(cm.include_fields) if cm.include_fields is not None else None
+    exclude = set(cm.exclude_fields)
 
     def _add(name: str) -> None:
         if name and name not in seen:
             seen.add(name)
             names.append(name)
 
+    def _kept(column: str) -> bool:
+        return (include is None or column in include) and column not in exclude
+
     # Explicit field renames: value is the target property name.
-    for target in cm.field_mappings.values():
+    for target in (t for source, t in cm.field_mappings.items() if _kept(source)):
         _add(target)
     # Computed / fan-in properties.
     for fe in cm.field_expressions:
@@ -497,14 +502,9 @@ def _entity_property_names(cm: CollectionMapping, table: Optional[Table]) -> Lis
     # Fall back to the physical columns when we have the schema and no explicit
     # rename covered a column.
     if table is not None:
-        include = set(cm.include_fields) if cm.include_fields is not None else None
-        exclude = set(cm.exclude_fields)
         for col in table.columns:
-            if include is not None and col.name not in include:
-                continue
-            if col.name in exclude:
-                continue
-            _add(cm.field_mappings.get(col.name, col.name))
+            if _kept(col.name):
+                _add(cm.field_mappings.get(col.name, col.name))
 
     return names
 

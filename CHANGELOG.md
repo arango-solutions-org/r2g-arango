@@ -75,6 +75,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load wrote documents and edge endpoints that a later stream or CDC run could not
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
+- **CSI export honors `include_fields` and `exclude_fields` on renamed columns (related to #91, PRD
+  P12.1).** A rename whose source column was filtered out was still exported as a property. It is
+  now omitted, with or without a schema, unless a field expression also targets it. A curated label
+  on a removed property is now unmatched, so `export-csi` and `export-r2rml` refuse to write without
+  `--allow-unapplied-labels`, and that property's name is free for another curated rename.
 
 ## [0.11.1] — 2026-11-19
 

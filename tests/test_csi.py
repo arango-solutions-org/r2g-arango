@@ -1251,3 +1251,133 @@ def test_export_csi_without_a_schema_says_its_names_can_differ(tmp_path):
     result = CliRunner().invoke(app, ["export-csi", "--config", str(config), "-o", str(tmp_path / "out.json")])
     assert result.exit_code == 0, result.output
     assert "No --schema" in " ".join(result.output.split())
+
+
+# ── Property filtering: include/exclude apply to a rename's source column ──
+
+
+def _customer_table() -> Table:
+    return Table(
+        name="customer",
+        columns=[
+            Column(name="id", data_type="integer", is_primary_key=True),
+            Column(name="full_name", data_type="text"),
+            Column(name="ssn", data_type="text"),
+        ],
+        primary_key=["id"],
+    )
+
+
+def _customer_csi(with_schema: bool, **mapping) -> dict:
+    mapping.setdefault("field_mappings", {"full_name": "name", "ssn": "taxId"})
+    config = MappingConfig(
+        source_schema="shop",
+        collections={
+            "customer": CollectionMapping(
+                source_table="customer", target_collection="Customer", **mapping
+            )
+        },
+    )
+    schema = Schema(tables={"customer": _customer_table()}) if with_schema else None
+    doc = mapping_to_csi(config, schema)
+    validate_csi(doc)
+    return doc
+
+
+def _conceptual_names(doc: dict) -> list:
+    return [p["name"] for p in doc["conceptualModel"]["entities"][0]["properties"]]
+
+
+def _physical_fields(doc: dict) -> list:
+    props = doc["arangoPhysicalMapping"]["entities"]["Customer"]["properties"]
+    return [p["field"] for p in props.values()]
+
+
+@pytest.mark.parametrize("with_schema", [True, False], ids=["schema", "no-schema"])
+def test_excluded_renamed_column_is_absent(with_schema):
+    doc = _customer_csi(with_schema, exclude_fields=["ssn"])
+    assert "taxId" not in _conceptual_names(doc)
+    assert "taxId" not in _physical_fields(doc)
+    assert "name" in _conceptual_names(doc)
+
+
+@pytest.mark.parametrize("with_schema", [True, False], ids=["schema", "no-schema"])
+def test_rename_outside_include_fields_is_absent(with_schema):
+    doc = _customer_csi(with_schema, include_fields=["id", "full_name"])
+    assert "taxId" not in _conceptual_names(doc)
+    assert "taxId" not in _physical_fields(doc)
+    assert "name" in _conceptual_names(doc)
+
+
+@pytest.mark.parametrize("with_schema", [True, False], ids=["schema", "no-schema"])
+def test_computed_target_survives_filtering(with_schema):
+    doc = _customer_csi(
+        with_schema,
+        exclude_fields=["ssn"],
+        field_expressions=[
+            FieldExpression(target="label", sources=["full_name"], expression="UPPER(@full_name)")
+        ],
+    )
+    assert "label" in _conceptual_names(doc)
+    assert "label" in _physical_fields(doc)
+
+
+@pytest.mark.parametrize(
+    ("with_schema", "expected"),
+    [(True, ["name", "taxId", "id"]), (False, ["name", "taxId"])],
+    ids=["schema", "no-schema"],
+)
+def test_excluded_rename_shared_with_an_expression_stays_at_the_expression(with_schema, expected):
+    # Without the rename the target is added by the expression, after every
+    # surviving rename: the one documented ordering change.
+    doc = _customer_csi(
+        with_schema,
+        field_mappings={"ssn": "taxId", "full_name": "name"},
+        exclude_fields=["ssn"],
+        field_expressions=[
+            FieldExpression(target="taxId", sources=["full_name"], expression="MD5(@full_name)")
+        ],
+    )
+    assert _conceptual_names(doc) == expected
+
+
+@pytest.mark.parametrize(
+    ("with_schema", "expected"),
+    [(True, ["name", "taxId", "id"]), (False, ["name", "taxId"])],
+    ids=["schema", "no-schema"],
+)
+def test_valid_renames_keep_their_order(with_schema, expected):
+    assert _conceptual_names(_customer_csi(with_schema)) == expected
+
+
+def test_rename_of_a_nonexistent_column_is_unchanged():
+    doc = _customer_csi(True, field_mappings={"gone": "ghost"})
+    assert _conceptual_names(doc) == ["ghost", "id", "fullName", "ssn"]
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [{"exclude_fields": ["ssn"]}, {"include_fields": ["id", "full_name"]}],
+    ids=["exclude", "include"],
+)
+def test_filtered_csi_and_r2rml_name_the_same_properties(filters):
+    import re
+
+    from r2g.r2rml import mapping_to_r2rml
+
+    config = MappingConfig(
+        source_schema="shop",
+        collections={
+            "customer": CollectionMapping(
+                source_table="customer",
+                target_collection="Customer",
+                field_mappings={"full_name": "name", "ssn": "taxId"},
+                **filters,
+            )
+        },
+    )
+    schema = Schema(tables={"customer": _customer_table()})
+    doc = mapping_to_csi(config, schema)
+    validate_csi(doc)
+    predicates = set(re.findall(r"rr:predicate <[^>]*#(\w+)>", mapping_to_r2rml(config, schema)))
+    assert predicates == set(_conceptual_names(doc)) == {"id", "name"}
