@@ -551,11 +551,12 @@ class TestIncludeViews:
             "ACCOUNT_VW": True,
             "USERS": False,
         }
+        # Only a view is persisted; a reloaded table is unknown, not assumed a table.
         reloaded = Schema.model_validate_json(schema.model_dump_json())
         assert {n: t.is_view for n, t in reloaded.tables.items()} == {
             "ACCOUNT_MV": True,
             "ACCOUNT_VW": True,
-            "USERS": False,
+            "USERS": None,
         }
 
     def test_the_flag_must_be_a_boolean_word(self):

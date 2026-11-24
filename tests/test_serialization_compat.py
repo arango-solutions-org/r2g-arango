@@ -27,8 +27,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import pytest
-
 from r2g.catalog import CatalogManager
 from r2g.classification import annotate_schema
 from r2g.types import (
@@ -269,12 +267,16 @@ class TestSchemaByteStability:
 
 
 class TestViewStatusSerialization:
-    @pytest.mark.parametrize("status", [True, False], ids=["view", "table"])
-    def test_known_status_is_written_last_and_reloads(self, status):
-        table = Table(name="t", columns=[], is_view=status)
-        dumped = table.model_dump()
+    def test_a_view_is_written_last_and_reloads(self):
+        dumped = Table(name="t", columns=[], is_view=True).model_dump()
         assert list(dumped)[-1] == "is_view"
-        assert Table.model_validate(dumped).is_view is status
+        assert Table.model_validate(dumped).is_view is True
+
+    def test_a_known_table_stays_false_in_memory_and_keeps_its_bytes(self):
+        known = Table(name="t", columns=[], is_view=False)
+        assert known.is_view is False
+        assert known.model_dump_json() == Table(name="t", columns=[]).model_dump_json()
+        assert Table.model_validate_json(known.model_dump_json()).is_view is None
 
     def test_unknown_status_is_not_written(self):
         table = Table(name="t", columns=[])

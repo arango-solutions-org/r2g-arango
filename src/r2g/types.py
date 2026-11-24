@@ -94,7 +94,7 @@ class Table(_RsaTable):
     Serializes to r2g's historical key set (dropping RSA's ``comment`` /
     constraint / index enrichment and the ``extra`` passthrough) for byte-stable
     snapshots. ``schema_name`` is kept only outside :data:`DEFAULT_SQL_SCHEMA`
-    (see :meth:`qualified_name`), and ``is_view`` only when known.
+    (see :meth:`qualified_name`), and ``is_view`` only when true.
     """
 
     # Narrowing the inherited RSA field to r2g's Column subclass (safe: every
@@ -128,10 +128,10 @@ class Table(_RsaTable):
         # snapshot persisted before this -- stays byte-identical.
         if full.get("schema_name") not in (None, DEFAULT_SQL_SCHEMA):
             out["schema_name"] = full["schema_name"]
-        # Written last and only when known, so every snapshot persisted before
-        # this, and every source that does not record it, stays byte-identical.
-        if full.get("is_view") is not None:
-            out["is_view"] = full["is_view"]
+        # Written last and only when true, so every snapshot without a view,
+        # including every one persisted before this, stays byte-identical.
+        if full.get("is_view"):
+            out["is_view"] = True
         return out
 
     def qualified_name(self) -> str:

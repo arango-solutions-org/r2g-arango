@@ -406,26 +406,26 @@ def test_latest_snapshot_warns_when_it_lost_overlay_unique_keys(monkeypatch, tmp
 
 
 @pytest.mark.parametrize(
-    ("recorded", "expected"),
-    [({}, None), ({"is_view": False}, False), ({"is_view": True}, True)],
+    ("recorded", "in_memory", "after_reload"),
+    [({}, None, None), ({"is_view": False}, False, None), ({"is_view": True}, True, True)],
     ids=["absent", "false", "true"],
 )
-def test_offline_schema_file_keeps_view_status_through_reload(tmp_path, recorded, expected):
+def test_offline_schema_file_keeps_view_status(tmp_path, recorded, in_memory, after_reload):
     path = tmp_path / "schema.json"
     table = {"name": "X", "columns": [{"name": "A", "data_type": "text"}], **recorded}
     path.write_text(json.dumps({"tables": {"X": table}}), encoding="utf-8")
     mgr = CatalogManager(tmp_path / "catalog")
     mgr.add_source("wh", "snowflake", "snowflake://user:password@account/DB/SCHEMA")
 
-    capture_source_snapshot(
+    _, result = capture_source_snapshot(
         mgr, "wh", schema_name="PUBLIC", schema_file=read_schema_file(path)
     )
     reloaded = CatalogManager(tmp_path / "catalog").get_latest_snapshot("wh")
 
-    assert reloaded.schema_data.tables["X"].is_view is expected
+    assert result.schema.tables["X"].is_view is in_memory
+    assert reloaded.schema_data.tables["X"].is_view is after_reload
     persisted = reloaded.model_dump(mode="json")["schema_data"]["tables"]["X"]
-    assert persisted.get("is_view") is expected
-    assert ("is_view" in persisted) is (expected is not None)
+    assert ("is_view" in persisted) is (after_reload is True)
     assert reloaded.schema_format_version == CURRENT_SCHEMA_FORMAT == 2
 
 
@@ -451,11 +451,31 @@ def test_key_overlay_keeps_view_status(monkeypatch, tmp_path):
         lambda *args, **kwargs: _Connector(schema),
     )
 
-    capture_source_snapshot(mgr, "wh", schema_name="PUBLIC")
+    _, result = capture_source_snapshot(mgr, "wh", schema_name="PUBLIC")
     tables = CatalogManager(tmp_path).get_latest_snapshot("wh").schema_data.tables
 
-    assert {n: t.is_view for n, t in tables.items()} == {"V": True, "T": False, "U": None}
+    assert {n: t.is_view for n, t in result.schema.tables.items()} == {
+        "V": True,
+        "T": False,
+        "U": None,
+    }
+    assert {n: t.is_view for n, t in tables.items()} == {"V": True, "T": None, "U": None}
     assert all(t.primary_key == ["ID"] for t in tables.values())
+
+
+def test_a_snapshot_of_known_tables_writes_no_view_key(monkeypatch, tmp_path):
+    columns = [Column(name="ID", data_type="number", is_nullable=False)]
+    known = Schema(tables={"T": Table(name="T", columns=columns, is_view=False)})
+    mgr = CatalogManager(tmp_path)
+    mgr.add_source("wh", "snowflake", "snowflake://user:password@account/DB/SCHEMA")
+    monkeypatch.setattr(
+        "r2g.connectors.base.create_source_connector",
+        lambda *args, **kwargs: _Connector(known),
+    )
+
+    snapshot, _ = capture_source_snapshot(mgr, "wh", schema_name="PUBLIC")
+
+    assert "is_view" not in snapshot.model_dump(mode="json")["schema_data"]["tables"]["T"]
 
 
 def test_legacy_snapshot_reloads_as_unknown_and_resaves_byte_identically():

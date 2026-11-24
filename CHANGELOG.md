@@ -39,11 +39,14 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Snowflake snapshots record which objects are views (related to #91, PRD P6.1, P6.10).** A
-  captured schema now keeps `is_view`: `true` for a view or materialized view, `false` for a base
-  table, and absent when unknown. Existing snapshots reload unchanged and stay unknown, with no new
-  snapshot format. Newly captured Snowflake schemas serialize different bytes, and one containing a
-  view gets a new physical-schema fingerprint. `source suggest-keys` no longer proposes keys for
-  recognized Snowflake views and reports them as not evaluated, so give them a reviewed key overlay.
+  view or materialized view is now saved with `is_view: true`. Base tables are known as tables
+  during introspection but nothing is written for them, so a snapshot without a view keeps its
+  bytes and fingerprint. A missing value stays unknown. No new snapshot format.
+- **`source suggest-keys` no longer proposes keys for recognized Snowflake views.** This affects
+  only sources with `include_views=true`, which is off by default. A view is reported as not
+  evaluated, and a table that refers to it loses the suggested relationship too, because the view
+  has no key to point at. A reviewed key overlay declaring the view's key and the reference
+  restores both.
 
 ## [0.11.1] — 2026-11-19
 
