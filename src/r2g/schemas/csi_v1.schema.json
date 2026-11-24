@@ -77,7 +77,13 @@
               "type": { "type": "string", "minLength": 1 },
               "fromEntity": { "type": "string", "minLength": 1 },
               "toEntity": { "type": "string", "minLength": 1 },
-              "properties": { "type": "array", "items": { "type": "object" } }
+              "properties": { "type": "array", "items": { "type": "object" } },
+              "reference": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A FOREIGN_KEY mapping lifted off the physical layer. `id` is its mapping identity.",
+                "properties": { "id": { "$ref": "#/$defs/MappingId" } }
+              }
             }
           }
         },
@@ -107,7 +113,11 @@
                 "type": "object",
                 "description": "Conceptual property name -> where its value is stored.",
                 "additionalProperties": { "$ref": "#/$defs/PropertyMapping" }
-              }
+              },
+              "id": { "$ref": "#/$defs/MappingId" },
+              "propertyIds": { "$ref": "#/$defs/PropertyIds" },
+              "relation": { "$ref": "#/$defs/RelationalSource" },
+              "columns": { "type": "array", "items": { "$ref": "#/$defs/RelationalColumn" } }
             }
           }
         },
@@ -122,11 +132,20 @@
               "style": { "type": "string", "enum": ["DEDICATED_COLLECTION", "GENERIC_WITH_TYPE"] },
               "edgeCollectionName": { "type": "string" },
               "typeField": { "type": "string" },
-              "typeValue": { "type": "string" }
+              "typeValue": { "type": "string" },
+              "id": { "$ref": "#/$defs/MappingId" },
+              "propertyIds": { "$ref": "#/$defs/PropertyIds" },
+              "relation": { "$ref": "#/$defs/RelationalSource" },
+              "columns": { "type": "array", "items": { "$ref": "#/$defs/RelationalColumn" } }
             }
           }
         }
       }
+    },
+
+    "physicalMapping": {
+      "description": "The generalized name of `arangoPhysicalMapping` (issue #42): the same object under a second key. `arangoPhysicalMapping` stays required, so v1 readers keep working; when both are present they must be equal (checked by validate_csi, not by this schema). The version gates above apply to `arangoPhysicalMapping`.",
+      "$ref": "#/properties/arangoPhysicalMapping"
     },
 
     "provenance": {
@@ -156,12 +175,51 @@
           "properties": { "from": { "type": "string" } }
         },
         "validTimeSource": { "type": "string", "enum": ["catalog", "event", "file", "fingerprint-continuity", "observed"] },
-        "predecessorFingerprint": { "type": ["string", "null"] }
+        "predecessorFingerprint": { "type": ["string", "null"] },
+        "publisher": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["uri"],
+          "description": "The namespace this document's mapping ids are minted under: one URI per published CSI document, so two documents never share an id.",
+          "properties": { "uri": { "$ref": "#/$defs/MappingId" } }
+        }
       }
     }
   },
 
   "$defs": {
+    "MappingId": {
+      "description": "A publisher-minted mapping identity: an absolute http(s) URI without query or fragment.",
+      "type": "string",
+      "pattern": "^https?://[^\\s?#]+$"
+    },
+    "PropertyIds": {
+      "description": "Property name -> mapping identity of that property's mapping. Its keys are exactly those of the sibling `properties`; kept beside it because a property mapping is strict.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MappingId" }
+    },
+    "RelationalSource": {
+      "description": "The relational table or view an entity, or a join-table-backed relationship, is read from.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["table", "view"] },
+        "schema": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "RelationalColumn": {
+      "description": "One column of the relational source, with its SQL type.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "sqlType"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "sqlType": { "type": "string", "minLength": 1 },
+        "nullable": { "type": "boolean" }
+      }
+    },
     "PropertyMapping": {
       "description": "Where one entity property is stored. `field` is one literal attribute name, dots included (\"address.city\" is a single top-level attribute). `path` names a value inside a nested object, one name per level ([\"address\", \"city\"]) and needs csiVersion 1.1. `multiValued` says the attribute holds a list, one value per element, and needs csiVersion 1.2. At most one of the two; with neither, the property name is the attribute. Besides them, only the descriptive keys below or an ignorable `x-` key are allowed: a reader refuses anything else rather than ignore a key that might say where the value lives. Relationship property mappings keep the additive rule.",
       "type": "object",

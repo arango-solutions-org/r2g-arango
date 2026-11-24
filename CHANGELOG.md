@@ -57,6 +57,11 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Vendored CSI schema synced to arangodb-schema-analyzer 0.21.0 (#91, PRD P12.10, P12.14).**
+  `src/r2g/schemas/csi_v1.schema.json` now matches the analyzer's released 0.21.0 schema apart from
+  r2g's vendored-copy `description`; the new definitions are additive, so r2g's CSI output is
+  unchanged. The `[test]`/`[dev]` analyzer range is now `>=0.21.0,<0.23`. No runtime dependency.
+
 - **Under a control plane, a project sees only its own source, target and catalog (#61, PRD
   P14.16).** Once the transformation project the control plane opens exists, the source, target
   and catalog lists show only its source, the target its loads write to and the catalog its

@@ -125,8 +125,9 @@ test = [
   # too; without ASA here it would skip in CI's test job (r2g-arango#30).
   # Capped (raise deliberately): a new analyzer release can change the CSI schema, and the
   # vendored copy must follow it in the same PR that raises the cap. 0.20.0 (CSI 1.2) turned
-  # main red on 2026-11-16 and held the 0.11.0 release until #87.
-  "arangodb-schema-analyzer>=0.18.0,<0.21",
+  # main red on 2026-11-16 and held the 0.11.0 release until #87. Raised to <0.23 with the
+  # vendored copy synced to 0.21.0 (r2g-arango#91); 0.22's CSI schema is byte-identical.
+  "arangodb-schema-analyzer>=0.21.0,<0.23",
 ]
 dev = [
   "ruff>=0.4",
@@ -136,8 +137,9 @@ dev = [
   # authoritative copy (contextual-data-fabric unified-architecture paper, step 2).
   # Capped (raise deliberately): a new analyzer release can change the CSI schema, and the
   # vendored copy must follow it in the same PR that raises the cap. 0.20.0 (CSI 1.2) turned
-  # main red on 2026-11-16 and held the 0.11.0 release until #87.
-  "arangodb-schema-analyzer>=0.18.0,<0.21",
+  # main red on 2026-11-16 and held the 0.11.0 release until #87. Raised to <0.23 with the
+  # vendored copy synced to 0.21.0 (r2g-arango#91); 0.22's CSI schema is byte-identical.
+  "arangodb-schema-analyzer>=0.21.0,<0.23",
   # In-process Snowflake emulator, so tests/test_cli_suggest_keys.py runs the
   # suggest -> review -> snapshot loop end to end in CI without an account.
   "fakesnow>=0.11",
