@@ -5,6 +5,8 @@
 > that audit left open are carried below with their current state.
 > Baseline: **4022 passed, 2 skipped, 18 xfailed; 87% line coverage** on the unit suite
 > (`pytest -m "not integration" --cov=r2g`), 181 integration tests deselected.
+> **Updated 2026-11-24, after 0.12.0:** units 1–7 are done; the security work's
+> follow-ups are units 21–24. `file:line` references elsewhere are as of `b1f2a56`.
 
 ## How to read this plan
 
@@ -22,7 +24,7 @@ exist.
 |---|---|
 | SSRF via target introspect / source snapshot — "revisit if a hosted or multi-tenant mode ships" | Revisited now that control-plane mode has shipped; see §2. Local mode is unchanged: connecting to user-chosen endpoints is the product. |
 | LOW — rate limiting on expression compile/preview and `infer-fks?sample=true` | Still open; still deliberately not done for local mode (see §5). |
-| LOW — preview-modal header/title not escaped | Title fixed (`textContent`); see §2 for the rest. |
+| LOW — preview-modal header/title not escaped | Fixed: the title (`textContent`), and in 0.12.0 the column names and cell tooltips (unit 5). |
 | LOW — `~/.r2g` and DLQ files created with default permissions | Still open → unit 12. |
 | LOW — `openProjectDatabase` opens a user-controlled endpoint | Still open, and it accepts any URL scheme → unit 12. |
 | Python `_resolve_target` vs JS `_resolveProjectTarget` | The two agree. Retired as a duplication item; the Python copy moves to `CatalogManager` in unit 14 for a different reason. |
@@ -38,9 +40,11 @@ exist.
 
 ## 2. Security
 
-Five findings with a concrete exploit path were reproduced by execution and are
-**reported in a private security advisory**, not here: this repository is public. Their
-fixes are units 1–5 below, described here only once the advisory is published.
+Five findings with a concrete exploit path were reproduced by execution, fixed through a
+temporary private fork, and released in **0.12.0** (2026-11-24; merged as `80dee8a`).
+They are units 1–5 below. The CHANGELOG's 0.12.0 Security section is their record: the
+draft advisories were closed without being published, since r2g is pre-1.0 with no
+known outside users.
 
 Hardening without a current exploit path is unit 12.
 
@@ -50,7 +54,8 @@ names refused by the naming round-trip); Snowflake streams/CDC SQL quoting and
 connection-error scrubbing; AQL in CDC resync, the temporal applier and selective reload
 (bind variables); `shlex.quote` on every arangoimport command argument; no
 `eval`/`exec`/`subprocess`/`shell=True`/`pickle`/`yaml.load` in `src`; `catalog.json`
-and `secret.key` written 0600; cross-site `text/plain` POST answers 422; under a control
+and `secret.key` written 0600; cross-site POST with a JSON body answers 422 (one with no body went through until
+0.12.0's `Origin` check, unit 4); under a control
 plane another project's routes answer 404, unknown non-GET routes are refused, the MCP
 server refuses to start, `suggest-ontology` sampling is refused; API responses redact
 source, target and catalog credentials; CI uses `pull_request`, not
@@ -60,25 +65,34 @@ source, target and catalog credentials; CI uses `pull_request`, not
 
 ## 3. Units, in landing order
 
-### A. Security fixes (private until the advisory is published)
+### A. Security fixes — done in 0.12.0
 
-1–5. Tracked in the private advisory, each with a regression test. One of them needs a
-   design decision before it can be fixed, and that decision is coordinated with
-   contextual-data-fabric. It lands before unit 14, which edits the same code.
+Each landed with tests that fail without its fix, after six independent reviews.
+
+1. **Source identifiers are quoted in every generated query** (SQL injection through
+   table and column names), and the dump commands and `generate-csv-import` refuse a
+   table name that would leave their directory.
+2. **Names stay inside their comments and strings** in generated arangoimport scripts,
+   R2RML mappings and the Rego stub.
+3. **Under a control plane, a project's target is bound at creation** (PRD P14.18,
+   `r2g target add [--project]`). The sensitive-field gate covers field expressions,
+   migrations and keys, and a context that opens no project sees nothing.
+4. **An open Studio answers only requests addressed to a local name** and takes changes
+   only from its own origin (`R2G_ALLOWED_HOSTS` adds names).
+5. **The Studio escapes a source's names and data** in the table preview, the table
+   panel and the expression chips.
 
 ### B. Small correctness fixes (independent of each other)
 
-6. **`r2g secrets init|status` use the catalog's directory** — PR #110. Both hardwire
-   `Path.home()/".r2g"` (`main.py:4329`, `:4371`) while the catalog reads
-   `<catalog_dir>/secret.key`, honouring `R2G_CATALOG_DIR` (`catalog.py:300-309`).
-   Under `R2G_CATALOG_DIR` (the control-plane image sets `/data`), `status` reports the
-   wrong file and `init` writes a second key the catalog never reads. One
-   `catalog_dir()` helper; fix `README.md:792,854` and `.env.example:16`. *Test.*
-7. **CSV-direct import script honours `key_separator`** — PR #111. `generators/arangoimport.py:923,
-   979, 991` join composite keys with a hardcoded `_`; the transformers use the
-   mapping's separator. A non-default separator gives bulk CSV loads keys that streaming
-   and CDC never produce. *Test* (parametrize the separator; compare with
-   `NodeTransformer`).
+6. **`r2g secrets init|status` use the catalog's directory** — done in #110 (0.12.0).
+   Both hardwired `Path.home()/".r2g"` while the catalog reads
+   `<catalog_dir>/secret.key`, honouring `R2G_CATALOG_DIR`, so under that variable
+   `status` reported the wrong file and `init` wrote a second key the catalog never
+   read. They now share `default_catalog_dir()`.
+7. **CSV-direct import script honours `key_separator`** — done in #111 (0.12.0). It
+   joined composite keys with a hardcoded `_` where the transformers use the mapping's
+   separator, so a non-default separator gave bulk CSV loads keys that streaming and
+   CDC never produce.
 8. **Small surface fixes, one PR each:**
    - Studio table preview does not expand `$VAR` connection strings (`ui/server.py:1023`);
      MCP does (`mcp_server.py:637`). Expand inside `preview_table_rows`. *Test.*
@@ -109,8 +123,8 @@ source, target and catalog credentials; CI uses `pull_request`, not
      `--allow-sensitive` (`README.md:578`) and `--verbose` as a per-command option
      (`README.md:614`; it is `r2g -v <command>`);
    - env vars read in `src/` are a subset of those documented in `README.md` ∪
-     `.env.example` — fails on `CONTROL_PLANE_HOME`, `OPENAI_BASE_URL`,
-     `R2G_CATALOG_DIR`, `R2G_TENANT`, `CONTROL_PLANE_URL`;
+     `.env.example` — fails on `CONTROL_PLANE_HOME`, `OPENAI_BASE_URL`, `R2G_TENANT`,
+     `CONTROL_PLANE_URL`;
    - the README extras table equals `[project.optional-dependencies]` — fails on `llm`,
      `ontology`;
    - no status banner quotes an RSA band other than `pyproject.toml`'s — fails on
@@ -136,7 +150,7 @@ source, target and catalog credentials; CI uses `pull_request`, not
     never does. **Judgment:** add the gate to `stream`, or reword the README per path.
     Open drift gap P9.5 already tracks the code side.
 
-### D. Hardening (one PR, after the advisory)
+### D. Hardening (one PR)
 
 12. Hardening batch, *test* where noted: DLQ files and the catalog directory created
     0700/0600 (`dlq.py:23,40`, `catalog.py:306`, `governed.keep_version`) *test*;
@@ -158,14 +172,15 @@ source, target and catalog credentials; CI uses `pull_request`, not
     `1.50_2020-01-01%2000:00:00+00:00` from bulk and `1.5_2020-01-01%2000:00:00+00`
     from CDC (executed with each path's input types; not yet against a live
     replication slot), so a CDC delete misses and an update duplicates. Canonicalise
-    on the CDC side so existing graphs keep their keys. *Test.* **After PR #108**,
-    which changes the same rule for keyless tables.
+    on the CDC side so existing graphs keep their keys. *Test.* PR #108 (merged) changed
+    the same rule for keyless tables, so this builds on it.
 14. **MCP `start_load` shares the Studio's load orchestration.** `mcp_server.py:676-741`
     ignores the project's linked target and credentials, and skips `validate_config`,
     the sensitivity gate and the DLQ, all of which the Studio load applies
     (`ui/server.py:1922-2060`). Move `_resolve_target` (`ui/server.py:320`) to
-    `CatalogManager.resolve_target` and share one load function. *Test.* **After units 1–5
-    and PR #106** (both edit these functions).
+    `CatalogManager.resolve_target` and share one load function, keeping 0.12.0's
+    control-plane checks (target binding, the gate on migrations, the key check).
+    *Test.* **After PR #106**, which edits these functions.
 15. **The Snowflake URL parser moves to RSA.** r2g's (`connectors/snowflake.py:376`) and
     RSA's (`connectors/snowflake.py:463`) have drifted both ways: r2g refuses
     `authenticator=externalbrowser` without a password and validates `include_views`;
@@ -187,16 +202,17 @@ source, target and catalog credentials; CI uses `pull_request`, not
     guard with a test.
 19. `CHANGELOG.md:81` says 0.11.1 needs Polars ≥1.41.1; `pyproject.toml:55` allows
     `polars>=1.0.0`. Raise the floor (a dependency move) or reword.
-20. **PRD restructuring**, after the open PRs that edit PRD rows (#104, #105, #106,
-    #108) merge, or every one of them conflicts:
+20. **PRD restructuring**, after the open PRs that edit PRD rows (#104, #106) merge, or
+    each of them conflicts (#105 and #108 have merged):
     - stale status prose, proposed via `/prd-sync` as `OUTDATED-PRD` patches, not
       edited directly: header Version 0.1.0 and Status cell (`:8,10`), roadmap overview
       stopping at Phase 6 (`:86`), §6 "P6.7, planned" against row P6.7 Done
       (`:1205` vs `:202`), Phase 12 heading "P12.1 shipped" (`:1041`), superseded
       single-label text in P13.3 (`:1113`), encryption "AES-256 or OS keychain"
       (`:271`) against Fernet (`:186,353`), the reference to `PRD-gemini.md` /
-      `PRD-notebooklm.md`, which are not in the repository (`:1280`). P14.15
-      "unreleased" is already fixed in PR #104;
+      `PRD-notebooklm.md`, which are not in the repository (`:1280`). P14.15's
+      release (0.11.1, not the 0.12.0 the release commit stamped) is corrected in
+      PR #104;
     - one Status cell per requirement from a fixed list — 62 rows have none
       (P5.1–8, P5d.1–5, P8.1–8, P9.1–9, P10.1–8, P11.1–10, P12.2–8), and P12.7 still
       says "due 2026-07-24";
@@ -208,15 +224,35 @@ source, target and catalog credentials; CI uses `pull_request`, not
     - split the omnibus rows (P6.16, P12.1, P6.4, P12.12, P12.13) into child markers,
       updating code citations and the drift ledger together.
 
+### G. Follow-ups from the security work (0.12.0)
+
+21. **The Studio's `hash` and `tokenize` masks cannot be loaded.** `validate_config`
+    refuses `MD5`/`SHA512`, which only ArangoDB evaluates, so a mapping using "mask this
+    field" with either kind fails a load and a migration; only `redact` and `nullify`
+    work. Evaluate both locally, as ArangoDB does, so validation accepts them. *Test.*
+22. **Keys built from sensitive columns are refused, not hidden.** Under a control
+    plane, 0.12.0 refuses a load that would write a sensitive column into a key; the
+    remedy is a key overlay. Hashing such keys (a keyed hash, so the graph stays
+    joinable) would let those loads through, but every key builder must agree: bulk,
+    streaming, CDC, and the CSV-direct scripts, which build keys inside `arangoimport`.
+    Design first.
+23. **A migration's policy items name only what changed** (#124), while reloading an
+    edge or collection also rewrites the starting table's documents and other edges.
+24. **The key check refuses more than it must** under a control plane: a dry run is
+    checked, and a migration checks the whole mapping, so a sensitive-key table a load
+    left out still blocks a later migration. Fails closed; narrow it when 23 is done.
+
 ---
 
 ## 4. Belongs elsewhere
 
 - **relational-schema-analyzer:** unit 15 (Snowflake URL parser, authenticator policy,
   `include_views`, URL scrubbing in `_safe_connection_error`).
-- **contextual-data-fabric:** one of units 1–5 needs its agreement (see the advisory).
-  Unit 6 changes where `secrets` looks under `R2G_CATALOG_DIR`, which the
-  control-plane image sets.
+- **argos** (the control-plane deployment): unit 3 needs `r2g target add --project` for
+  its seeded project, and its maintainers have been told. Unit 6 changes where `secrets`
+  looks under `R2G_CATALOG_DIR`, which that deployment sets.
+- **contextual-data-fabric** pins r2g only as the Forge generator, which 0.12.0 did not
+  change.
 
 ## 5. Deliberately not proposed
 

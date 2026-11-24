@@ -183,19 +183,21 @@ code they name has moved since; `git log --since=2026-11-22 -- <path>` says whet
   connection-error scrubbing; AQL in CDC resync, the temporal applier and selective
   reload uses bind variables; arangoimport command arguments are `shlex.quote`d; no
   `eval`/`exec`/`subprocess`/`shell=True`/`pickle`/`yaml.load` in `src`; `catalog.json`
-  and `secret.key` are 0600; a cross-site `text/plain` POST gets 422; control-plane
+  and `secret.key` are 0600; an open Studio refuses a cross-site change (`Host` and
+  `Origin` checks, 0.12.0; a JSON body alone did not stop one with no body); control-plane
   routing only (another project 404s, unknown non-GET routes refused, MCP refuses to
   start) — the rest of project isolation is not known clean;
   credentials redacted in API responses; CI uses `pull_request`, release uses OIDC.
 - **Duplication:** `naming.py` matches RSA exactly (38,198-word differential); offline
   sources are refused on every connection path (`require_connection_string`); every
   surface scrubs errors through `scrub_dsn_credentials`; CDC edge deletes reuse
-  `EdgeTransformer`; Python `_resolve_target` and JS `_resolveProjectTarget` agree.
+  `EdgeTransformer`. (Python `_resolve_target` and JS `_resolveProjectTarget` agreed on
+  2026-11-22; 0.12.0 changed the Python one, so re-check them.)
 - **Hardwired values:** Studio port 8501, MCP SSE port 8502, bulk batch size 10000,
-  CDC batch sizes, the `key_separator` default `_` (except the CSV generator, plan unit
-  7), sampling defaults, MySQL/SQL Server/ClickHouse test DSNs.
+  CDC batch sizes, the `key_separator` default `_` (the CSV generator too, since #111),
+  sampling defaults, MySQL/SQL Server/ClickHouse test DSNs.
 - **Docs:** every fenced `r2g` command in `README.md` and the examples parses; every
-  option named in CHANGELOG [Unreleased], 0.11.1 and 0.11.0 exists; every MCP tool the
+  option named in CHANGELOG 0.11.1 and 0.11.0 exists (0.12.0's were not checked); every MCP tool the
   docs name is registered; Python 3.10+ is stated consistently; RSA band is not quoted
   in user-facing docs.
 - **PRD:** no duplicate markers; no dangling marker citations in the repo; all 154
