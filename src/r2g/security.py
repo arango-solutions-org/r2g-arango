@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Any
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlencode, urlparse, urlsplit, urlunparse
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -168,6 +170,107 @@ def scrub_dsn_credentials(text: str) -> str:
     if not text:
         return text
     return _DSN_CRED_RE.sub(r"\1***:***@", text)
+
+
+# ── Connection errors (#118) ─────────────────────────────────────────────────
+#
+# A driver's error text goes into r2g's message, and from there into logs, CLI output, the
+# UI and MCP responses, and any printed traceback. Whether a driver repeats the password or
+# token it was given depends on the driver and the failure (Snowflake's was caught doing
+# it), so connectors treat driver text as untrusted. Mirrors relational-schema-analyzer
+# 0.16's ``redact`` module (same names), so r2g can import that instead once it requires
+# RSA 0.16 or later.
+
+#: Parameter names whose value is a credential, matched case-insensitively.
+SENSITIVE_CONNECT_KEYS = _SENSITIVE_DSN_QUERY_KEYS | frozenset(
+    {
+        "passwd",
+        "pwd",
+        "passcode",
+        "motherduck_token",
+        "private_key_passphrase",
+        "passphrase",
+        "client_secret",
+        "secret",
+        "api_key",
+    }
+)
+
+#: What a masked credential reads as.
+SECRET_MASK = "***"
+
+# libpq's key=value form: ``host=db password=s3cret`` or ``password='s3 cret'``.
+_KEYWORD_VALUE = re.compile(r"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)")
+
+
+def _sensitive_key(name: str) -> bool:
+    return name.lower() in SENSITIVE_CONNECT_KEYS
+
+
+def _with_encodings(value: str) -> list[str]:
+    """The value as given, decoded and percent-encoded: a driver may echo any form."""
+    if not value:
+        return []
+    decoded = unquote(value)
+    return [value, decoded, quote(decoded, safe=""), quote_plus(decoded, safe="")]
+
+
+def secrets_in(*sources: Any) -> list[str]:
+    """Every credential in ``sources``, longest first.
+
+    A source is a connection string (URL or libpq ``key=value`` form), a mapping of
+    connection parameters, or ``None``. Anything else is ignored.
+    """
+    found: set[str] = set()
+    for source in sources:
+        if isinstance(source, Mapping):
+            for key, value in source.items():
+                if isinstance(key, str) and _sensitive_key(key) and value not in (None, ""):
+                    found.update(_with_encodings(str(value)))
+        elif isinstance(source, str) and source:
+            found.update(_secrets_in_string(source))
+    return sorted((s for s in found if s), key=len, reverse=True)
+
+
+def _secrets_in_string(text: str) -> set[str]:
+    found: set[str] = set()
+    if "://" in text:
+        try:
+            password = urlsplit(text).password
+        except ValueError:
+            password = None  # a malformed URL still gets the scans below
+        if password:
+            found.update(_with_encodings(password))
+    if "?" in text:  # a query string, with or without a scheme
+        for name, value in parse_qsl(text.split("?", 1)[1], keep_blank_values=False):
+            if _sensitive_key(name):
+                found.update(_with_encodings(value))
+    for name, value in _KEYWORD_VALUE.findall(text):
+        if _sensitive_key(name):
+            if len(value) >= 2 and value[0] == value[-1] == "'":
+                value = value[1:-1].replace("\\'", "'").replace("\\\\", "\\")
+            # Unquoted, the value may run into a query string's next parameter: mask both.
+            found.update(_with_encodings(value))
+            found.update(_with_encodings(value.split("&", 1)[0]))
+    return found
+
+
+def redact(text: str, secrets: Iterable[str]) -> str:
+    """``text`` with every secret masked (longest first) and any ``user:pass@`` scrubbed."""
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, SECRET_MASK)
+    return scrub_dsn_credentials(text)
+
+
+def connection_error(what: str, err: BaseException, secrets: Iterable[str]) -> RuntimeError:
+    """The exception to raise **``from None``** when a connection fails.
+
+    ``"<what>: <DriverError>: <driver text, secrets masked>"``. ``from None`` matters: a
+    chained ``__cause__`` is the driver's original exception, and any traceback prints it
+    unmasked.
+    """
+    return RuntimeError(f"{what}: {type(err).__name__}: {redact(str(err), secrets)}")
 
 
 def redact_source_dump(dump: dict) -> dict:

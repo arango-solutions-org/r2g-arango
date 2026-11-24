@@ -28,6 +28,7 @@ from r2g.cdc.handler import CDCHandler
 from r2g.cdc.models import ChangeEvent
 from r2g.cdc.parsers import TestDecodingParser, Wal2JsonParser
 from r2g.log import get_logger
+from r2g.security import connection_error, secrets_in
 
 logger = get_logger(__name__)
 
@@ -76,11 +77,16 @@ class PGReplicationListener:
 
     def _connect(self) -> psycopg.Connection:
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg.connect(
-                self.pg_conn_string,
-                autocommit=True,
-                row_factory=tuple_row,
-            )
+            try:
+                self._conn = psycopg.connect(
+                    self.pg_conn_string,
+                    autocommit=True,
+                    row_factory=tuple_row,
+                )
+            except Exception as err:
+                raise connection_error(
+                    "Failed to connect to PostgreSQL", err, secrets_in(self.pg_conn_string)
+                ) from None
         return self._conn
 
     def slot_exists(self) -> bool:

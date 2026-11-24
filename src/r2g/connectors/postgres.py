@@ -28,6 +28,7 @@ from typing import Any, Iterator, Optional
 import psycopg
 from psycopg.rows import dict_row, tuple_row
 
+from r2g.security import connection_error, secrets_in
 from r2g.types import Column, ForeignKey, Schema, Table
 
 
@@ -118,7 +119,13 @@ def preview_table_rows(
         sql.Identifier(schema_name),
         sql.Identifier(table_name),
     )
-    with psycopg.connect(connection_string, row_factory=dict_row) as conn:
+    try:
+        conn = psycopg.connect(connection_string, row_factory=dict_row)
+    except Exception as err:
+        raise connection_error(
+            "Failed to connect to PostgreSQL", err, secrets_in(connection_string)
+        ) from None
+    with conn:
         with conn.cursor() as cur:
             cur.execute(query, (limit,))
             rows = cur.fetchall()
@@ -178,7 +185,11 @@ class PostgresConnector:
                     partition_rows = cur.fetchall()
 
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch schema from PostgreSQL: {e}")
+            # ``from None``: the driver's exception would otherwise print in any traceback,
+            # unmasked (#118). Without it the raise also chained implicitly.
+            raise connection_error(
+                "Failed to fetch schema from PostgreSQL", e, secrets_in(self.connection_string)
+            ) from None
 
         annotate_partition_metadata(schema, partition_rows)
         return schema
@@ -291,11 +302,16 @@ class PostgresSession:
     @property
     def connection(self) -> "psycopg.Connection[dict[str, Any]]":
         if self._conn is None:
-            self._conn = psycopg.connect(
-                self.connection_string,
-                row_factory=dict_row,
-                autocommit=False,
-            )
+            try:
+                self._conn = psycopg.connect(
+                    self.connection_string,
+                    row_factory=dict_row,
+                    autocommit=False,
+                )
+            except Exception as err:
+                raise connection_error(
+                    "Failed to connect to PostgreSQL", err, secrets_in(self.connection_string)
+                ) from None
             self._conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         return self._conn
 

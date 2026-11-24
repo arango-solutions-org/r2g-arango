@@ -74,12 +74,11 @@ from typing import Any, Iterator, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 from r2g.log import get_logger
-from r2g.security import scrub_dsn_credentials
+from r2g.security import connection_error, redact, secrets_in
 from r2g.types import Column, ForeignKey, Schema, Table
 
 logger = get_logger(__name__)
 
-_SENSITIVE_CONNECT_FIELDS = ("password", "private_key_file", "private_key_file_pwd")
 
 #: Accepted spellings of the ``include_views`` URL flag. Blank means absent.
 _BOOL_WORDS = {
@@ -174,9 +173,11 @@ class SnowflakeConnector:
         try:
             conn = snowflake.connect(**connect_kwargs)
         except Exception as err:
-            raise RuntimeError(
-                f"Failed to connect to Snowflake: {_safe_connection_error(err, connect_kwargs)}"
-            ) from err
+            raise connection_error(
+                "Failed to connect to Snowflake",
+                err,
+                secrets_in(connect_kwargs, self.connection_string),
+            ) from None
 
         try:
             return self._introspect(conn)
@@ -364,13 +365,12 @@ def _safe_int(v: Any) -> int:
 
 
 def _safe_connection_error(err: Exception, connect_params: dict[str, Any]) -> str:
-    """Return a useful driver error without credential or key-path disclosure."""
-    message = scrub_dsn_credentials(str(err))
-    for field in _SENSITIVE_CONNECT_FIELDS:
-        value = connect_params.get(field)
-        if value:
-            message = message.replace(str(value), "***")
-    return message
+    """The driver's error text with every credential in ``connect_params`` masked.
+
+    Kept for callers that build their own message; prefer
+    :func:`r2g.security.connection_error`, raised ``from None`` (#118).
+    """
+    return redact(str(err), secrets_in(connect_params))
 
 
 def _parse_snowflake_url(url: str) -> dict[str, Any]:
@@ -502,10 +502,11 @@ class SnowflakeSession:
             try:
                 self._conn = snowflake.connect(**self._connect_params)
             except Exception as err:
-                raise RuntimeError(
-                    "Failed to connect to Snowflake: "
-                    f"{_safe_connection_error(err, self._connect_params)}"
-                ) from err
+                raise connection_error(
+                    "Failed to connect to Snowflake",
+                    err,
+                    secrets_in(self._connect_params, self.connection_string),
+                ) from None
             try:
                 cur = self._conn.cursor()
                 try:
