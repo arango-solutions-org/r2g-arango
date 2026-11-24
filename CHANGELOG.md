@@ -9,6 +9,13 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Under a control plane, a migration is checked on everything its reloads rewrite (#124,
+  PRD P14.10).** A reload runs the load for the tables it reloads, so reloading one
+  relationship rewrote its starting table's documents and other relationships, and reloading
+  a collection dropped and rewrote the relationships starting from it, emptying an edge
+  collection that other tables also write to. The policy was asked only about what the plan
+  named. Each is now checked, as a load of those tables is, so a user who may change one class
+  can no longer empty a collection that holds another's.
 - **The Studio's `hash` and `tokenize` masks load (PRD P5c.1.4, P9.6).** "Mask this field" writes
   `MD5(TO_STRING(@col))` or `SHA512(TO_STRING(@col))`, which only ArangoDB evaluated, so mapping
   validation refused them and neither a load nor a migration could use either mask; only `redact`

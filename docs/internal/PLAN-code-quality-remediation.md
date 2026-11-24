@@ -6,7 +6,7 @@
 > Baseline: **4022 passed, 2 skipped, 18 xfailed; 87% line coverage** on the unit suite
 > (`pytest -m "not integration" --cov=r2g`), 181 integration tests deselected.
 > **Updated 2026-11-24, after 0.12.0:** units 1–7 are done; the security work's
-> follow-ups are units 21–24 (21 is done). `file:line` references elsewhere are as of `b1f2a56`.
+> follow-ups are units 21–24 (21 and 23 are done). `file:line` references elsewhere are as of `b1f2a56`.
 
 ## How to read this plan
 
@@ -235,11 +235,13 @@ Each landed with tests that fail without its fix, after six independent reviews.
     joinable) would let those loads through, but every key builder must agree: bulk,
     streaming, CDC, and the CSV-direct scripts, which build keys inside `arangoimport`.
     Design first: #126.
-23. **A migration's policy items name only what changed** (#124), while reloading an
-    edge or collection also rewrites the starting table's documents and other edges.
+23. **A migration is checked on everything its reloads rewrite** — done (#124). Its
+    policy items named only what changed, while a reload rewrote the starting table's
+    documents and other edges, and dropped edge collections other tables share.
 24. **The key check refuses more than it must** under a control plane: a dry run is
     checked, and a migration checks the whole mapping, so a sensitive-key table a load
-    left out still blocks a later migration. Fails closed; narrow it when 23 is done.
+    left out still blocks a later migration. Fails closed; with 23 done, it can be
+    narrowed to the tables the migration's reloads write.
 
 ---
 
