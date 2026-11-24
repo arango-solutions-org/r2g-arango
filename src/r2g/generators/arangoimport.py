@@ -867,6 +867,23 @@ class CsvImportGenerator:
             col.is_nullable for col in table.columns if col.name in fk_cols
         )
 
+    def _merge_expression(self, columns: list[str] | tuple[str, ...]) -> str:
+        """``--merge-attributes`` value joining ``columns`` with the mapping's separator.
+
+        The transformers build a composite ``_key`` as the PK values joined by
+        ``key_separator``; this script must build the same key, or a CSV-direct load
+        writes documents a later stream or CDC run cannot find. arangoimport reads
+        ``[col]`` as a column reference, so a separator holding a bracket cannot be
+        written here.
+        """
+        sep = self.config.key_separator
+        if "[" in sep or "]" in sep:
+            raise ValueError(
+                f"key_separator {sep!r} contains a bracket, which arangoimport's "
+                "--merge-attributes cannot express; use JSONL mode for this mapping."
+            )
+        return "[" + f"]{sep}[".join(columns) + "]"
+
     def _csv_file_path(self, table_name: str) -> str:
         return f"{self.data_dir.rstrip('/')}/{table_name}.csv"
 
@@ -920,7 +937,7 @@ class CsvImportGenerator:
                 parts.extend(["--translate", shlex.quote(f"{pk_cols[0]}=_key")])
             parts.extend(["--datatype", shlex.quote(f"{pk_cols[0]}=string")])
         elif len(pk_cols) > 1:
-            merge_expr = "[" + "]_[".join(pk_cols) + "]"
+            merge_expr = self._merge_expression(pk_cols)
             parts.extend([
                 "--merge-attributes", shlex.quote(f"_key={merge_expr}"),
             ])
@@ -976,7 +993,7 @@ class CsvImportGenerator:
             parts.extend(["--translate", shlex.quote(f"{pk_cols[0]}=_from")])
             parts.extend(["--datatype", shlex.quote(f"{pk_cols[0]}=string")])
         elif len(pk_cols) > 1:
-            merge_expr = "[" + "]_[".join(pk_cols) + "]"
+            merge_expr = self._merge_expression(pk_cols)
             parts.extend([
                 "--merge-attributes", shlex.quote(f"_from={merge_expr}"),
             ])
@@ -988,7 +1005,7 @@ class CsvImportGenerator:
             parts.extend(["--translate", shlex.quote(f"{from_fields[0]}=_to")])
             parts.extend(["--datatype", shlex.quote(f"{from_fields[0]}=string")])
         else:
-            merge_expr = "[" + "]_[".join(from_fields) + "]"
+            merge_expr = self._merge_expression(from_fields)
             parts.extend([
                 "--merge-attributes", shlex.quote(f"_to={merge_expr}"),
             ])

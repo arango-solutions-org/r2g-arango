@@ -145,7 +145,7 @@ r2g export-r2rml --config mapping.yaml --schema schema.json --output analytics.r
 - **Environment variable support** -- connection parameters (`PG_CONN`, `ARANGO_ENDPOINT`, `ARANGO_DB`, `ARANGO_USER`, `ARANGO_PASSWORD`) can be set via environment variables or a `.env` file; CLI flags override env vars when both are provided
 - **Skip existing** -- `stream --skip-existing` skips collections that already contain data, enabling resumption of partial streaming runs without re-importing completed collections
 - **Incremental streaming** -- `stream --since 2026-04-01T00:00:00` filters rows by a timestamp column (auto-detects `updated_at`/`created_at` or use `--since-column`); combine with `--on-duplicate=replace` for basic incremental updates
-- **PK-less table safety** -- tables without a primary key are warned during validation and streaming; documents receive auto-generated keys and edges referencing such tables are flagged
+- **PK-less table keys** -- a table without a primary key is warned during validation and streaming, and each row is keyed by every column in schema order (NULL written as `%null`, keys over 200 characters hashed), so its edges load; identical rows collapse to one document, and so do distinct rows whose values join to the same key (`('x_y', 'z')` and `('x', 'y_z')` with the default `_` separator), as composite primary keys already do. The CSV-direct path (`generate-csv-import`) still gives such a table no edges
 - **CDC (Change Data Capture)** -- near real-time PostgreSQL→ArangoDB sync via logical replication. `PGReplicationListener` manages replication slots, polls `pg_logical_slot_get_changes`, parses output via `test_decoding` (built-in) or `wal2json` plugins. `DeltaTransformer` converts row-level changes to graph mutations (document upserts/deletes + edge recalculation). `CDCHandler` orchestrates event processing with transaction grouping and stats tracking. Configurable conflict resolution policies: `source_wins` (default), `last_write_wins`, `log_and_skip`, `fail`. CLI commands: `cdc-setup`, `cdc-teardown`, `cdc-status`, `cdc-start`
 - **Composite foreign key support** -- multi-column foreign keys are correctly introspected from `pg_catalog`, represented in mappings, and transformed into composite `_key` / `_from` / `_to` values using a configurable separator
 - **Multi-schema support** -- `--pg-schema` option on `ingest-schema`, `dump-tables`, and `stream` commands allows introspection and import from any PostgreSQL schema, not just `public`
@@ -664,7 +664,7 @@ r2g cdc-start --pg-conn "..." schema.json mapping.yaml \
 
 A conflict summary table is printed at the end of each CDC session showing counts by conflict type.
 
-For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values:
+For UPDATE/DELETE events, set `REPLICA IDENTITY FULL` on source tables to capture old row values. A table without a primary key needs it for deletes: its documents are keyed by every column, so a DELETE without the full old row deletes nothing. For the same reason an UPDATE to a row of such a table changes its key: change capture writes a new document and the old one stays (known limitation):
 
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;
@@ -734,7 +734,8 @@ run naming the stream, as with `--no-recover-streams`:
 - with `--temporal`, where an insert never replaces an existing version;
 - under a conflict policy other than `source_wins`: `log_and_skip` would skip every changed row, and
   `fail` would stop at the first row the copy already holds;
-- for an object with no primary key in the schema, whose documents cannot be matched to its rows.
+- for an object with no primary key in the schema, whose identical rows collapse to one document, so
+  the sweep could not tell them apart.
 
 One case a resync does not correct. The stream is recreated and the object is read a moment later. A
 row that changes between the two and changes back before the next cycle, or is inserted and then
@@ -789,7 +790,7 @@ r2g is a reference application (see the Status note near the top): well-tested, 
 - **Incremental + change capture** -- `stream --since` filters rows by a timestamp column for basic incremental loads; full change capture is available via the CDC (`cdc-start`) and Kafka (`kafka-start`) pipelines with configurable conflict resolution, and `mapping-diff` / `selective-reload` reconcile mapping changes against an already-loaded target.
 - **Self-referential FKs** -- these work but produce edges within the same collection (e.g., `orders.referrer_id -> customers.id` creates `orders_to_customers_referrer_id`). This is correct but may be unexpected.
 - **ArangoDB write path** -- the `stream` command connects directly to ArangoDB via python-arango, but the file-based paths (`generate-csv-import`, `generate-import`) still require `arangoimport` installed separately.
-- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `~/.r2g/secret.key` (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
+- **Credential handling** -- catalog secrets (source connection strings, target passwords) are encrypted at rest with Fernet using a key from `R2G_SECRET_KEY` or `secret.key` in the catalog directory, `~/.r2g` unless `R2G_CATALOG_DIR` says otherwise (managed via `r2g secrets init|status|migrate`); API responses redact them. Generated import scripts still reference connection defaults via environment variables, and there is no integrated remote secrets manager (e.g. Vault).
 
 ## Testing
 
@@ -850,8 +851,9 @@ environment variables (see [.env.example](.env.example)):
 |---|---|
 | `R2G_API_TOKEN` | Require `Authorization: Bearer <token>` on the UI API and the MCP SSE transport. A token is auto-generated and printed when binding to a non-loopback address. |
 | `R2G_CORS_ORIGINS` | Comma-separated allow-list of CORS origins for the UI (default: same-origin only). |
+| `R2G_CATALOG_DIR` | Directory holding the catalog (`catalog.json`), its `secret.key` and the dead-letter queue (default: `~/.r2g`). |
 | `R2G_CSV_BASE_DIR` | Confine CSV sources to a trusted directory tree; paths outside it (including via symlinks/`..`) are rejected. |
-| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `~/.r2g/secret.key`). |
+| `R2G_SECRET_KEY` | Fernet key for encrypting catalog credentials at rest (else `secret.key` in the catalog directory). |
 
 The MCP `stdio` transport (Cursor / Claude Desktop) is local-only and needs no
 token; only the network-exposed SSE transport is gated.
