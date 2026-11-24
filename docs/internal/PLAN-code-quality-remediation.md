@@ -234,7 +234,7 @@ Each landed with tests that fail without its fix, after six independent reviews.
     remedy is a key overlay. Hashing such keys (a keyed hash, so the graph stays
     joinable) would let those loads through, but every key builder must agree: bulk,
     streaming, CDC, and the CSV-direct scripts, which build keys inside `arangoimport`.
-    Design first.
+    Design first: #126.
 23. **A migration's policy items name only what changed** (#124), while reloading an
     edge or collection also rewrites the starting table's documents and other edges.
 24. **The key check refuses more than it must** under a control plane: a dry run is
