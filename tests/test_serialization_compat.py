@@ -266,6 +266,24 @@ class TestSchemaByteStability:
         assert loaded.tables["events_2026"].partition_of == "events"
 
 
+class TestViewStatusSerialization:
+    def test_a_view_is_written_last_and_reloads(self):
+        dumped = Table(name="t", columns=[], is_view=True).model_dump()
+        assert list(dumped)[-1] == "is_view"
+        assert Table.model_validate(dumped).is_view is True
+
+    def test_a_known_table_stays_false_in_memory_and_keeps_its_bytes(self):
+        known = Table(name="t", columns=[], is_view=False)
+        assert known.is_view is False
+        assert known.model_dump_json() == Table(name="t", columns=[]).model_dump_json()
+        assert Table.model_validate_json(known.model_dump_json()).is_view is None
+
+    def test_unknown_status_is_not_written(self):
+        table = Table(name="t", columns=[])
+        assert table.is_view is None
+        assert "is_view" not in table.model_dump()
+
+
 class TestMappingConfigByteStability:
     def test_current_code_reproduces_golden(self):
         text = _dump(build_reference_mapping())

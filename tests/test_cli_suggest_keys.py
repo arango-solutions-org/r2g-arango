@@ -171,3 +171,93 @@ def test_a_sampler_that_cannot_connect_fails_loudly_and_writes_nothing(warehouse
     assert result.exit_code == 1, result.output
     assert "could not connect" in result.output
     assert not (warehouse / "wh.keys.draft.json").exists()
+
+
+def _mark_views(monkeypatch, *names: str) -> None:
+    """fakesnow lists no views, so mark them where r2g's connector returns them."""
+    from r2g.connectors.snowflake import SnowflakeConnector
+
+    real = SnowflakeConnector.get_schema
+
+    def get_schema(self):
+        schema = real(self)
+        for table in schema.tables.values():
+            table.is_view = table.name in names
+        return schema
+
+    monkeypatch.setattr(SnowflakeConnector, "get_schema", get_schema)
+
+
+def test_a_view_is_not_evaluated_and_a_base_table_keeps_its_key(warehouse, monkeypatch):
+    _mark_views(monkeypatch, "ORDERS")
+    result = runner.invoke(app, ["source", "suggest-keys", "wh"])
+    assert result.exit_code == 0, result.output
+
+    draft = json.loads((warehouse / "wh.keys.draft.json").read_text())
+    assert draft["tables"]["CUSTOMERS"]["primaryKey"] == ["CUSTOMER_ID"]
+    assert "primaryKey" not in draft["tables"].get("ORDERS", {})
+    assert "view: uniqueness of a view is not a key" in " ".join(result.output.split())
+
+
+def test_a_view_only_schema_writes_an_empty_draft_and_says_why(warehouse, monkeypatch):
+    _mark_views(monkeypatch, "CUSTOMERS", "ORDERS")
+    result = runner.invoke(app, ["source", "suggest-keys", "wh"])
+    assert result.exit_code == 0, result.output
+
+    draft = json.loads((warehouse / "wh.keys.draft.json").read_text())
+    assert not any("primaryKey" in spec for spec in draft["tables"].values())
+    output = " ".join(result.output.split())
+    assert "CUSTOMERS: view: uniqueness of a view is not a key" in output
+    assert "ORDERS: view: uniqueness of a view is not a key" in output
+
+
+def test_a_table_referring_to_a_view_gets_no_inferred_relationship(warehouse, monkeypatch):
+    # Without the view the reference is inferred (see the first test in this file).
+    # A view gets no proposed key, so the reference has nothing to point at.
+    _mark_views(monkeypatch, "CUSTOMERS")
+    result = runner.invoke(app, ["source", "suggest-keys", "wh"])
+    assert result.exit_code == 0, result.output
+
+    draft = json.loads((warehouse / "wh.keys.draft.json").read_text())
+    assert "primaryKey" not in draft["tables"].get("CUSTOMERS", {})
+    assert draft["tables"]["ORDERS"]["primaryKey"] == ["ORDER_ID"]
+    assert "foreignKeys" not in draft["tables"]["ORDERS"]
+    output = " ".join(result.output.split())
+    assert "CUSTOMERS: view: uniqueness of a view is not a key" in output
+    assert "ORDERS.CUSTOMER_ID -> CUSTOMERS" not in output
+
+
+def test_a_reviewed_overlay_restores_the_views_key_and_the_relationship(warehouse, monkeypatch):
+    _mark_views(monkeypatch, "CUSTOMERS")
+    overlay = {
+        "version": 1,
+        "description": "Reviewed keys for a view and the table that refers to it",
+        "tables": {
+            "CUSTOMERS": {"primaryKey": ["CUSTOMER_ID"]},
+            "ORDERS": {
+                "primaryKey": ["ORDER_ID"],
+                "foreignKeys": [
+                    {
+                        "columns": ["CUSTOMER_ID"],
+                        "references": {"table": "CUSTOMERS", "columns": ["CUSTOMER_ID"]},
+                    }
+                ],
+            },
+        },
+    }
+    (warehouse / "reviewed.json").write_text(json.dumps(overlay))
+    result = runner.invoke(app, ["source", "set-key-overlay", "wh", "reviewed.json"])
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(app, ["source", "snapshot", "wh"])
+    assert result.exit_code == 0, result.output
+
+    tables = CatalogManager(str(warehouse / "catalog")).get_latest_snapshot("wh").schema_data.tables
+    assert tables["CUSTOMERS"].is_view is True
+    assert tables["CUSTOMERS"].primary_key == ["CUSTOMER_ID"]
+    (fk,) = tables["ORDERS"].foreign_keys
+    assert (fk.columns, fk.foreign_table, fk.foreign_columns) == (
+        ["CUSTOMER_ID"],
+        "CUSTOMERS",
+        ["CUSTOMER_ID"],
+    )
+    assert fk.enforced is False

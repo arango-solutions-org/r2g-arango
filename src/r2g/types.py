@@ -92,14 +92,17 @@ class Table(_RsaTable):
     """Physical table: the shared RSA table narrowed to r2g's :class:`Column`.
 
     Serializes to r2g's historical key set (dropping RSA's ``comment`` /
-    ``is_view`` / constraint / index enrichment and the ``extra`` passthrough)
-    for byte-stable snapshots. ``schema_name`` is kept only outside
-    :data:`DEFAULT_SQL_SCHEMA` (see :meth:`qualified_name`).
+    constraint / index enrichment and the ``extra`` passthrough) for byte-stable
+    snapshots. ``schema_name`` is kept only outside :data:`DEFAULT_SQL_SCHEMA`
+    (see :meth:`qualified_name`), and ``is_view`` only when true.
     """
 
     # Narrowing the inherited RSA field to r2g's Column subclass (safe: every
     # r2g Column is an RSA Column; the invariance warning does not apply at runtime).
     columns: List[Column]  # type: ignore[assignment]
+    # True for a view, False for a confirmed base table, None when nothing recorded
+    # which. RSA's bool cannot say "unknown"; its readers only test truthiness.
+    is_view: Optional[bool] = None  # type: ignore[assignment]
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
@@ -125,6 +128,10 @@ class Table(_RsaTable):
         # snapshot persisted before this -- stays byte-identical.
         if full.get("schema_name") not in (None, DEFAULT_SQL_SCHEMA):
             out["schema_name"] = full["schema_name"]
+        # Written last and only when true, so every snapshot without a view,
+        # including every one persisted before this, stays byte-identical.
+        if full.get("is_view"):
+            out["is_view"] = True
         return out
 
     def qualified_name(self) -> str:

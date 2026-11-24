@@ -155,6 +155,10 @@ def build_source_schema(
     # and persistence. ForeignKey provenance (overlay:* / enforced=False)
     # survives; RSA Table.extra is summarized above because r2g omits it.
     schema = Schema.model_validate(physical.model_dump())
+    # The dump drops a known False and RSA's invents one: carry only what was recorded.
+    for table_name, table in physical.tables.items():
+        recorded = "is_view" in table.model_fields_set
+        schema.tables[table_name].is_view = table.is_view if recorded else None
     classified = 0
     if source.classifications:
         from r2g.classification import annotate_schema

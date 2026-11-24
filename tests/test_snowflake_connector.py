@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 import pytest
 
 from r2g.connectors.snowflake import SnowflakeConnector, _parse_snowflake_url
+from r2g.types import Schema
 
 # ── URL parsing ──────────────────────────────────────────────────────────
 
@@ -534,6 +535,29 @@ class TestIncludeViews:
         assert key_queries, "base tables are still asked for their keys"
         assert not any('"ACCOUNT_VW"' in sql for sql in key_queries)
         assert schema.tables["USERS"].primary_key == ["ID"]
+
+    def test_each_object_records_what_it_is(self, monkeypatch):
+        scripted = self._scripted()
+        scripted["INFORMATION_SCHEMA.TABLES"] = (
+            ["TABLE_NAME", "TABLE_TYPE"],
+            [("ACCOUNT_MV", "MATERIALIZED VIEW"), ("ACCOUNT_VW", "VIEW"), ("USERS", "BASE TABLE")],
+        )
+        monkeypatch.setattr(self, "_scripted", lambda: scripted)
+        schema, _, _ = self._run(
+            monkeypatch, "snowflake://svc:xxx@xy12345/ANALYTICS/CORE?include_views=true"
+        )
+        assert {n: t.is_view for n, t in schema.tables.items()} == {
+            "ACCOUNT_MV": True,
+            "ACCOUNT_VW": True,
+            "USERS": False,
+        }
+        # Only a view is persisted; a reloaded table is unknown, not assumed a table.
+        reloaded = Schema.model_validate_json(schema.model_dump_json())
+        assert {n: t.is_view for n, t in reloaded.tables.items()} == {
+            "ACCOUNT_MV": True,
+            "ACCOUNT_VW": True,
+            "USERS": None,
+        }
 
     def test_the_flag_must_be_a_boolean_word(self):
         with pytest.raises(ValueError, match="include_views must be true or false"):
