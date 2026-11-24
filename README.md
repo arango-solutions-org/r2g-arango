@@ -586,6 +586,9 @@ The load API also accepts `emit_governance` / `tier_layout` to drop the artifact
 
 | Command | Description |
 |---|---|
+| `target add` | Register an ArangoDB target (`--name`, `--endpoint`, `--database`, `--username`, `--password`; honours `ARANGO_*`); under a control plane, projects are created only on registered targets, and `--project NAME` registers it for that one project |
+| `target list` | List registered targets (passwords never shown) |
+| `target remove` | Remove a registered target |
 | `secrets init` | Initialize (or replace) the on-disk catalog secret key; respects `R2G_SECRET_KEY` |
 | `secrets migrate` | Force-encrypt every secret in the catalog with the active key |
 | `secrets status` | Show where the active secret key is coming from |
@@ -849,6 +852,7 @@ environment variables (see [.env.example](.env.example)):
 
 | Variable | Effect |
 |---|---|
+| `R2G_ALLOWED_HOSTS` | Extra host names (comma-separated) an open Studio — loopback bind, no token — answers to, beyond `localhost`, `127.0.0.1` and `[::1]`. Requests addressed to any other name are refused, which stops a web page reaching the Studio by DNS rebinding. |
 | `R2G_API_TOKEN` | Require `Authorization: Bearer <token>` on the UI API and the MCP SSE transport. A token is auto-generated and printed when binding to a non-loopback address. |
 | `R2G_CORS_ORIGINS` | Comma-separated allow-list of CORS origins for the UI (default: same-origin only). |
 | `R2G_CATALOG_DIR` | Directory holding the catalog (`catalog.json`), its `secret.key` and the dead-letter queue (default: `~/.r2g`). |

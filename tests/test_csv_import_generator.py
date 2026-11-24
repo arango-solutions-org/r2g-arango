@@ -932,6 +932,18 @@ def test_composite_edge_endpoints_use_the_mapping_separator(
     assert f"_to=[customer_id]{sep}[referrer_id]" in cmd
 
 
+@pytest.mark.parametrize("table", ["../x", "a/b", "..", "a\\b"])
+def test_a_table_name_that_leaves_the_data_dir_is_refused(ecommerce_config, ecommerce_schema,
+                                                          table):
+    """The script reads <data_dir>/<table>.csv; a source table named ``../x`` would make
+    it load a file from outside the directory, so the names the dumps refuse are
+    refused here too."""
+    gen = CsvImportGenerator(ecommerce_config, ecommerce_schema, data_dir="./dumps")
+    with pytest.raises(ValueError, match="cannot be used as a file name"):
+        gen._csv_file_path(table)
+    assert gen._csv_file_path("orders") == "./dumps/orders.csv"
+
+
 def test_a_separator_with_a_bracket_is_refused(ecommerce_config, ecommerce_schema):
     config = ecommerce_config.model_copy(update={"key_separator": "]["})
     gen = CsvImportGenerator(config, ecommerce_schema, data_dir="./dumps")

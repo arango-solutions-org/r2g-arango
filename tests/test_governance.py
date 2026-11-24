@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from r2g.governance import (
     apply_sensitivity_gate,
     build_entitlement_report,
     classification_manifest,
+    key_exposures,
     lineage_manifest,
     policy_rego,
     suggested_rbac,
@@ -346,3 +349,164 @@ class TestCdcGovernanceGate:
             assert e.exit_code == 1
         else:
             raise AssertionError("expected typer.Exit")
+
+
+class TestTheGateCoversFieldExpressions:
+    """An expression reads its columns from the row whether they are excluded or not,
+    and declares them only if its author chose to. The gate rates a field by every
+    column its expression references, drops a field it rates sensitive along with its
+    columns, and takes a field as masked only when its expression is a mask."""
+
+    ROW = {"id": "1", "email": "a@b.c", "first_name": "Ann", "loyalty_tier": "gold"}
+
+    def _loaded(self, fx):
+        from r2g.transformers.node_transformer import NodeTransformer
+
+        cfg = MappingConfig(collections={"customer": CollectionMapping(
+            source_table="customer", target_collection="Customer", field_expressions=[fx])})
+        gated, _ = apply_sensitivity_gate(cfg, build_entitlement_report(cfg, _schema()))
+        return NodeTransformer(_schema().tables["customer"],
+                               gated.collections["customer"]).transform_row(self.ROW)
+
+    @pytest.mark.parametrize("fx", [
+        FieldExpression(target="contact", sources=["email"], expression="@email"),
+        FieldExpression(target="contact", sources=["first_name"], expression="@email"),
+        FieldExpression(target="contact", sources=["first_name", "email"],
+                        expression="CONCAT(@first_name, @email)"),
+        FieldExpression(target="email", sources=["email"], expression="",
+                        description="r2g:mask:hash"),
+    ])
+    def test_a_field_reading_a_sensitive_column_is_not_loaded(self, fx):
+        assert "a@b.c" not in str(self._loaded(fx))
+
+    def test_a_second_expression_on_a_masked_field_unmasks_it(self):
+        """The transformer writes the last expression for a property, so a mask is only
+        a mask if every expression for that property is one."""
+        from r2g.transformers.node_transformer import NodeTransformer
+
+        cfg = MappingConfig(collections={"customer": CollectionMapping(
+            source_table="customer", target_collection="Customer", field_expressions=[
+                make_mask_expression("email", "redact"),
+                FieldExpression(target="email", sources=["email"], expression="@email")])})
+        gated, _ = apply_sensitivity_gate(cfg, build_entitlement_report(cfg, _schema()))
+        doc = NodeTransformer(_schema().tables["customer"],
+                              gated.collections["customer"]).transform_row(self.ROW)
+        assert "a@b.c" not in str(doc)
+
+    def test_a_mask_is_loaded_and_other_expressions_untouched(self):
+        assert self._loaded(make_mask_expression("email", "redact"))["email"] == "***"
+        upper = FieldExpression(target="shout", sources=["first_name"],
+                                expression="UPPER(@first_name)")
+        assert self._loaded(upper)["shout"] == "ANN"
+
+    @pytest.mark.parametrize("fx", [
+        FieldExpression(target="email", sources=["email"], expression="",
+                        description="r2g:mask:hash"),
+        FieldExpression(target="email", sources=["email"], expression="@email",
+                        description="r2g:mask:redact"),
+        FieldExpression(target="email", sources=["email"], expression="MD5(TO_STRING(@email))",
+                        description="r2g:mask:hash", engine="python"),
+    ])
+    def test_a_mask_marker_alone_does_not_make_a_field_masked(self, fx):
+        assert not is_masking_expression(fx)
+
+
+class TestSensitiveKeys:
+    """The gate removes properties, not keys: a sensitive primary key, any column of a
+    table without one, or a sensitive foreign key an edge follows would be written into
+    ``_key``/``_to``. The report names each such column."""
+
+    def _schema(self, *, pk="ssn"):
+        from r2g.types import ForeignKey
+
+        person = Table(name="person", columns=[_col("ssn", _pii()), _col("pid"), _col("name")],
+                       primary_key=[pk] if pk else [])
+        claim = Table(name="claim", columns=[_col("id", pk=True), _col("person_ssn", _pii())],
+                      primary_key=["id"], foreign_keys=[ForeignKey(
+                          column="person_ssn", foreign_table="person", foreign_column="ssn")])
+        link = Table(name="link", columns=[_col("a"), _col("b_ssn", _pii())], primary_key=[],
+                     foreign_keys=[ForeignKey(column="a", foreign_table="person",
+                                              foreign_column="pid"),
+                                   ForeignKey(column="b_ssn", foreign_table="person",
+                                              foreign_column="ssn")])
+        return Schema(tables={"person": person, "claim": claim, "link": link})
+
+    def _config(self, *, edge=True, join=True):
+        cols = {"person": CollectionMapping(source_table="person", target_collection="Person"),
+                "claim": CollectionMapping(source_table="claim", target_collection="Claim")}
+        if join:
+            cols["link"] = CollectionMapping(source_table="link", target_collection="linked",
+                                             collection_type="edge", is_join_table=True)
+        edges = [EdgeDefinition(edge_collection="filed_by", from_collection="claim",
+                                to_collection="person", from_fields=["person_ssn"],
+                                to_fields=["ssn"])] if edge else []
+        return MappingConfig(collections=cols, edges=edges)
+
+    def test_each_kind_of_key_is_named(self):
+        """A join table mapped as an edge collection writes nothing itself, so its
+        foreign keys are not named; the edges in ``config.edges`` are what is written."""
+        found = {(e.collection, e.column) for e in key_exposures(self._config(), self._schema())}
+        assert found == {("Person", "ssn"), ("filed_by", "person_ssn")}
+
+    def test_an_empty_include_list_means_every_table(self):
+        """As the pipeline reads it: an empty list is no filter, not "load nothing"."""
+        assert key_exposures(self._config(), self._schema(), include=[]) == \
+            key_exposures(self._config(), self._schema())
+
+    def test_an_edge_carries_its_starting_tables_key_mapped_or_not(self):
+        """``_from`` and the edge's ``_key`` hold the starting row's key, whether or not
+        that table is mapped as documents, or mapped as an edge collection."""
+        from r2g.types import ForeignKey
+
+        schema = Schema(tables={
+            "person": Table(name="person", columns=[_col("pid", pk=True)],
+                            primary_key=["pid"]),
+            "claim": Table(name="claim", columns=[_col("ssn", _pii()), _col("person_pid")],
+                           primary_key=["ssn"], foreign_keys=[ForeignKey(
+                               column="person_pid", foreign_table="person",
+                               foreign_column="pid")]),
+        })
+        edge = EdgeDefinition(edge_collection="filed_by", from_collection="claim",
+                              to_collection="person", from_fields=["person_pid"],
+                              to_fields=["pid"])
+        for extra in ({}, {"claim": CollectionMapping(source_table="claim",
+                                                      target_collection="claims",
+                                                      collection_type="edge")}):
+            cfg = MappingConfig(collections={"person": CollectionMapping(
+                source_table="person", target_collection="Person"), **extra}, edges=[edge])
+            assert {(e.collection, e.column) for e in key_exposures(cfg, schema)} == {
+                ("filed_by", "ssn")}
+
+    def test_a_foreign_key_is_rated_by_the_column_it_points_at(self):
+        """``_to`` carries the referenced row's key: an unclassified column holding a
+        sensitive key is as sensitive as that key."""
+        from r2g.types import ForeignKey
+
+        schema = Schema(tables={
+            "person": Table(name="person", columns=[_col("ssn", _pii()), _col("pid")],
+                            primary_key=["pid"]),
+            "visit": Table(name="visit", columns=[_col("vid", pk=True), _col("person_ref")],
+                           primary_key=["vid"], foreign_keys=[ForeignKey(
+                               column="person_ref", foreign_table="person",
+                               foreign_column="ssn")]),
+        })
+        cfg = MappingConfig(collections={
+            "visit": CollectionMapping(source_table="visit", target_collection="Visit")},
+            edges=[EdgeDefinition(edge_collection="of", from_collection="visit",
+                                  to_collection="person", from_fields=["person_ref"],
+                                  to_fields=["ssn"])])
+        assert {(e.collection, e.column) for e in key_exposures(cfg, schema)} == {
+            ("of", "person_ref")}
+
+    def test_a_table_without_a_primary_key_is_keyed_by_every_column(self):
+        found = key_exposures(self._config(edge=False, join=False), self._schema(pk=None))
+        assert {(e.collection, e.column) for e in found} == {("Person", "ssn")}
+
+    def test_a_key_that_is_not_sensitive_and_tables_left_out_are_clean(self):
+        assert key_exposures(self._config(edge=False, join=False), self._schema(pk="pid")) == []
+        assert key_exposures(self._config(), self._schema(), exclude=["person", "claim",
+                                                                       "link"]) == []
+
+    def test_the_report_carries_them(self):
+        report = build_entitlement_report(self._config(), self._schema())
+        assert {e.column for e in report.key_exposures} == {"ssn", "person_ssn"}

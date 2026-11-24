@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -487,9 +488,11 @@ class TestCreatingIsScopedToo:
                           json={"name": "not-named-here", "source_name": "src"})
         assert r.status_code == 404
         assert CatalogManager(tmp_path).get_project("not-named-here") is None
-        # Positive control: the one it opens can be created.
+        # Positive control: the one it opens can be created, on a registered target.
+        CatalogManager(tmp_path).add_target("equity-db", database="equity")
         r = governed.post("/api/projects", headers=bearer(),
-                          json={"name": "not-created-yet", "source_name": "src"})
+                          json={"name": "not-created-yet", "source_name": "src",
+                                "target_name": "equity-db"})
         assert r.status_code == 201
 
     def test_a_demo_preset_is_refused_even_for_the_project_opened(self, governed):
@@ -643,16 +646,52 @@ def test_shared_key_inference_names_no_other_projects_source(tenant, tmp_path, m
     assert r.json()["skipped"] == []
 
 
-def test_before_its_project_exists_the_tenants_sources_are_offered(before_its_project):
+def test_before_its_project_exists_the_tenants_sources_are_offered(before_its_project, tmp_path):
     client = before_its_project
     assert _names(client, "/api/sources") == ["crm", "hr"]
     assert client.get("/api/sources/hr/schema", headers=bearer()).status_code == 200
-    # Creating it narrows what it sees to its own from then on.
+    # Creating it narrows what it sees to its own from then on. It is created on a target
+    # an administrator registered and no other project holds (P14.18).
+    CatalogManager(tmp_path).add_target("new-graph", database="new_one")
     r = client.post("/api/projects", headers=bearer(),
-                    json={"name": "new-one", "source_name": "crm"})
+                    json={"name": "new-one", "source_name": "crm", "target_name": "new-graph"})
     assert r.status_code == 201, r.text
     assert _names(client, "/api/sources") == ["crm"]
+    assert _names(client, "/api/targets") == ["new-graph"]
     assert client.get("/api/sources/hr/schema", headers=bearer()).status_code == 404
+
+
+def test_before_its_project_exists_only_targets_it_could_be_bound_to_are_offered(
+        before_its_project, tmp_path):
+    """Every target here is another project's, bound or registered for it (P14.18), so
+    none is listed, nor read with its stored credentials, before the project exists."""
+    client = before_its_project
+    CatalogManager(tmp_path).add_target("hr-only", database="hr2", project="someone-elses")
+    CatalogManager(tmp_path).add_target("free-graph", database="free")
+    assert _names(client, "/api/targets") == ["free-graph"]
+    for target in ("hr-graph", "hr-only"):
+        r = client.post(f"/api/targets/{target}/introspect", headers=bearer())
+        assert r.status_code == 404, r.text
+
+
+class OpensNone(FakeControlPlane):
+    def project(self, identity: control_plane.Identity) -> control_plane.Project:
+        return control_plane.Project("equity", "Equity research", None)
+
+
+def test_a_context_that_opens_no_project_sees_none_of_the_tenants(tmp_path, monkeypatch):
+    """A control-plane project that names no transformation project has none of its
+    own, so it sees none of the tenant's: nothing listed, nothing read with another
+    project's stored credentials."""
+    client = _tenant(tmp_path, monkeypatch, OpensNone())
+    try:
+        for kind in ("sources", "targets", "catalogs"):
+            assert _names(client, f"/api/{kind}") == []
+        assert client.get("/api/sources/hr/schema", headers=bearer()).status_code == 404
+        r = client.post("/api/targets/hr-graph/introspect", headers=bearer())
+        assert r.status_code == 404, r.text
+    finally:
+        control_plane.set_instance(None)
 
 
 def test_without_a_control_plane_every_project_sees_the_tenants(tmp_path, monkeypatch):
@@ -663,3 +702,370 @@ def test_without_a_control_plane_every_project_sees_the_tenants(tmp_path, monkey
     assert _names(client, "/api/sources") == ["crm", "hr"]
     assert _names(client, "/api/targets") == ["crm-graph", "hr-graph"]
     assert client.get("/api/sources/hr/schema").status_code == 200
+
+
+class TestATargetIsBoundAtCreation:
+    """Under a control plane a project's load target is set when the project is created,
+    from the targets an administrator registered, and no request changes it. Before this,
+    a user scoped to one project could point its loads at another project's target (with
+    that target's credentials), or at a host of their choosing (with the server's own
+    ``ARANGO_*`` credentials), and could turn the sensitive-field gate off."""
+
+    @pytest.fixture
+    def loads(self, tmp_path, monkeypatch):
+        """What a load would write to, captured instead of connecting."""
+        from r2g.types import Column, Schema, Table
+        from r2g.ui import server
+
+        monkeypatch.setenv("ARANGO_USER", "server-user")
+        monkeypatch.setenv("ARANGO_PASSWORD", "server-env-secret")
+        catalog = CatalogManager(tmp_path)
+        (tmp_path / "t.csv").write_text("id,name\n1,a\n")
+        catalog.create_snapshot("src", Schema(tables={"t": Table(name="t", columns=[
+            Column(name="id", data_type="integer", is_nullable=False, is_primary_key=True),
+            Column(name="name", data_type="text", is_nullable=True)], primary_key=["id"])}))
+        catalog.add_target("tgt-a", endpoint="http://arango-a:8529", database="graph_a",
+                           username="a", password="pw-a")
+        catalog.add_target("tgt-b", endpoint="http://arango-b:8529", database="graph_b",
+                           username="b", password="pw-b")
+        for name, tgt in (("customer-360", "tgt-a"), ("someone-elses", "tgt-b")):
+            (tmp_path / f"{name}.yaml").write_text(
+                "collections:\n  t:\n    source_table: t\n    target_collection: t\nedges: []\n")
+            catalog.update_project(name, target_name=tgt)
+        seen: dict[str, Any] = {}
+
+        class Writer:
+            def __init__(self, **kw):
+                seen["writer"] = kw
+
+        class Pipeline:
+            def __init__(self, **kw):
+                self.errors: dict = {}
+
+            def run(self, **kw):
+                return {"documents": [], "edges": []}
+
+        monkeypatch.setattr(server, "ArangoWriter", Writer)
+        monkeypatch.setattr(server, "StreamingPipeline", Pipeline)
+        monkeypatch.setattr(server, "_graph_state", lambda *a: seen.setdefault("read", a) and None)
+        return seen
+
+    def test_a_request_cannot_relink_the_project_to_another_target(self, governed, loads,
+                                                                     tmp_path):
+        r = governed.patch("/api/projects/customer-360", headers=bearer(),
+                           json={"target_name": "tgt-b"})
+        assert r.status_code == 403, r.text
+        assert "set when the project is created" in r.json()["detail"]
+        assert CatalogManager(tmp_path).get_project("customer-360").target_name == "tgt-a"
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
+        assert r.status_code == 202, r.text
+        assert loads["writer"]["endpoint"] == "http://arango-a:8529"
+        assert loads["writer"]["password"] == "pw-a"
+        # Positive control: other details still change.
+        r = governed.patch("/api/projects/customer-360", headers=bearer(),
+                           json={"mapping_name": "renamed"})
+        assert r.status_code == 200, r.text
+
+    def test_a_project_bound_to_no_registered_target_does_not_load(self, governed, loads,
+                                                                   tmp_path):
+        """No fallback to the server's credentials: they are never sent where a request
+        pointed them."""
+        CatalogManager(tmp_path).update_project(
+            "customer-360", target_name="", arango_endpoint="http://attacker.example:8529",
+            arango_database="loot")
+        for dry_run in (True, False):
+            r = governed.post("/api/projects/customer-360/load", headers=bearer(),
+                              json={"dry_run": dry_run})
+            assert r.status_code == 403, r.text
+            assert "registered target" in r.json()["detail"]
+        assert "writer" not in loads and "read" not in loads
+        assert CatalogManager(tmp_path).get_history("customer-360") == []
+
+    def test_creating_binds_only_a_registered_target_no_other_project_holds(
+        self, governed, loads, tmp_path,
+    ):
+        catalog = CatalogManager(tmp_path)
+        catalog.delete_project("customer-360")
+        create = {"name": "customer-360", "source_name": "src"}
+        refusals = [
+            dict(create, arango_endpoint="http://attacker.example:8529", arango_database="loot"),
+            dict(create, target_name="tgt-b"),  # someone-elses's, by name
+            dict(create, arango_endpoint="http://arango-b:8529", arango_database="graph_b"),
+        ]
+        for body in refusals:
+            r = governed.post("/api/projects", headers=bearer(), json=body)
+            assert r.status_code == 403, (body, r.text)
+            assert CatalogManager(tmp_path).get_project("customer-360") is None
+        r = governed.post("/api/projects", headers=bearer(), json=dict(create, target_name="nope"))
+        assert r.status_code == 400
+        # Positive control: a registered target no other project holds, by its address.
+        r = governed.post("/api/projects", headers=bearer(),
+                          json=dict(create, arango_endpoint="http://arango-a:8529/",
+                                    arango_database="graph_a"))
+        assert r.status_code == 201, r.text
+        assert r.json()["target_name"] == "tgt-a"
+
+    @pytest.mark.parametrize("body", [{"allow_sensitive": True},
+                                      {"sensitivity_threshold": "restricted"}])
+    def test_a_load_may_not_loosen_the_sensitive_field_gate(self, governed, loads, body):
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json=body)
+        assert r.status_code == 403, r.text
+        assert "stricter but not looser" in r.json()["detail"]
+        assert "writer" not in loads
+
+    def test_a_load_may_make_the_gate_stricter(self, governed, loads):
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(),
+                          json={"sensitivity_threshold": "internal"})
+        assert r.status_code == 202, r.text
+
+    def test_a_target_registered_for_another_project_is_neither_bound_nor_loaded(
+        self, governed, loads, tmp_path,
+    ):
+        """``r2g target add --project``: the first project created does not get to take
+        a target an administrator registered for another one."""
+        catalog = CatalogManager(tmp_path)
+        catalog.add_target("tgt-c", endpoint="http://arango-c:8529", database="graph_c",
+                           username="c", password="pw-c", project="someone-elses")
+        catalog.delete_project("customer-360")
+        r = governed.post("/api/projects", headers=bearer(),
+                          json={"name": "customer-360", "source_name": "src",
+                                "target_name": "tgt-c"})
+        assert r.status_code == 403, r.text
+        assert CatalogManager(tmp_path).get_project("customer-360") is None
+        # Nor does a project already bound to it, before it was reserved, load there.
+        (tmp_path / "customer-360.yaml").write_text(
+            "collections:\n  t:\n    source_table: t\n    target_collection: t\nedges: []\n")
+        catalog.create_project("customer-360", "src", str(tmp_path / "customer-360.yaml"))
+        catalog.update_project("customer-360", target_name="tgt-c")
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
+        assert r.status_code == 403, r.text
+        assert "registered for another project" in r.json()["detail"]
+        assert "writer" not in loads
+        # Positive control: the project it is registered for is created on it.
+        catalog.delete_project("customer-360")
+        catalog.update_project("someone-elses", target_name="")
+        catalog.add_target("tgt-d", endpoint="http://arango-d:8529", database="graph_d",
+                           project="customer-360")
+        r = governed.post("/api/projects", headers=bearer(),
+                          json={"name": "customer-360", "source_name": "src",
+                                "target_name": "tgt-d"})
+        assert r.status_code == 201, r.text
+
+    def test_a_target_bound_while_the_creation_waited_is_refused(self, governed, loads,
+                                                                 tmp_path):
+        """Two creations at once: the target is checked again after the control plane
+        answers, so the second does not bind a target the first just took."""
+        catalog = CatalogManager(tmp_path)
+        catalog.delete_project("customer-360")
+        catalog.update_project("someone-elses", target_name="")  # tgt-b is free
+
+        class Meanwhile(FakeControlPlane):
+            def decide(self, identity, action, term):
+                CatalogManager(tmp_path).update_project("someone-elses", target_name="tgt-b")
+                return super().decide(identity, action, term)
+
+        control_plane.set_instance(Meanwhile())
+        r = governed.post("/api/projects", headers=bearer(),
+                          json={"name": "customer-360", "source_name": "src",
+                                "target_name": "tgt-b"})
+        assert r.status_code == 403, r.text
+        assert CatalogManager(tmp_path).get_project("customer-360") is None
+
+
+class TestTheGateHoldsUnderAControlPlane:
+    """The sensitive-field gate is the control plane's: no mapping and no route gets a
+    field it rates sensitive past it. A migration reloaded a gated load's collections
+    without it; a mask marker in a field's description passed an unmasked field; and an
+    expression loaded what it computed from a column the gate had excluded."""
+
+    PLAIN = "collections:\n  t:\n    source_table: t\n    target_collection: t\nedges: []\n"
+    ROW = {"id": 1, "name": "a", "ssn": "123-45-6789"}
+
+    @pytest.fixture
+    def setup(self, tmp_path, monkeypatch):
+        import r2g.streaming.pipeline as sp
+        from r2g.types import Classification, Column, Schema, Table
+        from r2g.ui import server
+
+        catalog = CatalogManager(tmp_path)
+        catalog.create_snapshot("src", Schema(tables={"t": Table(name="t", columns=[
+            Column(name="id", data_type="integer", is_nullable=False, is_primary_key=True),
+            Column(name="name", data_type="text", is_nullable=True),
+            Column(name="ssn", data_type="text", is_nullable=True,
+                   classification=Classification(tags=["PII.Sensitive"])),
+        ], primary_key=["id"])}))
+        catalog.add_target("tgt-a", endpoint="http://arango-a:8529", database="graph_a",
+                           username="a", password="pw-a")
+        catalog.update_project("customer-360", target_name="tgt-a")
+        configs: list[Any] = []
+
+        class Writer:
+            def __init__(self, **kw):
+                pass
+
+        class Pipeline:
+            def __init__(self, **kw):
+                configs.append(kw["config"])
+                self.errors: dict = {}
+
+            def run(self, **kw):
+                return {"documents": [("t", 1)], "edges": []}
+
+        monkeypatch.setattr(server, "ArangoWriter", Writer)
+        monkeypatch.setattr(server, "StreamingPipeline", Pipeline)
+        monkeypatch.setattr(sp, "StreamingPipeline", Pipeline)
+        monkeypatch.setattr(server, "_graph_state", lambda *a: None)
+        return tmp_path, configs
+
+    def _document(self, tmp_path, config) -> dict:
+        from r2g.transformers.node_transformer import NodeTransformer
+
+        table = CatalogManager(tmp_path).get_latest_snapshot("src").schema_data.tables["t"]
+        return NodeTransformer(table, config.collections["t"]).transform_row(self.ROW)
+
+    @pytest.mark.parametrize("field", [
+        "{target: ssn, sources: [ssn], expression: '\"***\"', description: 'r2g:mask:redact'}"
+        "\n      - {target: ssn, sources: [ssn], expression: '@ssn'}",
+        "{target: ssn, sources: [ssn], expression: '', description: 'r2g:mask:hash'}",
+        "{target: contact, sources: [name], expression: '@ssn'}",
+        "{target: contact, sources: [ssn], expression: '@ssn'}",
+        "{target: contact, sources: [name, ssn], expression: 'CONCAT(@name, @ssn)'}",
+    ])
+    def test_no_field_expression_loads_a_sensitive_column(self, governed, setup, field):
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(
+            self.PLAIN.replace("edges", f"    field_expressions:\n      - {field}\nedges"))
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
+        assert r.status_code == 202, r.text
+        assert "123-45-6789" not in str(self._document(tmp_path, configs[-1]))
+
+    def test_a_second_collection_on_the_table_is_refused(self, governed, setup):
+        """A load writes one collection per source table. A decoy listed first took the
+        gate's exclusion, and a migration asked the policy about the decoy while it
+        rewrote the other; such a mapping is refused before either."""
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)
+        (tmp_path / "customer-360.yaml").write_text(
+            "collections:\n  decoy:\n    source_table: t\n    target_collection: decoy\n"
+            + self.PLAIN.removeprefix("collections:\n"))
+        loads = len(configs)
+        for route in ("load", "migrate"):
+            r = governed.post(f"/api/projects/customer-360/{route}", headers=bearer(), json={})
+            assert r.status_code == 400, (route, r.text)
+            assert "more than one document collection" in str(r.json()["detail"])
+        assert len(configs) == loads
+
+    def test_a_sensitive_key_is_refused(self, governed, setup):
+        """A key is built from the row's values, so a sensitive primary key reaches the
+        graph whatever the gate excludes; such a load or migration is refused."""
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)  # keyed by id: loads
+        catalog = CatalogManager(tmp_path)
+        snap = catalog.get_latest_snapshot("src")
+        table = snap.schema_data.tables["t"]
+        table.primary_key = ["ssn"]
+        catalog.create_snapshot("src", snap.schema_data)
+        loads = len(configs)
+        for route in ("load", "migrate"):
+            r = governed.post(f"/api/projects/customer-360/{route}", headers=bearer(), json={})
+            assert r.status_code == 403, (route, r.text)
+            assert "t.ssn" in r.json()["detail"] and "key overlay" in r.json()["detail"]
+        assert len(configs) == loads
+        # An empty include list is every table to the pipeline, so it is to the check.
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(),
+                          json={"include_tables": []})
+        assert r.status_code == 403, r.text
+        assert len(configs) == loads
+        # A load that leaves the table out writes no such key.
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(),
+                          json={"exclude_tables": ["t"]})
+        assert r.status_code == 202, r.text
+
+    def test_a_mask_still_loads(self, governed, setup):
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN.replace(
+            "edges", "    field_expressions:\n      - {target: ssn, sources: [ssn], "
+            "expression: '\"***\"', description: 'r2g:mask:redact'}\nedges"))
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
+        assert r.status_code == 202, r.text
+        assert self._document(tmp_path, configs[-1])["ssn"] == "***"
+
+    def test_a_migration_reloads_nothing_the_gate_excluded(self, governed, setup):
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)
+        # No edit since the load: nothing to migrate.
+        r = governed.post("/api/projects/customer-360/migrate", headers=bearer(), json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["report"]["actions_executed"] == []
+        # An edit: what is reloaded is gated.
+        (tmp_path / "customer-360.yaml").write_text(
+            self.PLAIN.replace("edges", "    field_mappings: {name: full_name}\nedges"))
+        r = governed.post("/api/projects/customer-360/migrate", headers=bearer(), json={})
+        assert r.status_code == 200, r.text
+        assert all("123-45-6789" not in str(self._document(tmp_path, c)) for c in configs)
+
+    def _loaded(self, governed, tmp_path):
+        r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
+        assert r.status_code == 202, r.text
+        for _ in range(50):
+            if CatalogManager(tmp_path).get_project("customer-360").loaded_mapping:
+                return
+            time.sleep(0.05)
+        raise AssertionError("the load never recorded its mapping")
+
+    def test_a_migration_checks_the_mapping_as_a_load_does(self, governed, setup):
+        """An expression that cannot run here would go to ArangoDB as AQL; ``row.ssn``
+        reads the column with no ``@ssn`` for the gate to see."""
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN.replace(
+            "edges", "    field_expressions:\n      - {target: leak, expression: 'row.ssn'}\nedges"))
+        loads = len(configs)
+        r = governed.post("/api/projects/customer-360/migrate", headers=bearer(), json={})
+        assert r.status_code == 400, r.text
+        assert "validation_errors" in r.json()["detail"]
+        assert len(configs) == loads
+
+    def test_the_migration_plan_plans_what_the_migration_does(self, governed, setup):
+        tmp_path, _ = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)
+        r = governed.get("/api/projects/customer-360/migration-plan", headers=bearer())
+        assert r.status_code == 200, r.text
+        assert r.json()["plan"]["actions"] == []
+
+    @pytest.mark.parametrize("body", [{"allow_sensitive": True},
+                                      {"sensitivity_threshold": "restricted"}])
+    def test_a_migration_may_not_loosen_the_gate(self, governed, setup, body):
+        tmp_path, configs = setup
+        (tmp_path / "customer-360.yaml").write_text(self.PLAIN)
+        self._loaded(governed, tmp_path)
+        r = governed.post("/api/projects/customer-360/migrate", headers=bearer(), json=body)
+        assert r.status_code == 403, r.text
+        assert "stricter but not looser" in r.json()["detail"]
+
+
+def test_outside_a_control_plane_targets_are_unchanged(tmp_path, monkeypatch):
+    """Locally the request is the user's own: relinking works, and a project with no
+    registered target still loads with the user's ARANGO_* credentials."""
+    monkeypatch.delenv("CONTROL_PLANE_URL", raising=False)
+    monkeypatch.delenv("R2G_API_TOKEN", raising=False)
+    monkeypatch.setenv("ARANGO_USER", "me")
+    monkeypatch.setenv("ARANGO_PASSWORD", "mine")
+    catalog = CatalogManager(tmp_path)
+    catalog.add_source("src", "csv", str(tmp_path))
+    catalog.add_target("tgt-b", endpoint="http://arango-b:8529", database="graph_b")
+    (tmp_path / "p.yaml").write_text("collections: {}\nedges: []\n")
+    catalog.create_project("p", "src", str(tmp_path / "p.yaml"),
+                           arango_endpoint="http://anywhere:8529", arango_database="g")
+    client = TestClient(create_app(catalog_dir=str(tmp_path)))
+    r = client.patch("/api/projects/p", json={"target_name": "tgt-b"})
+    assert r.status_code == 200 and r.json()["target_name"] == "tgt-b"
+    r = client.post("/api/projects", json={"name": "q", "source_name": "src",
+                                           "arango_endpoint": "http://anywhere:8529",
+                                           "arango_database": "g"})
+    assert r.status_code == 201 and r.json()["target_name"] in (None, "")

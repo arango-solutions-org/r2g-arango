@@ -238,6 +238,21 @@ def validate_config(schema: Schema, config: MappingConfig) -> list[str]:
     }
     collection_tables = set()
 
+    # A load writes one document collection per table (the last it finds), so a second
+    # one on the same table is never loaded, and a mapping that has one says something
+    # the load does not do: a migration would govern and gate one collection and write
+    # the other.
+    by_table: dict[str, list[str]] = {}
+    for key, cm in config.collections.items():
+        if cm.collection_type == "document":
+            by_table.setdefault(cm.source_table, []).append(key)
+    for src, keys in by_table.items():
+        if len(keys) > 1:
+            issues.append(
+                f"Table '{src}' is mapped by more than one document collection "
+                f"({', '.join(keys)}); a load writes only one of them, so map it once"
+            )
+
     for key, cm in config.collections.items():
         src = cm.source_table
         if src not in schema.tables:

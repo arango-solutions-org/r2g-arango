@@ -73,6 +73,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
+from r2g.connectors.base import quote_double
 from r2g.log import get_logger
 from r2g.security import scrub_dsn_credentials
 from r2g.types import Column, ForeignKey, Schema, Table
@@ -125,6 +126,11 @@ def _column_type(data_type: Any, precision: Any, scale: Any) -> str:
     if base in _FIXED_POINT_DATA_TYPES and precision is not None and scale is not None:
         return f"{base}({int(precision)},{int(scale)})"
     return base
+
+
+def _qualified_name(database: str, schema: str, table: str) -> str:
+    """``"DB"."SCHEMA"."TABLE"`` with each part quoted, embedded quotes doubled."""
+    return ".".join(quote_double(part) for part in (database, schema, table))
 
 
 class SnowflakeConnector:
@@ -271,7 +277,7 @@ class SnowflakeConnector:
         cur = conn.cursor()
         try:
             cur.execute(
-                f'SHOW PRIMARY KEYS IN TABLE "{self._database}"."{self.schema_name}"."{table_name}"'
+                f"SHOW PRIMARY KEYS IN TABLE {_qualified_name(self._database, self.schema_name, table_name)}"
             )
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
@@ -303,7 +309,7 @@ class SnowflakeConnector:
         cur = conn.cursor()
         try:
             cur.execute(
-                f'SHOW IMPORTED KEYS IN TABLE "{self._database}"."{self.schema_name}"."{table_name}"'
+                f"SHOW IMPORTED KEYS IN TABLE {_qualified_name(self._database, self.schema_name, table_name)}"
             )
             rows = cur.fetchall()
             columns = [d[0] for d in (cur.description or [])]
@@ -549,7 +555,7 @@ class SnowflakeSession:
         self.close()
 
     def _qualified(self, table: str) -> str:
-        return f'"{self._database}"."{self.schema_name}"."{table}"'
+        return _qualified_name(self._database, self.schema_name, table)
 
     def count_rows(
         self,
@@ -564,7 +570,7 @@ class SnowflakeSession:
         try:
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT COUNT(*) FROM {q} WHERE "{since_column}" >= %s',  # noqa: S608
+                    f"SELECT COUNT(*) FROM {q} WHERE {quote_double(since_column)} >= %s",  # noqa: S608
                     (since_value,),
                 )
             else:
@@ -595,7 +601,7 @@ class SnowflakeSession:
         try:
             if since_column and since_value is not None:
                 cur.execute(
-                    f'SELECT * FROM {q} WHERE "{since_column}" >= %s',  # noqa: S608
+                    f"SELECT * FROM {q} WHERE {quote_double(since_column)} >= %s",  # noqa: S608
                     (since_value,),
                 )
             else:
