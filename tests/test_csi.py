@@ -13,6 +13,7 @@ from r2g.csi import (
     CSI_VERSION_NESTED,
     csi_schema,
     csi_version_for,
+    is_entity_collection,
     mapping_to_csi,
     validate_csi,
 )
@@ -21,6 +22,7 @@ from r2g.types import (
     Column,
     EdgeDefinition,
     FieldExpression,
+    ForeignKey,
     MappingConfig,
     Schema,
     SharedKey,
@@ -214,6 +216,106 @@ def test_entities_are_document_collections_only():
     assert set(doc["arangoPhysicalMapping"]["entities"]) == {"User", "Order"}
     for phys in doc["arangoPhysicalMapping"]["entities"].values():
         assert phys["style"] == "COLLECTION"
+
+
+# ── A join table Auto-Map flags but leaves a document collection ───────────
+#
+# generate-config flags a two-FK table ``is_join_table`` and keeps it a
+# ``document`` collection; the loaders then write it as a vertex plus one edge
+# per foreign key. The CSI used to drop that vertex and keep both of its edges,
+# so each named a ``fromEntity`` the document never declared.
+
+
+def _join_table_auto_map():
+    from r2g.config import ConfigManager
+
+    schema = Schema(
+        tables={
+            "posts": Table(
+                name="posts",
+                columns=[Column(name="id", data_type="integer", is_primary_key=True)],
+                primary_key=["id"],
+            ),
+            "tags": Table(
+                name="tags",
+                columns=[Column(name="id", data_type="integer", is_primary_key=True)],
+                primary_key=["id"],
+            ),
+            "post_tags": Table(
+                name="post_tags",
+                columns=[
+                    Column(name="post_id", data_type="integer", is_primary_key=True),
+                    Column(name="tag_id", data_type="integer", is_primary_key=True),
+                    Column(name="created_at", data_type="timestamp"),
+                ],
+                primary_key=["post_id", "tag_id"],
+                foreign_keys=[
+                    ForeignKey(columns=["post_id"], foreign_table="posts", foreign_columns=["id"]),
+                    ForeignKey(columns=["tag_id"], foreign_table="tags", foreign_columns=["id"]),
+                ],
+            ),
+        }
+    )
+    config = ConfigManager.generate_default_config(schema)
+    jt = config.collections["post_tags"]
+    assert jt.is_join_table and jt.collection_type == "document"
+    return config, schema
+
+
+def test_join_table_left_a_document_collection_is_an_entity():
+    doc = mapping_to_csi(*_join_table_auto_map())
+    validate_csi(doc)
+    names = {e["name"] for e in doc["conceptualModel"]["entities"]}
+    assert names == {"Post", "Tag", "PostTag"}
+    phys = doc["arangoPhysicalMapping"]["entities"]["PostTag"]
+    # It describes the collection the loader writes, with its junction metadata.
+    assert phys["collectionName"] == "post_tags"
+    assert phys["properties"]["createdAt"] == {"field": "created_at"}
+
+
+def test_every_relationship_endpoint_is_a_declared_entity():
+    doc = mapping_to_csi(*_join_table_auto_map())
+    names = {e["name"] for e in doc["conceptualModel"]["entities"]}
+    rels = {(r["type"], r["fromEntity"], r["toEntity"]) for r in doc["conceptualModel"]["relationships"]}
+    assert rels == {("postTagsToPosts", "PostTag", "Post"), ("postTagsToTags", "PostTag", "Tag")}
+    assert all(f in names and t in names for _, f, t in rels)
+
+
+def test_entity_collection_rule_follows_collection_type_not_the_join_flag():
+    assert is_entity_collection(CollectionMapping(source_table="t", target_collection="t"))
+    assert is_entity_collection(CollectionMapping(source_table="t", target_collection="t", is_join_table=True))
+    assert not is_entity_collection(
+        CollectionMapping(source_table="t", target_collection="t", collection_type="edge", is_join_table=True)
+    )
+    assert not is_entity_collection(CollectionMapping(source_table="t", target_collection="t", collection_type="edge"))
+
+
+def test_join_table_left_a_document_collection_takes_a_curated_label():
+    # The curated-label plan sees the same entities the CSI declares.
+    config, schema = _join_table_auto_map()
+    labels = {"curatedLabelsVersion": "1", "entities": [{"name": "PostTag", "label": "Tagging"}]}
+    doc = mapping_to_csi(config, schema, label_policy="warn", curated_labels=labels)
+    assert {e["name"] for e in doc["conceptualModel"]["entities"]} == {"Post", "Tag", "Tagging"}
+
+
+def test_join_table_column_bound_to_a_shared_key_is_a_declared_join_key():
+    # A declared join key keeps its generated name on a join table as on any entity.
+    config, schema = _join_table_auto_map()
+    config.shared_keys = [
+        SharedKey(
+            key="postId",
+            concept="Post",
+            bindings=[SharedKeyBinding(source="blog", table="post_tags", column="post_id")],
+        )
+    ]
+    labels = {
+        "curatedLabelsVersion": "1",
+        "properties": [{"entity": "PostTag", "name": "postId", "label": "article id"}],
+    }
+    doc = mapping_to_csi(config, schema, label_policy="warn", curated_labels=labels)
+    rec = next(r for r in doc["provenance"]["curatedLabels"] if r["name"] == "postId")
+    assert rec["resolution"] == "refused"
+    assert "join key" in rec["reason"]
 
 
 def test_relationship_endpoints_resolve_to_target_collections():
@@ -1141,6 +1243,319 @@ _ABSENT = object()  # distinguishes "field omitted" from any value it could hold
 # there unilaterally. A malformed declaration is therefore not a document that
 # fails; it is a document whose declared uniqueness is wrong, surfacing as a
 # downstream join that groups incorrectly, arbitrarily far from the cause.
+
+
+class TestJoinEntityYields:
+    """A join table exported as an entity never renames a property of an entity it links.
+
+    Its foreign-key columns are named after the keys they reference and its
+    junction metadata often repeats a linked table's column, so its labels
+    collide with the linked entities' labels. Those entities keep exactly the
+    names they had before join tables were exported, and the join entity's
+    colliding labels are qualified on it alone.
+    """
+
+    @staticmethod
+    def _table(name, cols, pk, fks=()):
+        return Table(
+            name=name,
+            columns=[Column(name=c, data_type=t, is_primary_key=c in pk) for c, t in cols],
+            primary_key=list(pk),
+            foreign_keys=[ForeignKey(columns=[c], foreign_table=ft, foreign_columns=[fc]) for c, ft, fc in fks],
+        )
+
+    def _enrollment(self, *, course_created_at=False, second_join_table=False, student_created_at=True):
+        from r2g.config import ConfigManager
+
+        course_cols = [("course_id", "integer"), ("title", "text")]
+        if course_created_at:
+            course_cols.append(("created_at", "timestamp"))
+        student_cols = [("student_id", "integer"), ("full_name", "text")]
+        if student_created_at:
+            student_cols.append(("created_at", "timestamp"))
+        tables = {
+            "student": self._table("student", student_cols, ["student_id"]),
+            "course": self._table("course", course_cols, ["course_id"]),
+            "enrollment": self._table(
+                "enrollment",
+                [("student_id", "integer"), ("course_id", "integer"), ("created_at", "timestamp")],
+                ["student_id", "course_id"],
+                [("student_id", "student", "student_id"), ("course_id", "course", "course_id")],
+            ),
+        }
+        if second_join_table:
+            tables["tag"] = self._table("tag", [("tag_id", "integer"), ("name", "text")], ["tag_id"])
+            tables["course_tag"] = self._table(
+                "course_tag",
+                [("course_id", "integer"), ("tag_id", "integer"), ("created_at", "timestamp")],
+                ["course_id", "tag_id"],
+                [("course_id", "course", "course_id"), ("tag_id", "tag", "tag_id")],
+            )
+        schema = Schema(tables=tables)
+        config = ConfigManager.generate_default_config(schema)
+        for name in ("enrollment", "course_tag"):
+            if name in config.collections:
+                assert config.collections[name].is_join_table
+                assert config.collections[name].collection_type == "document"
+        return config, schema
+
+    @staticmethod
+    def _props(doc):
+        return {e["name"]: sorted(p["name"] for p in e["properties"]) for e in doc["conceptualModel"]["entities"]}
+
+    @staticmethod
+    def _join_record(doc, label):
+        """The second pass's record for ``label`` (the first pass's records carry no such kind)."""
+        return next(
+            r
+            for r in doc["provenance"]["labelCollisions"]
+            if r["label"] == label and r.get("kind") == "join_entity"
+        )
+
+    @staticmethod
+    def _without_join_tables(config):
+        """The same mapping with every flagged join table left out, as main exported it."""
+        trimmed = config.model_copy(deep=True)
+        trimmed.collections = {k: cm for k, cm in config.collections.items() if not cm.is_join_table}
+        return trimmed
+
+    @pytest.mark.parametrize("policy", ["qualify", "roles", "warn"])
+    @pytest.mark.parametrize(
+        "shape",
+        [{}, {"course_created_at": True}, {"course_created_at": True, "second_join_table": True}],
+        ids=["linked-keys-and-metadata", "linked-entities-already-collide", "two-join-tables"],
+    )
+    def test_linked_entities_keep_the_names_they_had_without_the_join_table(self, policy, shape):
+        config, schema = self._enrollment(**shape)
+        with_join = self._props(mapping_to_csi(config, schema, label_policy=policy))
+        without = self._props(mapping_to_csi(self._without_join_tables(config), schema, label_policy=policy))
+        assert {name: with_join[name] for name in without} == without
+
+    def test_qualify_renames_the_join_entity_only(self):
+        config, schema = self._enrollment()
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        validate_csi(doc)
+        props = self._props(doc)
+        assert props["Student"] == ["createdAt", "fullName", "studentId"]
+        assert props["Course"] == ["courseId", "title"]
+        assert props["Enrollment"] == ["enrollmentCourseId", "enrollmentCreatedAt", "enrollmentStudentId"]
+        # The physical mapping follows the rename, so each name still resolves to its column.
+        phys = doc["arangoPhysicalMapping"]["entities"]["Enrollment"]["properties"]
+        assert phys["enrollmentStudentId"] == {"field": "student_id"}
+        assert phys["enrollmentCreatedAt"] == {"field": "created_at"}
+        rec = next(r for r in doc["provenance"]["labelCollisions"] if r["label"] == "studentId")
+        assert rec == {
+            "label": "studentId",
+            "entities": ["Enrollment", "Student"],
+            "kind": "join_entity",
+            "resolution": "qualified",
+            "renamedTo": {"Enrollment": "enrollmentStudentId"},
+            "owner": "Student",
+            "detail": rec["detail"],
+        }
+
+    def test_roles_collapses_the_seam_on_the_join_entity(self):
+        config, schema = self._enrollment(second_join_table=True)
+        props = self._props(mapping_to_csi(config, schema, label_policy="roles"))
+        # ``courseTag`` + ``tagId`` collapses to ``courseTagId``, as ``roles`` does for
+        # any referencing entity (``filmCategory`` + ``categoryId`` → ``filmCategoryId``).
+        assert props["CourseTag"] == ["courseTagCourseId", "courseTagCreatedAt", "courseTagId"]
+        assert props["Tag"] == ["name", "tagId"]
+
+    def test_warn_records_and_renames_nothing(self):
+        config, schema = self._enrollment()
+        doc = mapping_to_csi(config, schema, label_policy="warn")
+        assert self._props(doc)["Enrollment"] == ["courseId", "createdAt", "studentId"]
+        recs = [r for r in doc["provenance"]["labelCollisions"] if r.get("kind") == "join_entity"]
+        assert {r["label"] for r in recs} == {"courseId", "createdAt", "studentId"}
+        assert {r["resolution"] for r in recs} == {"reported"}
+
+    def test_off_skips_the_join_entity_too(self):
+        config, schema = self._enrollment()
+        doc = mapping_to_csi(config, schema, label_policy="off")
+        assert self._props(doc)["Enrollment"] == ["courseId", "createdAt", "studentId"]
+        assert "labelCollisions" not in doc["provenance"]
+
+    def test_two_join_entities_sharing_a_label_both_yield(self):
+        config, schema = self._enrollment(second_join_table=True)
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        rec = self._join_record(doc, "courseId")
+        assert rec["renamedTo"] == {"CourseTag": "courseTagCourseId", "Enrollment": "enrollmentCourseId"}
+        assert rec["owner"] == "Course"
+        assert self._props(doc)["Course"] == ["courseId", "title"]
+
+    def test_two_join_entities_sharing_a_label_no_linked_entity_holds_are_both_qualified(self):
+        # Only the two join tables carry ``created_at``: left bare, the label would
+        # be shared by two entities, so both are qualified.
+        config, schema = self._enrollment(second_join_table=True, student_created_at=False)
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        rec = next(r for r in doc["provenance"]["labelCollisions"] if r["label"] == "createdAt")
+        assert rec["entities"] == ["CourseTag", "Enrollment"]
+        assert rec["renamedTo"] == {"CourseTag": "courseTagCreatedAt", "Enrollment": "enrollmentCreatedAt"}
+        assert "owner" not in rec
+
+    def test_a_label_several_linked_entities_keep_names_no_owner(self):
+        # ``code`` on Alpha and Beta cannot be qualified (``alphaCode`` is taken), so
+        # both keep it; the join entity's ``code`` yields, and no single owner is named.
+        from r2g.config import ConfigManager
+
+        schema = Schema(
+            tables={
+                "alpha": self._table(
+                    "alpha", [("id", "integer"), ("code", "text"), ("alpha_code", "text")], ["id"]
+                ),
+                "beta": self._table("beta", [("id", "integer"), ("code", "text")], ["id"]),
+                "alpha_beta": self._table(
+                    "alpha_beta",
+                    [("alpha_id", "integer"), ("beta_id", "integer"), ("code", "text")],
+                    ["alpha_id", "beta_id"],
+                    [("alpha_id", "alpha", "id"), ("beta_id", "beta", "id")],
+                ),
+            }
+        )
+        config = ConfigManager.generate_default_config(schema)
+        config.collections["alpha_beta"].is_join_table = True
+        config.collections["alpha_beta"].collection_type = "document"
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        props = self._props(doc)
+        assert "code" in props["Alpha"] and "code" in props["Beta"]
+        rec = self._join_record(doc, "code")
+        assert rec["entities"] == ["Alpha", "AlphaBeta", "Beta"]
+        assert rec["renamedTo"] == {"AlphaBeta": "alphaBetaCode"}
+        assert "owner" not in rec
+
+    def test_a_collision_the_linked_entities_resolve_first_is_then_yielded_to(self):
+        # Issue #88's schema: ``id`` on Author and Book is qualified to
+        # ``authorId`` / ``bookId`` as before, and the join entity's own
+        # ``authorId`` / ``bookId`` give way to those names.
+        from r2g.config import ConfigManager
+
+        schema = Schema(
+            tables={
+                "author": self._table("author", [("id", "integer"), ("name", "text")], ["id"]),
+                "book": self._table("book", [("id", "integer"), ("title", "text")], ["id"]),
+                "book_author": self._table(
+                    "book_author",
+                    [("book_id", "integer"), ("author_id", "integer")],
+                    ["book_id", "author_id"],
+                    [("book_id", "book", "id"), ("author_id", "author", "id")],
+                ),
+            }
+        )
+        config = ConfigManager.generate_default_config(schema)
+        props = self._props(mapping_to_csi(config, schema, label_policy="qualify"))
+        assert props["Author"] == ["authorId", "name"]
+        assert props["Book"] == ["bookId", "title"]
+        assert props["BookAuthor"] == ["bookAuthorAuthorId", "bookAuthorBookId"]
+
+    def test_a_rename_that_would_collide_is_refused_on_the_join_entity(self):
+        config, schema = self._enrollment()
+        # The join table already has a column the rename would produce.
+        schema.tables["enrollment"].columns.append(Column(name="enrollment_student_id", data_type="integer"))
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        rec = self._join_record(doc, "studentId")
+        assert rec["resolution"] == "unresolved"
+        assert "enrollmentStudentId" in rec["reason"]
+        props = self._props(doc)
+        assert props["Student"] == ["createdAt", "fullName", "studentId"]
+        assert "studentId" in props["Enrollment"]
+
+    @staticmethod
+    def _bind_join_table_created_at(config):
+        config.shared_keys = [
+            SharedKey(
+                key="createdAt",
+                concept="Enrollment",
+                bindings=[SharedKeyBinding(source="school", table="enrollment", column="created_at")],
+            )
+        ]
+
+    def test_a_join_key_bound_on_the_join_table_stays_bare_on_every_entity(self):
+        # Student and the join entity share ``createdAt``; a shared key bound on the
+        # join table's column keeps it bare on both, as a join key always is.
+        config, schema = self._enrollment()
+        self._bind_join_table_created_at(config)
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        props = self._props(doc)
+        assert props["Student"] == ["createdAt", "fullName", "studentId"]
+        assert "createdAt" in props["Enrollment"]
+        rec = self._join_record(doc, "createdAt")
+        assert rec["resolution"] == "join_key"
+        assert rec["entities"] == ["Enrollment", "Student"]
+
+    def test_a_join_key_bound_only_on_the_join_table_does_not_exempt_the_linked_entities(self):
+        # Student and Course collide on ``createdAt`` among themselves and are
+        # qualified, exactly as when the join table was not exported: a binding on
+        # the join table alone does not turn their collision into a join key.
+        config, schema = self._enrollment(course_created_at=True)
+        self._bind_join_table_created_at(config)
+        doc = mapping_to_csi(config, schema, label_policy="qualify")
+        props = self._props(doc)
+        assert props["Student"] == ["fullName", "studentCreatedAt", "studentId"]
+        assert props["Course"] == ["courseCreatedAt", "courseId", "title"]
+        assert "createdAt" in props["Enrollment"]
+
+    def test_a_curated_join_entity_name_is_the_one_that_yields(self):
+        config, schema = self._enrollment()
+        labels = {"curatedLabelsVersion": "1", "entities": [{"name": "Enrollment", "label": "Registration"}]}
+        props = self._props(mapping_to_csi(config, schema, label_policy="qualify", curated_labels=labels))
+        assert props["Student"] == ["createdAt", "fullName", "studentId"]
+        assert props["Registration"] == [
+            "registrationCourseId",
+            "registrationCreatedAt",
+            "registrationStudentId",
+        ]
+
+    @pytest.mark.parametrize("policy", ["qualify", "roles"])
+    def test_a_join_key_two_join_entities_share_is_not_taken_by_an_earlier_qualification(self, policy):
+        # ``enrollmentCourseId`` is a declared join key on two other join tables.
+        # Enrollment's ``courseId`` sorts first and would qualify to that same label;
+        # it is refused, so the join key stays on exactly the entities it binds.
+        from r2g.config import ConfigManager
+
+        keys = [("student_id", "student", "student_id"), ("enrollment_course_id", "course", "course_id")]
+        schema = Schema(
+            tables={
+                "student": self._table("student", [("student_id", "integer")], ["student_id"]),
+                "course": self._table("course", [("course_id", "integer")], ["course_id"]),
+                "enrollment": self._table(
+                    "enrollment",
+                    [("student_id", "integer"), ("course_id", "integer")],
+                    ["student_id", "course_id"],
+                    [("student_id", "student", "student_id"), ("course_id", "course", "course_id")],
+                ),
+                **{
+                    name: self._table(
+                        name,
+                        [("student_id", "integer"), ("enrollment_course_id", "integer")],
+                        ["student_id", "enrollment_course_id"],
+                        keys,
+                    )
+                    for name in ("waitlist", "audit_seat")
+                },
+            }
+        )
+        config = ConfigManager.generate_default_config(schema)
+        for name in ("enrollment", "waitlist", "audit_seat"):
+            assert config.collections[name].is_join_table
+            assert config.collections[name].collection_type == "document"
+        config.shared_keys = [
+            SharedKey(
+                key="enrollmentCourseId",
+                concept="Course",
+                bindings=[
+                    SharedKeyBinding(source="school", table=t, column="enrollment_course_id")
+                    for t in ("waitlist", "audit_seat")
+                ],
+            )
+        ]
+        doc = mapping_to_csi(config, schema, label_policy=policy)
+        holders = sorted(name for name, labels in self._props(doc).items() if "enrollmentCourseId" in labels)
+        assert holders == ["AuditSeat", "Waitlist"]
+        assert self._join_record(doc, "enrollmentCourseId")["resolution"] == "join_key"
+        rec = self._join_record(doc, "courseId")
+        assert rec["resolution"] == "unresolved"
+        assert "enrollmentCourseId" in rec["reason"]
 
 
 class TestDeclaredUniqueness:

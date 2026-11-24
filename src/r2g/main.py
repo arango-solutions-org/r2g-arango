@@ -751,7 +751,7 @@ def export_r2rml(
     ``--curated-labels`` must be the same file given to ``export-csi``, or the
     two legs will name concepts differently.
     """
-    from r2g.csi import curated_plan_for_mapping
+    from r2g.csi import curated_plan_for_mapping, is_entity_collection
     from r2g.curated_labels import load_curated_labels
     from r2g.r2rml import mapping_to_r2rml
 
@@ -776,11 +776,7 @@ def export_r2rml(
             curated_labels=curated,
         )
         Path(output).write_text(ttl, encoding="utf-8")
-        n_entities = sum(
-            1
-            for cm in mapping.collections.values()
-            if cm.collection_type != "edge" and not cm.is_join_table
-        )
+        n_entities = sum(1 for cm in mapping.collections.values() if is_entity_collection(cm))
         console.print(f"[green]Wrote R2RML mapping:[/green] [bold]{output}[/bold]")
         console.print(
             f"  [dim]{n_entities} TriplesMaps, {len(mapping.edges)} FK relationships[/dim]"

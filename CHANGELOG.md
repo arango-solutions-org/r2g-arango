@@ -75,6 +75,36 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load wrote documents and edge endpoints that a later stream or CDC run could not
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
+- **A join table that is still a document collection is exported as the entity it is loaded
+  as.** `generate-config` flags a table with exactly two foreign keys and no data columns beyond
+  junction metadata (`quantity`, `created_at`, …) `is_join_table`, and keeps it a `document`
+  collection, so `transform-all` and the streaming pipeline load it as a vertex plus one edge per
+  foreign key. `export-csi` and `export-r2rml` skipped every flagged table: the CSI declared both
+  of its foreign-key relationships with a `fromEntity` it never declared, and the R2RML listed
+  both under "Skipped edges", so the many-to-many link could not be queried through the R2RML
+  mapping. Both exporters, and `export-r2rml`'s TriplesMap count, now share one rule,
+  `r2g.csi.is_entity_collection`: every collection that is not an edge collection is an entity.
+  A join table whose `collection_type` is `edge` is still not an entity, as before. **What
+  changes for an existing mapping:** each flagged join table that is still a document collection
+  gains a CSI entity, with its key and junction-metadata columns as properties, and an R2RML
+  TriplesMap that carries both foreign keys. **No property of an existing entity is renamed**,
+  unless a join table was mapped by hand into another table's collection, where that entity is
+  declared twice and its colliding properties are qualified under `qualify`.
+  The new entity's columns usually carry the same labels as properties of the tables it links
+  (`student_id`, `created_at`). The other entities' collisions are resolved among themselves
+  exactly as before, and then the join entity yields: under `qualify` and `roles` each of its
+  colliding labels is qualified on the join entity only (`enrollmentStudentId`,
+  `enrollmentCreatedAt`), recorded in `provenance.labelCollisions` with `kind: "join_entity"`;
+  `warn` records them. A declared cross-source join key stays bare on every join entity that
+  carries it, bound there or not, and on a linked entity that alone already carried the label,
+  which then shares it with the join entity (recorded `join_key`). A binding on the join table
+  alone does not exempt the linked entities' collision with each other, as before. A join key
+  bound only on the join table refuses a curated rename on the join entity alone, so a curated
+  rename of the same label on a linked entity applies as before. A curated rename that
+  applied before is refused only where its target is the join entity's name or one of its labels
+  (`Course.title` renamed to "quantity" when the join table has a `quantity` column), as P12.12
+  refuses any name another entity carries. A mapping with no such table exports
+  byte-identical CSI and R2RML.
 
 ### Security
 

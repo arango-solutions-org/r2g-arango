@@ -257,6 +257,7 @@ def plan_curated_labels(
     entities: Mapping[str, Iterable[str]],
     relationships: Iterable[str],
     join_key_labels: Optional[Set[str]] = None,
+    entity_join_key_labels: Optional[Mapping[str, Set[str]]] = None,
 ) -> CuratedPlan:
     """Resolve a curated-labels document against r2g's generated names.
 
@@ -265,7 +266,10 @@ def plan_curated_labels(
         entities: generated entity name -> its generated property names.
         relationships: generated relationship names.
         join_key_labels: generated property labels that are declared cross-source
-            join keys (P6.7); never renamed.
+            join keys (P6.7); never renamed, on any entity.
+        entity_join_key_labels: generated entity name -> join-key labels bound on
+            that entity only (a join table's, #88); never renamed on that entity,
+            and no bar to renaming the same label on another.
 
     Pure and deterministic: entries are resolved in sorted order, so the result
     never depends on the order a curator's tool happened to write them.
@@ -273,6 +277,7 @@ def plan_curated_labels(
     from .csi import _qualified_label
 
     join_key_labels = join_key_labels or set()
+    entity_join_key_labels = entity_join_key_labels or {}
     entity_props = {e: list(props) for e, props in entities.items()}
     relationship_names = sorted(set(relationships))
     plan = CuratedPlan(
@@ -343,7 +348,9 @@ def plan_curated_labels(
                 )
             records[key] = _record("property", entry, resolution="unmatched", reason=reason)
             continue
-        if entry["name"] in join_key_labels:
+        if entry["name"] in join_key_labels or entry["name"] in entity_join_key_labels.get(
+            entry["entity"], ()
+        ):
             records[key] = _record(
                 "property",
                 entry,
