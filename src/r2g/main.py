@@ -1370,8 +1370,9 @@ def dump_tables(
     (or a subset if --tables is specified). Output files are named <table>.csv.
     """
     import psycopg
+    from psycopg import sql as pg_sql
 
-    from r2g.connectors.base import create_source_connector
+    from r2g.connectors.base import create_source_connector, table_output_file
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1399,8 +1400,10 @@ def dump_tables(
 
         with psycopg.connect(connection_string) as conn:
             for tbl in table_names:
-                csv_path = out / f"{tbl}.csv"
-                copy_sql = f"COPY {schema_filter}.{tbl} TO STDOUT WITH CSV HEADER"
+                csv_path = table_output_file(out, tbl)
+                copy_sql = pg_sql.SQL("COPY {} TO STDOUT WITH CSV HEADER").format(
+                    pg_sql.Identifier(pg_schema_name, tbl)
+                )
                 with csv_path.open("wb") as f:
                     with conn.cursor().copy(copy_sql) as copy:
                         for chunk in copy:
@@ -2581,7 +2584,7 @@ def source_dump(
     so PostgreSQL goes through ``COPY TO STDOUT`` and Snowflake streams
     through the cursor; both produce comma-separated, header-row CSV.
     """
-    from r2g.connectors.base import create_source_connector
+    from r2g.connectors.base import create_source_connector, table_output_file
 
     mgr = _get_catalog()
     source = mgr.get_source(name)
@@ -2631,8 +2634,8 @@ def source_dump(
     try:
         total_rows = 0
         for tbl in table_names:
-            csv_path = out / f"{tbl}.csv"
             try:
+                csv_path = table_output_file(out, tbl)
                 rows = session.dump_table_to_csv(tbl, csv_path)
             except Exception as err:  # noqa: BLE001
                 log.exception("source_dump_table_failed", source=name, table=tbl)

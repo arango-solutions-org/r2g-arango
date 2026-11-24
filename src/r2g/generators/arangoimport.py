@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from r2g.config import _base_pg_type_name, pg_type_to_json_type
+from r2g.connectors.base import table_output_file
 from r2g.log import get_logger
 from r2g.security import scrub_dsn_credentials
 from r2g.types import CollectionMapping, MappingConfig, Schema
@@ -885,6 +886,9 @@ class CsvImportGenerator:
         return "[" + f"]{sep}[".join(columns) + "]"
 
     def _csv_file_path(self, table_name: str) -> str:
+        # The script reads the file a dump of the table writes, so it refuses the names
+        # the dumps refuse: a table named ``../x`` would read a file outside data_dir.
+        table_output_file(Path(self.data_dir), table_name)
         return f"{self.data_dir.rstrip('/')}/{table_name}.csv"
 
     def _server_flags_for_script(self) -> list[str]:

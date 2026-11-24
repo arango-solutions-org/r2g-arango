@@ -76,6 +76,17 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
 
+### Security
+
+- **Identifiers a source reports are quoted in every query r2g sends back to it.** A
+  table or column name containing a quote character could end its identifier in the
+  row-count, streaming, dump and value-sampling queries for PostgreSQL, Snowflake and
+  ClickHouse, and `r2g dump-tables` did not quote names at all. Each name is now
+  quoted with its embedded quotes doubled (escaped, for ClickHouse). `r2g dump-tables`
+  and `r2g source dump` also refuse a table name that would write outside the output
+  directory, and `r2g generate-csv-import` one that would make its script read a file
+  from outside the data directory.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added
