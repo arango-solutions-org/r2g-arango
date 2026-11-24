@@ -232,11 +232,43 @@ def written_by(name: str, *configs: MappingConfig) -> tuple[str | None, ...]:
 
 def migration_items(actions: Iterable[Any], old: MappingConfig, new: MappingConfig) -> list[Item]:
     """What a migration writes: each collection its plan touches, on the classes of what
-    the collection holds before or after."""
+    the collection holds before or after; and, for a reload, everything the reload writes.
+
+    A reload runs the load pipeline for the tables it reloads (``SelectiveReloader``), so
+    it rewrites every collection and relationship those tables write, not only the one
+    the plan names: reloading one edge rewrites its starting table's documents and the
+    table's other relationships, and reloading a collection drops and rewrites the
+    relationships starting from it. Those are checked as a load of those tables is."""
+    actions = list(actions)
     by_collection: dict[str, list[str]] = {}
     for action in actions:
         by_collection.setdefault(action.collection or "", []).append(action.action_type)
-    return [Item(f"collections/{name}" if name else "graph",
-                 written_by(name, old, new) if name else (PROJECT_WIDE,),
-                 tuple(dict.fromkeys(kinds)))
-            for name, kinds in sorted(by_collection.items())]
+    items = [Item(f"collections/{name}" if name else "graph",
+                  written_by(name, old, new) if name else (PROJECT_WIDE,),
+                  tuple(dict.fromkeys(kinds)))
+             for name, kinds in sorted(by_collection.items())]
+    for action in actions:
+        if action.action_type == "reload_collection":
+            tables = {c.source_table for c in new.collections.values()
+                      if c.target_collection == action.collection}
+            drop = True
+        elif action.action_type == "reload_edge":
+            tables = {e.from_collection for e in new.edges
+                      if e.edge_collection == action.collection}
+            drop = False
+        else:
+            continue
+        if tables:  # an empty include is every table; a reload of none writes nothing
+            items += load_items(new, include=sorted(tables), drop=drop)
+    return _merged(items)
+
+
+def _merged(items: list[Item]) -> list[Item]:
+    """One item per place, its classes and what is done there gathered in order."""
+    out: dict[str, Item] = {}
+    for item in items:
+        had = out.get(item.where)
+        out[item.where] = item if had is None else Item(
+            item.where, _unique([*had.terms, *item.terms]),
+            tuple(dict.fromkeys([*had.what, *item.what])))
+    return list(out.values())

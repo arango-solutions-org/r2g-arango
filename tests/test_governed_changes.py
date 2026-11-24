@@ -523,8 +523,58 @@ def test_a_migration_is_checked_on_what_each_collection_holds():
                ReloadAction(action_type="rebuild_graph", collection="", reason="r")]
     assert [(i.where, i.terms, i.what) for i in migration_items(actions, old, new)] == [
         ("graph", (PROJECT_WIDE,), ("rebuild_graph",)),
-        ("collections/books", (BOOK,), ("rename_collection",)),
-        ("collections/wrote", (BOOK,), ("reload_edge",))]
+        ("collections/books", (BOOK,), ("rename_collection", "load")),
+        ("collections/wrote", (BOOK,), ("reload_edge",)),
+        # Reloading an edge runs the load for its starting table (#124).
+        ("edges/wrote(books.author_id -> authors.id)", (BOOK,), ("load",))]
+
+
+def _sharing_wrote() -> MappingConfig:
+    """Authors also write relationships into the ``wrote`` collection the books use."""
+    return mapping(edited(lambda d: d["edges"].append(
+        {"edge_collection": "wrote", "from_collection": "authors", "to_collection": "members",
+         "from_field": "id", "to_field": "id"})))
+
+
+def test_a_reload_is_checked_on_everything_it_rewrites():
+    """#124: a reload runs the load for its tables, so it rewrites more than the plan
+    names. Reloading a collection drops the relationships starting from it, and so empties
+    an edge collection other tables write to as well."""
+    m = _sharing_wrote()
+    items = {i.where: (i.terms, i.what) for i in migration_items(
+        [ReloadAction(action_type="reload_collection", collection="authors", reason="r")],
+        m, m)}
+    assert items["collections/authors"] == ((AUTHOR,), ("reload_collection", "load", "drop"))
+    assert items["collections/wrote"] == ((BOOK, AUTHOR), ("drop",))
+    edge = migration_items(
+        [ReloadAction(action_type="reload_edge", collection="borrowed_by", reason="r")], m, m)
+    assert [i.where for i in edge] == [
+        "collections/borrowed_by", "collections/loans",
+        "edges/borrowed_by(loans.member_id -> members.id)"]
+
+
+def test_a_reload_that_finds_no_table_adds_nothing():
+    """An empty include list would mean every table; a reload of none writes nothing."""
+    items = migration_items(
+        [ReloadAction(action_type="reload_edge", collection="no_such_edge", reason="r")],
+        mapping(), mapping())
+    assert [i.where for i in items] == ["collections/no_such_edge"]
+
+
+def test_a_migration_may_not_empty_a_collection_another_class_writes(studio, cp, tmp_path):
+    """The analyst may write authors, not books. Reloading authors drops the shared
+    ``wrote`` collection, books' relationships with it, so the migration is refused; it
+    used to be checked on authors alone."""
+    CatalogManager(tmp_path).set_loaded_mapping("library-catalog",
+                                                _sharing_wrote().model_dump())
+    shared = _sharing_wrote().model_dump(exclude_none=True)
+    shared["collections"]["authors"]["exclude_fields"] = ["id"]
+    (tmp_path / "projects" / "library-catalog" / "mapping.yaml").write_text(
+        yaml.safe_dump(shared))
+    r = studio.post("/api/projects/library-catalog/migrate", headers=as_(ANALYST),
+                    json={"dry_run": True})
+    assert r.status_code == 403, r.text
+    assert "collections/wrote" in [x["where"] for x in r.json()["detail"]["refused"]]
 
 
 def test_in_the_lpg_layout_the_shared_collections_hold_every_class():
