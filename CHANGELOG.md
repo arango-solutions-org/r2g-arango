@@ -7,6 +7,8 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-11-24
+
 ### Added
 
 - **A schema entered from a file, for a source we cannot connect to (#78, PRD P6.17).**
@@ -1413,7 +1415,8 @@ Initial phased implementation (not yet published to PyPI):
   pipeline, `r2g source dump` CLI, pure-Python FK inference with
   optional value-overlap sampler.
 
-[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/ArthurKeen/r2g-arango/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/ArthurKeen/r2g-arango/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ArthurKeen/r2g-arango/compare/v0.9.0...v0.10.0
