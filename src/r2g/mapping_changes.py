@@ -151,8 +151,9 @@ def load_items(config: MappingConfig, include: Iterable[str] | None = None,
 def _loaded(config: MappingConfig, include: Iterable[str] | None,
             exclude: Iterable[str] | None,
             ) -> tuple[list[tuple[str, CollectionMapping]], list[EdgeDefinition]]:
-    """The tables and relationships a load writes, filtered as the load filters them."""
-    inc = None if include is None else set(include)
+    """The tables and relationships a load writes, filtered as the load filters them: an
+    empty ``include`` means every table, as it does to the pipeline."""
+    inc = set(include) if include else None
     exc = set(exclude or ())
 
     def loads(table: str) -> bool:

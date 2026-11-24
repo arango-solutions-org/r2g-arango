@@ -98,6 +98,53 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the source. The OPA/Rego policy stub now writes collection and edge names as escaped
   string literals, so a quote in one cannot end its string.
 
+- **Under a control plane, a project's load target is bound when the project is
+  created (PRD P14.18).** A request could relink a project to another project's
+  target, or create one at an address of its choosing and have the server's own
+  `ARANGO_*` credentials used there, and a load could turn the sensitive-field gate
+  off. Now:
+  - creation binds a target an administrator registered and no other project holds,
+    or registered for that project (`r2g target add --project`); before the project
+    exists, only such targets are listed or read;
+  - changing a project's target is refused;
+  - a project with no registered target does not load or migrate;
+  - a load or a migration may make the gate stricter, but not looser;
+  - a load or a migration that would write a sensitive column into a document or edge
+    key is refused, naming the column: keys are built from the row's values, so the
+    gate, which removes properties, cannot keep a sensitive primary key, a column of a
+    table without one, the key of the row an edge starts from, or a foreign key an edge
+    follows (rated as the column it points at) out of the graph. A reviewed key overlay
+    that names a key that is not sensitive is the remedy;
+  - a load whose include list is empty, which loads every table, is governed and
+    checked as the load of every table; the policy used to be asked about none.
+
+  Outside a control plane these do not change.
+  **Upgrading a control-plane deployment:** register a target with the new
+  `r2g target add` for every project whose endpoint and database no registered target
+  matches, with `--project` to keep it for that project. `r2g target list` and
+  `r2g target remove` complete it.
+
+- **The sensitive-field gate covers field expressions and migrations.** The gate
+  excluded a sensitive field's source columns, but a field expression reads its
+  columns from the row whether they are excluded or not, so an expression over a
+  sensitive column (`@ssn`, or `CONCAT(@name, @ssn)`) loaded what it computed, and so
+  did one that read a column without declaring it. A field is now rated by every column
+  its expressions reference, and a field the gate excludes loses its expressions too. A
+  field counts as masked only when each of its expressions is the mask the Studio's
+  "mask this field" writes, not because a description carries the mask marker, or
+  because a mask sits beside a second expression for the same property. A mapping that
+  maps one table with two document collections is refused: a load only ever wrote one
+  of them, so the gate could exclude a column from the other, and a migration could ask
+  the policy about one and rewrite the other. A migration
+  (`POST /api/projects/{name}/migrate`) now checks the mapping as a load does, and
+  applies the same gate, taking `allow_sensitive` and `sensitivity_threshold` likewise:
+  it used to reload a gated load's collections without the gate, and to send an
+  expression it could not check to ArangoDB as AQL. The migration plan
+  (`GET /api/projects/{name}/migration-plan`) is gated the same way, so it plans what
+  the migration does. The entitlement report (`r2g entitlements report`, and its
+  `key_exposures` in JSON) names every sensitive column a load would write into a key. A migration after a load with `allow_sensitive` now
+  needs `allow_sensitive` too, or it removes the sensitive fields that load wrote.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added

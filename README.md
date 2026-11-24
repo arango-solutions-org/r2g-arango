@@ -586,6 +586,9 @@ The load API also accepts `emit_governance` / `tier_layout` to drop the artifact
 
 | Command | Description |
 |---|---|
+| `target add` | Register an ArangoDB target (`--name`, `--endpoint`, `--database`, `--username`, `--password`; honours `ARANGO_*`); under a control plane, projects are created only on registered targets, and `--project NAME` registers it for that one project |
+| `target list` | List registered targets (passwords never shown) |
+| `target remove` | Remove a registered target |
 | `secrets init` | Initialize (or replace) the on-disk catalog secret key; respects `R2G_SECRET_KEY` |
 | `secrets migrate` | Force-encrypt every secret in the catalog with the active key |
 | `secrets status` | Show where the active secret key is coming from |
