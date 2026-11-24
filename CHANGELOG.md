@@ -36,8 +36,45 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cdc-start --source` for PostgreSQL** reads the slot through a catalog source's connection
   string. An explicit `--source` wins over a `PG_CONN` set in the environment or `.env`.
 
+### Changed
+
+- **Under a control plane, a project sees only its own source, target and catalog (#61, PRD
+  P14.16).** Once the transformation project the control plane opens exists, the source, target
+  and catalog lists show only its source, the target its loads write to and the catalog its
+  source was imported from. A route about another one answers "not found", as for a name the
+  tenant does not have. Shared-key inference reads only the project's sources. Before the
+  project exists, the Studio still creates it from the tenant's sources. Without
+  `CONTROL_PLANE_URL` nothing changes.
+- **A table without a primary key gets a deterministic key, so its edges load (#108, PRD
+  known edge cases).** Each row is keyed by every column in schema order, with NULL written as
+  `%null` and keys over 200 characters hashed. Vertices, the edges that reference them and
+  PostgreSQL change capture build the key the same way, so a DELETE carrying the full old row
+  (`REPLICA IDENTITY FULL`) now removes the document. Identical rows collapse to one document,
+  and so do distinct rows whose values join to the same key (`('x_y', 'z')` and `('x', 'y_z')`
+  with the default `_` separator), as composite primary keys already do. An UPDATE to such a
+  row changes its key, so change capture writes a new document and the old one stays (known
+  limitation). The CSV-direct path still gives such a table no edges, and Snowflake stream
+  recovery still refuses such an object. **Upgrade:** a graph loaded before this change holds
+  these documents under keys ArangoDB generated; reload keyless tables and the edges that start
+  from them with `--drop-collections`, otherwise every document exists twice. In the `lpg`
+  layout `--drop-collections` drops the shared node and edge collections, so an `lpg` graph
+  needs a full reload.
+
 ### Fixed
 
+- **`r2g secrets init` and `r2g secrets status` use the catalog's directory.** They
+  hardwired `~/.r2g/secret.key`, while the catalog reads `secret.key` from its own
+  directory and honours `R2G_CATALOG_DIR`. With that variable set (the control-plane
+  image sets it), `status` reported a file that did not exist and `init` wrote a second
+  key the catalog never read. Both now resolve the directory as the catalog does;
+  `R2G_CATALOG_DIR` is documented in the README and `.env.example`.
+- **CSV-direct import scripts build composite keys with the mapping's
+  `key_separator`.** `r2g generate-csv-import` and the Studio's CSV-mode import
+  preview joined composite primary and foreign keys with a hardcoded `_`, while every
+  other load path uses the mapping's separator. With any other separator a CSV-direct
+  load wrote documents and edge endpoints that a later stream or CDC run could not
+  find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
+  is now refused with a pointer to JSONL mode.
 - **CSI export honors `include_fields` and `exclude_fields` on renamed columns (related to #91, PRD
   P12.1).** A rename whose source column was filtered out was still exported as a property. It is
   now omitted, with or without a schema, unless a field expression also targets it. A curated label

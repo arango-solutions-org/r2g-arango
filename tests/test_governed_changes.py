@@ -127,7 +127,11 @@ SCHEMA = Schema(tables={
 @pytest.fixture
 def studio(cp: Library, tmp_path: Path) -> TestClient:
     catalog = CatalogManager(tmp_path)
-    catalog.add_source("library-csv", "csv", str(tmp_path))
+    # The project's own catalog and target (P14.16), so a refusal below is the refusal,
+    # not "not found".
+    catalog.add_catalog("c", "openmetadata", "http://om.test")
+    catalog.add_source("library-csv", "csv", str(tmp_path), catalog_name="c")
+    catalog.add_target("t", endpoint="http://db.test:8529", database="library")
     catalog.create_snapshot("library-csv", SCHEMA)
     path = tmp_path / "projects" / "library-catalog" / "mapping.yaml"
     path.parent.mkdir(parents=True)

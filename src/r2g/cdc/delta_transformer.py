@@ -16,7 +16,7 @@ from r2g.cdc.models import (
     ChangeEvent,
     ChangeOperation,
 )
-from r2g.keys import sanitize_key_component
+from r2g.keys import row_key
 from r2g.log import get_logger
 from r2g.transformers.edge_transformer import EdgeTransformer
 from r2g.transformers.node_transformer import NodeTransformer
@@ -191,15 +191,16 @@ class DeltaTransformer:
         self, table_name: str, row: dict[str, Any]
     ) -> str | None:
         table_def = self.schema.tables.get(table_name)
-        if table_def is None or not table_def.primary_key:
+        if table_def is None:
             return None
-        parts = []
-        for pk in table_def.primary_key:
-            val = row.get(pk)
-            if val is None:
-                return None
-            parts.append(sanitize_key_component(val))
-        key = self.config.key_separator.join(parts)
+        if not table_def.primary_key and any(c.name not in row for c in table_def.columns):
+            # A keyless table is keyed by every column, so only the full old row
+            # (Postgres: REPLICA IDENTITY FULL) can address its document.
+            return None
+        try:
+            key = row_key(table_def, row, self.config.key_separator)
+        except ValueError:  # a PK column missing from the old row
+            return None
         if self._lpg is not None:
             # This key is built here rather than by NodeTransformer (a delete
             # carries only the old row), so the label namespace has to be

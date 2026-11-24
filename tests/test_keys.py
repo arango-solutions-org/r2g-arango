@@ -81,3 +81,52 @@ class TestTimestampPkKeysAreLegalAndConsistent:
         # endpoint resolves during graph traversal.
         assert edge["_from"] == f"payment/{node_key}"
         assert all(ch in _LEGAL for ch in edge["_from"].split("/", 1)[1])
+
+
+def _hero_power_table():
+    # A link table with no primary key, as in BIRD's superhero.hero_power.
+    return Table(
+        name="hero_power",
+        columns=[Column(name="hero_id", data_type="integer"), Column(name="power_id", data_type="integer")],
+        primary_key=[],
+    )
+
+
+class TestKeylessTableGetsEdges:
+    EDGE = EdgeDefinition(
+        edge_collection="hero_power_to_superhero",
+        from_collection="hero_power",
+        to_collection="superhero",
+        from_field="hero_id",
+        to_field="id",
+    )
+
+    def test_edge_from_matches_node_key(self):
+        # Regression: the vertex got an auto-generated key and the edge was dropped.
+        row = {"hero_id": 1, "power_id": 18}
+        node_key = NodeTransformer(_hero_power_table()).transform_row(row)["_key"]
+        edge = EdgeTransformer(self.EDGE, _hero_power_table()).transform_row(row)
+        assert node_key == "1_18"
+        assert edge is not None and edge["_from"] == "hero_power/1_18"
+
+    def test_null_differs_from_every_value(self):
+        nt = NodeTransformer(_hero_power_table())
+        keys = {nt.transform_row({"hero_id": 1, "power_id": v})["_key"] for v in (None, "", "%null")}
+        assert len(keys) == 3
+        assert all(all(ch in _LEGAL for ch in k) for k in keys)
+
+    def test_long_key_is_hashed_to_a_legal_length(self):
+        table = Table(name="notes", columns=[Column(name="body", data_type="text")], primary_key=[])
+        key = NodeTransformer(table).transform_row({"body": "x" * 500})["_key"]
+        assert len(key) <= 254 and all(ch in _LEGAL for ch in key)
+        assert key == NodeTransformer(table).transform_row({"body": "x" * 500})["_key"]
+
+    def test_distinct_rows_joining_to_the_same_key_collapse(self):
+        # Documented limitation, shared with composite PKs: the separator is not escaped.
+        table = Table(
+            name="pairs",
+            columns=[Column(name="a", data_type="text"), Column(name="b", data_type="text")],
+            primary_key=[],
+        )
+        nt = NodeTransformer(table)
+        assert nt.transform_row({"a": "x_y", "b": "z"})["_key"] == nt.transform_row({"a": "x", "b": "y_z"})["_key"]
