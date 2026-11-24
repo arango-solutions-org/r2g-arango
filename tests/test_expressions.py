@@ -225,3 +225,24 @@ class TestCompiledExpression:
         c = compile_expression("UPPER(@s)")
         assert c.evaluate({"s": "ada"}) == "ADA"
         assert c.evaluate({"s": "lovelace"}) == "LOVELACE"
+
+
+
+class TestDigests:
+    """``MD5``/``SHA512``: the Studio's hash and tokenize masks, evaluated here."""
+
+    @pytest.mark.parametrize("fn, algo", [("MD5", "md5"), ("SHA512", "sha512")])
+    def test_lower_case_hex_of_the_text(self, fn, algo):
+        import hashlib
+
+        expr = compile_expression(f"{fn}(TO_STRING(@v))")
+        assert expr.evaluate({"v": "123-45-6789"}) == hashlib.new(
+            algo, b"123-45-6789").hexdigest()
+        assert expr.evaluate({"v": 42.0}) == hashlib.new(algo, b"42").hexdigest()
+
+    def test_a_blank_stays_blank(self):
+        assert compile_expression("MD5(@v)").evaluate({"v": None}) is None
+
+    def test_one_argument(self):
+        with pytest.raises(ExpressionError):
+            compile_expression("MD5(@a, @b)").evaluate({"a": "x", "b": "y"})

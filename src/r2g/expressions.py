@@ -15,7 +15,8 @@ not AQL at all. See P5c.1.4 before changing behaviour toward AQL parity.
 - Ternary: ``cond ? a : b``
 - Function calls (case-insensitive): ``CONCAT``, ``CONCAT_SEPARATOR``, ``UPPER``,
   ``LOWER``, ``SUBSTRING``, ``LENGTH``, ``LTRIM``, ``RTRIM``, ``TRIM``,
-  ``TO_STRING``, ``TO_NUMBER``, ``TO_BOOL``, ``CONTAINS``, ``COALESCE``
+  ``TO_STRING``, ``TO_NUMBER``, ``TO_BOOL``, ``CONTAINS``, ``COALESCE``, ``MD5``,
+  ``SHA512`` (a digest is ArangoDB's: lower-case hex of the UTF-8 text)
 
 Anything outside this subset raises :class:`ExpressionError` at compile time
 so the streaming path can fall back to server-side delegation (per the PRD
@@ -34,6 +35,7 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
@@ -433,6 +435,21 @@ def _fn_contains(args: list[Any]) -> bool | None:
     return _to_string(needle) in _to_string(s)
 
 
+def _digest(algorithm: str) -> Callable[[list[Any]], str | None]:
+    """``MD5`` / ``SHA512``: the lower-case hex digest of a value's text, as ArangoDB's
+    functions of the same name return it. A blank stays blank, as every function here
+    keeps it (ArangoDB would digest the empty text instead)."""
+
+    def fn(args: list[Any]) -> str | None:
+        if len(args) != 1:
+            raise ExpressionError(f"{algorithm.upper()} takes 1 argument")
+        if args[0] is None:
+            return None
+        return hashlib.new(algorithm, _to_string(args[0]).encode("utf-8")).hexdigest()
+
+    return fn
+
+
 def _fn_coalesce(args: list[Any]) -> Any:
     for a in args:
         if a is not None:
@@ -455,6 +472,10 @@ _FUNCS: dict[str, Callable[[list[Any]], Any]] = {
     "TO_BOOL": lambda a: _to_bool(a[0]),
     "CONTAINS": _fn_contains,
     "COALESCE": _fn_coalesce,
+    # The Studio's hash and tokenize masks (masking.py) use these; evaluated here, a
+    # mapping that masks a field passes validation and loads on every path.
+    "MD5": _digest("md5"),
+    "SHA512": _digest("sha512"),
 }
 
 

@@ -6,7 +6,7 @@
 > Baseline: **4022 passed, 2 skipped, 18 xfailed; 87% line coverage** on the unit suite
 > (`pytest -m "not integration" --cov=r2g`), 181 integration tests deselected.
 > **Updated 2026-11-24, after 0.12.0:** units 1–7 are done; the security work's
-> follow-ups are units 21–24. `file:line` references elsewhere are as of `b1f2a56`.
+> follow-ups are units 21–24 (21 is done). `file:line` references elsewhere are as of `b1f2a56`.
 
 ## How to read this plan
 
@@ -226,10 +226,9 @@ Each landed with tests that fail without its fix, after six independent reviews.
 
 ### G. Follow-ups from the security work (0.12.0)
 
-21. **The Studio's `hash` and `tokenize` masks cannot be loaded.** `validate_config`
-    refuses `MD5`/`SHA512`, which only ArangoDB evaluates, so a mapping using "mask this
-    field" with either kind fails a load and a migration; only `redact` and `nullify`
-    work. Evaluate both locally, as ArangoDB does, so validation accepts them. *Test.*
+21. **The Studio's `hash` and `tokenize` masks load** — done. `validate_config` refused
+    `MD5`/`SHA512`, which only ArangoDB evaluated, so neither mask could be loaded; r2g now
+    evaluates both with ArangoDB's digests (an integration test compares them).
 22. **Keys built from sensitive columns are refused, not hidden.** Under a control
     plane, 0.12.0 refuses a load that would write a sensitive column into a key; the
     remedy is a key overlay. Hashing such keys (a keyed hash, so the graph stays

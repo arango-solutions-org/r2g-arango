@@ -10,10 +10,10 @@ kinds are provided:
 - ``redact``   – constant ``"***"`` (value destroyed)
 - ``nullify``  – ``null`` (value dropped but property kept)
 
-``hash``/``tokenize`` use AQL functions outside the local expression subset, so
-they are evaluated **server-side** by ArangoDB at load (the pipeline's existing
-delegation path) and therefore work for every source type. ``redact``/``nullify``
-compile locally.
+All four compile in the local expression evaluator, so a masked mapping passes
+validation and loads the same way on every path. ``hash``/``tokenize`` digest the
+value's text as ArangoDB's ``MD5``/``SHA512`` do (lower-case hex); a blank value stays
+blank rather than becoming the digest of empty text.
 
 Masking expressions are tagged with a sentinel in ``FieldExpression.description``
 so the entitlement gate can recognise a field as masked (and therefore safe to

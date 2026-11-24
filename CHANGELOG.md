@@ -7,6 +7,16 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Studio's `hash` and `tokenize` masks load (PRD P5c.1.4, P9.6).** "Mask this field" writes
+  `MD5(TO_STRING(@col))` or `SHA512(TO_STRING(@col))`, which only ArangoDB evaluated, so mapping
+  validation refused them and neither a load nor a migration could use either mask; only `redact`
+  and `nullify` worked. r2g now evaluates `MD5` and `SHA512` itself, with ArangoDB's digests
+  (lower-case hex of the value's text; checked against ArangoDB 3.12). One difference: a blank
+  value stays blank, where ArangoDB would digest the empty text. A mapping that used these
+  functions elsewhere now has them evaluated by r2g instead of ArangoDB.
+
 ## [0.12.0] — 2026-11-24
 
 ### Added

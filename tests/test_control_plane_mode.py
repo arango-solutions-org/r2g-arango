@@ -983,14 +983,24 @@ class TestTheGateHoldsUnderAControlPlane:
                           json={"exclude_tables": ["t"]})
         assert r.status_code == 202, r.text
 
-    def test_a_mask_still_loads(self, governed, setup):
+    @pytest.mark.parametrize("kind", ["redact", "nullify", "hash", "tokenize"])
+    def test_every_mask_the_studio_offers_loads(self, governed, setup, kind):
+        """Each kind of "mask this field" passes validation and the gate, and loads a
+        value that is not the column's. ``hash`` and ``tokenize`` were refused by
+        validation, because their functions ran only in ArangoDB."""
+        import yaml
+
+        from r2g.masking import make_mask_expression
+
         tmp_path, configs = setup
+        fx = make_mask_expression("ssn", kind).model_dump(exclude_none=True)
         (tmp_path / "customer-360.yaml").write_text(self.PLAIN.replace(
-            "edges", "    field_expressions:\n      - {target: ssn, sources: [ssn], "
-            "expression: '\"***\"', description: 'r2g:mask:redact'}\nedges"))
+            "edges", "    field_expressions:\n      - " + yaml.safe_dump(
+                fx, default_flow_style=True).strip() + "\nedges"))
         r = governed.post("/api/projects/customer-360/load", headers=bearer(), json={})
         assert r.status_code == 202, r.text
-        assert self._document(tmp_path, configs[-1])["ssn"] == "***"
+        doc = self._document(tmp_path, configs[-1])
+        assert "ssn" in doc and doc["ssn"] != self.ROW["ssn"]
 
     def test_a_migration_reloads_nothing_the_gate_excluded(self, governed, setup):
         tmp_path, configs = setup
