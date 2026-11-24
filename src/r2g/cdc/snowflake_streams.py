@@ -98,9 +98,9 @@ from r2g.cdc.models import ArangoDelta, ArangoOperation, ChangeEvent, ChangeOper
 from r2g.connectors.snowflake import (
     _load_snowflake_connector,
     _parse_snowflake_url,
-    _safe_connection_error,
 )
 from r2g.log import get_logger
+from r2g.security import connection_error, secrets_in
 from r2g.types import MappingConfig, Schema
 
 logger = get_logger(__name__)
@@ -529,10 +529,9 @@ class SnowflakeStreamListener:
             try:
                 self._conn = connect(**self._connect_params)
             except Exception as err:
-                raise RuntimeError(
-                    "Failed to connect to Snowflake: "
-                    f"{_safe_connection_error(err, self._connect_params)}"
-                ) from err
+                raise connection_error(
+                    "Failed to connect to Snowflake", err, secrets_in(self._connect_params)
+                ) from None
             self._sink_ready = False
         return self._conn
 

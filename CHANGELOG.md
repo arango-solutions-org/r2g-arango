@@ -62,6 +62,18 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed connection can no longer print a credential (#118).** MySQL, SQL Server and
+  PostgreSQL put the driver's error text in their message and chained the driver's exception,
+  which any traceback prints raw. Snowflake masked its message, but only the password as given,
+  not percent-encoded, and then chained the raw exception too. ClickHouse and the PostgreSQL
+  CDC listener didn't wrap the connection at all. Every source connector, its bulk-read
+  session, `preview_table_rows`, and both CDC listeners now mask every credential in the
+  connection string or parameters (raw, decoded and percent-encoded) and raise without the
+  driver's exception attached. A failed connection reads `Failed to connect to MySQL:
+  OperationalError: <driver text, credentials masked>`. The helpers (`secrets_in`, `redact`,
+  `connection_error` in `r2g.security`) mirror relational-schema-analyzer 0.16's `redact`
+  module, so r2g can import that once it requires RSA 0.16. This closes a gap against PRD
+  P6.1, which says passwords and key paths must not appear in client errors.
 - **`r2g secrets init` and `r2g secrets status` use the catalog's directory.** They
   hardwired `~/.r2g/secret.key`, while the catalog reads `secret.key` from its own
   directory and honours `R2G_CATALOG_DIR`. With that variable set (the control-plane

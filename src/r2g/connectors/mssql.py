@@ -58,6 +58,7 @@ from typing import Any, Iterator, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 from r2g.log import get_logger
+from r2g.security import connection_error, secrets_in
 from r2g.types import Column, ForeignKey, Schema, Table
 
 logger = get_logger(__name__)
@@ -148,7 +149,11 @@ class SQLServerConnector:
         try:
             return pymssql.connect(**self._connect_params)
         except Exception as err:
-            raise RuntimeError(f"Failed to connect to SQL Server: {err}") from err
+            raise connection_error(
+                "Failed to connect to SQL Server",
+                err,
+                secrets_in(self._connect_params, self.connection_string),
+            ) from None
 
     def open_session(self) -> "SQLServerSession":
         """Open a bulk-read session for streaming / dumps."""
@@ -318,7 +323,11 @@ class SQLServerSession:
             try:
                 self._conn = pymssql.connect(**self._connect_params)
             except Exception as err:
-                raise RuntimeError(f"Failed to connect to SQL Server: {err}") from err
+                raise connection_error(
+                    "Failed to connect to SQL Server",
+                    err,
+                    secrets_in(self._connect_params, self.connection_string),
+                ) from None
         return self._conn
 
     def close(self) -> None:

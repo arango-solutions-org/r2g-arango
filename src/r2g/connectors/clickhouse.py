@@ -27,6 +27,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from r2g.log import get_logger
+from r2g.security import connection_error, secrets_in
 from r2g.types import Column, Schema, Table
 
 logger = get_logger(__name__)
@@ -54,7 +55,12 @@ def _database_of(connection_string: str) -> str:
 def _get_client(connection_string: str) -> Any:
     import clickhouse_connect  # lazy: optional extra
 
-    return clickhouse_connect.get_client(dsn=connection_string)
+    try:
+        return clickhouse_connect.get_client(dsn=connection_string)
+    except Exception as err:
+        raise connection_error(
+            "Failed to connect to ClickHouse", err, secrets_in(connection_string)
+        ) from None
 
 
 class ClickHouseConnector:
