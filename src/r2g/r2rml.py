@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from .security import one_line
 from .types import MappingConfig, Schema, Table
 
 # Class/property IRI namespace. Defaults to the AQL leg's synthetic concept
@@ -351,7 +352,7 @@ def mapping_to_r2rml(
             )
             if computed:
                 notes.append(
-                    f"# NOTE: computed properties omitted (need SQL): {computed}"
+                    f"# NOTE: computed properties omitted (need SQL): {one_line(computed)}"
                 )
 
         block = f"<#{entity}>\n" + " ;\n".join(preds) + " ."
@@ -364,7 +365,7 @@ def mapping_to_r2rml(
             "# Skipped edges (endpoint not a mapped document entity — e.g. "
             "join-table M2M):"
         )
-        lines.extend(f"#   {e}" for e in skipped_edges)
+        lines.extend(f"#   {one_line(e)}" for e in skipped_edges)
         lines.append("")
 
     return "\n".join(lines) + "\n"

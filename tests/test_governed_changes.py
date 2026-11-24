@@ -475,6 +475,13 @@ def test_what_a_load_writes():
     assert len(load_items(mapping(), exclude=["loans"])) == 4
 
 
+def test_an_empty_include_list_governs_every_table():
+    """The pipeline reads an empty include list as every table, so the policy is asked
+    about every table; before, it was asked about none while every table was loaded."""
+    assert load_items(mapping(), include=[]) == load_items(mapping())
+    assert load_collections(mapping(), include=[]) == load_collections(mapping())
+
+
 def test_a_load_is_refused_whole_if_one_collection_is(studio, cp, no_database, tmp_path):
     r = studio.post("/api/projects/library-catalog/load", headers=as_(ANALYST),
                     json={"include_tables": ["authors", "books"]})
@@ -557,6 +564,7 @@ def test_creating_reads_no_mapping_file_outside_the_tenants_folder(cp, tmp_path)
     other.write_text(yaml.safe_dump(library()))
     catalog_dir = tmp_path / "local"
     CatalogManager(catalog_dir).add_source("library-csv", "csv", str(tmp_path))
+    CatalogManager(catalog_dir).add_target("library-db", database="library")
     client = TestClient(create_app(catalog_dir=str(catalog_dir), host="0.0.0.0"))
     body = {"name": "library-catalog", "source_name": "library-csv",
             "mapping_config_path": str(other), "arango_database": "library"}
@@ -576,6 +584,7 @@ def test_creating_reads_no_mapping_file_outside_the_tenants_folder(cp, tmp_path)
 def test_the_mapping_a_project_starts_with_is_checked_as_a_save(cp, tmp_path):
     catalog_dir = tmp_path / "local"
     CatalogManager(catalog_dir).add_source("library-csv", "csv", str(tmp_path))
+    CatalogManager(catalog_dir).add_target("library-db", database="library")
     (catalog_dir / "seed.yaml").write_text(yaml.safe_dump(library()))
     client = TestClient(create_app(catalog_dir=str(catalog_dir), host="0.0.0.0"))
     body = {"name": "library-catalog", "source_name": "library-csv", "arango_database": "library",
@@ -703,6 +712,7 @@ def test_creating_reads_no_mapping_from_another_projects_folder(cp, tmp_path):
     catalog_dir = tmp_path / "local"
     catalog = CatalogManager(catalog_dir)
     catalog.add_source("library-csv", "csv", str(tmp_path))
+    catalog.add_target("library-db", database="library")
     other = catalog_dir / "projects" / "payroll" / "mapping.yaml"
     other.parent.mkdir(parents=True)
     other.write_text(yaml.safe_dump(library()))
@@ -774,6 +784,7 @@ def test_a_suggestion_does_not_send_the_sources_values(studio, monkeypatch):
 def test_a_project_starting_from_a_left_over_mapping_is_checked_on_it(cp, tmp_path):
     catalog_dir = tmp_path / "local"
     CatalogManager(catalog_dir).add_source("library-csv", "csv", str(tmp_path))
+    CatalogManager(catalog_dir).add_target("library-db", database="library")
     left = catalog_dir / "projects" / "library-catalog" / "mapping.yaml"
     left.parent.mkdir(parents=True)
     left.write_text(yaml.safe_dump(library()))  # a project deleted outside the Studio

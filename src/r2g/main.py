@@ -1370,8 +1370,9 @@ def dump_tables(
     (or a subset if --tables is specified). Output files are named <table>.csv.
     """
     import psycopg
+    from psycopg import sql as pg_sql
 
-    from r2g.connectors.base import create_source_connector
+    from r2g.connectors.base import create_source_connector, table_output_file
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1399,8 +1400,10 @@ def dump_tables(
 
         with psycopg.connect(connection_string) as conn:
             for tbl in table_names:
-                csv_path = out / f"{tbl}.csv"
-                copy_sql = f"COPY {schema_filter}.{tbl} TO STDOUT WITH CSV HEADER"
+                csv_path = table_output_file(out, tbl)
+                copy_sql = pg_sql.SQL("COPY {} TO STDOUT WITH CSV HEADER").format(
+                    pg_sql.Identifier(pg_schema_name, tbl)
+                )
                 with csv_path.open("wb") as f:
                     with conn.cursor().copy(copy_sql) as copy:
                         for chunk in copy:
@@ -2293,9 +2296,10 @@ def mcp_cmd(
 
     import uvicorn
 
-    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+    from r2g.security import LOOPBACK_HOSTS
+
     token = (os.environ.get("R2G_API_TOKEN") or "").strip()
-    require_auth = bool(token) or host not in _LOOPBACK_HOSTS
+    require_auth = bool(token) or host not in LOOPBACK_HOSTS
     if require_auth and not token:
         token = secrets.token_urlsafe(32)
 
@@ -2581,7 +2585,7 @@ def source_dump(
     so PostgreSQL goes through ``COPY TO STDOUT`` and Snowflake streams
     through the cursor; both produce comma-separated, header-row CSV.
     """
-    from r2g.connectors.base import create_source_connector
+    from r2g.connectors.base import create_source_connector, table_output_file
 
     mgr = _get_catalog()
     source = mgr.get_source(name)
@@ -2631,8 +2635,8 @@ def source_dump(
     try:
         total_rows = 0
         for tbl in table_names:
-            csv_path = out / f"{tbl}.csv"
             try:
+                csv_path = table_output_file(out, tbl)
                 rows = session.dump_table_to_csv(tbl, csv_path)
             except Exception as err:  # noqa: BLE001
                 log.exception("source_dump_table_failed", source=name, table=tbl)
@@ -3830,6 +3834,14 @@ def entitlements_report(
             "by default (pass --allow-sensitive to override, or mask them). r2g advises; "
             "the serving layer enforces."
         )
+    for exposure in report.key_exposures:
+        console.print(
+            f"[yellow]Warning:[/yellow] {escape(exposure.source_table)}."
+            f"{escape(exposure.column)} ({exposure.level}) is written into the keys of "
+            f"{escape(exposure.collection)}; the gate "
+            "cannot exclude a key. A reviewed key overlay naming a key that is not "
+            "sensitive keeps it out (under a control plane such a load is refused)."
+        )
 
 
 @entitlements_app.command("emit")
@@ -4300,6 +4312,72 @@ def history_cmd(
             r.started_at.isoformat(),
         )
     console.print(table)
+
+
+target_app = typer.Typer(help="Manage ArangoDB targets (where projects load to).")
+app.add_typer(target_app, name="target")
+
+
+@target_app.command("add")
+def target_add(
+    name: str = typer.Option(..., "--name", help="Target name"),
+    endpoint: str = typer.Option(
+        "http://localhost:8529", "--endpoint", help="ArangoDB endpoint", envvar="ARANGO_ENDPOINT",
+    ),
+    database: str = typer.Option(
+        ..., "--database", help="ArangoDB database name", envvar="ARANGO_DB",
+    ),
+    username: str = typer.Option(
+        "root", "--username", help="ArangoDB username", envvar="ARANGO_USER",
+    ),
+    password: str = typer.Option(
+        "", "--password", help="ArangoDB password (stored encrypted)", envvar="ARANGO_PASSWORD",
+    ),
+    description: str = typer.Option("", "--description", help="Description"),
+    project: Optional[str] = typer.Option(
+        None, "--project",
+        help="Under a control plane, the one transformation project that may use it",
+    ),
+) -> None:
+    """Register an ArangoDB target.
+
+    Under a control plane the Studio does not add targets, and a project can be created
+    only on one registered here (PRD P14.18); run this against the tenant's catalog
+    (``R2G_CATALOG_DIR``). With ``--project``, only that project is created on it and
+    loads to it; without, the first project created on it takes it.
+    """
+    try:
+        _get_catalog().add_target(name, endpoint, database, username, password, description,
+                                  project=project)
+    except ValueError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Target '{name}' registered ({endpoint}, database {database}).[/green]")
+
+
+@target_app.command("list")
+def target_list() -> None:
+    """List registered ArangoDB targets (passwords are never shown)."""
+    targets = _get_catalog().list_targets()
+    if not targets:
+        console.print("[dim]No targets registered.[/dim]")
+        return
+    table = RichTable(title="Targets")
+    for col in ("Name", "Endpoint", "Database", "Username", "Project", "Description"):
+        table.add_column(col)
+    for t in targets:
+        table.add_row(t.name, t.endpoint, t.database, t.username, t.project or "",
+                      t.description)
+    console.print(table)
+
+
+@target_app.command("remove")
+def target_remove(name: str = typer.Argument(..., help="Target name to remove")) -> None:
+    """Remove a registered ArangoDB target."""
+    if not _get_catalog().remove_target(name):
+        console.print(f"[red]Target '{name}' not found.[/red]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Target '{name}' removed.[/green]")
 
 
 secrets_app = typer.Typer(help="Manage the R2G catalog secret key.")

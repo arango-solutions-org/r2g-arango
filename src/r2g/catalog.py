@@ -101,6 +101,17 @@ class TargetConfig(BaseModel):
     description: str = ""
     created_at: datetime
     updated_at: datetime
+    #: The one transformation project this target is registered for, under a control
+    #: plane (``r2g target add --project``, P14.18): no other project is created on it
+    #: or loads to it. Written only when set, so existing targets re-save unchanged.
+    project: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        out = handler(self)
+        if out.get("project") is None:
+            out.pop("project", None)
+        return out
 
 
 class CatalogProviderConfig(BaseModel):
@@ -793,6 +804,7 @@ class CatalogManager:
         username: str = "root",
         password: str = "",
         description: str = "",
+        project: str | None = None,
     ) -> TargetConfig:
         catalog = self._load()
         if name in catalog.targets:
@@ -807,6 +819,7 @@ class CatalogManager:
             description=description,
             created_at=now,
             updated_at=now,
+            project=project,
         )
         catalog.targets[name] = target
         self._save(catalog)

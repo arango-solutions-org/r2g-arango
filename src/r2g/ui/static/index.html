@@ -3630,7 +3630,7 @@ function showSourceProps(tableName) {
       <div class="prop-group-title">Mapping</div>
       <div class="prop-row"><span class="prop-label">Target</span><span class="prop-value" style="color:var(--green)">${escHtml(targetName)}</span></div>
       <div class="prop-row"><span class="prop-label">Columns</span><span class="prop-value">${tableInfo.columns.length}</span></div>
-      <div class="prop-row"><span class="prop-label">Primary Key</span><span class="prop-value">${(tableInfo.pk || []).join(', ') || '\u2013'}</span></div>
+      <div class="prop-row"><span class="prop-label">Primary Key</span><span class="prop-value">${escHtml((tableInfo.pk || []).join(', ')) || '\u2013'}</span></div>
     </div>`;
 
   if (collKey) {
@@ -4232,7 +4232,7 @@ function renderExprSources() {
   const cols = tableInfo ? tableInfo.columns : [];
   const active = new Set(exprEditorState.sources);
   host.innerHTML = cols.map(c => `
-    <span class="expr-source-chip${active.has(c.name) ? ' active' : ''}" data-col="${c.name}">@${c.name}</span>
+    <span class="expr-source-chip${active.has(c.name) ? ' active' : ''}" data-col="${escHtml(c.name)}">@${escHtml(c.name)}</span>
   `).join('');
   host.querySelectorAll('.expr-source-chip').forEach(chip => {
     chip.addEventListener('click', () => {
@@ -4443,7 +4443,8 @@ document.addEventListener('keydown', e => {
 
 async function previewTable(sourceName, tableName) {
   try {
-    const data = await apiFetch(`/api/sources/${sourceName}/preview/${tableName}?limit=20`);
+    const data = await apiFetch(
+      `/api/sources/${encodeURIComponent(sourceName)}/preview/${encodeURIComponent(tableName)}?limit=20`);
     const rows = Array.isArray(data) ? data : (data.rows || data.data || []);
     if (!rows.length) {
       openModal('Preview: ' + tableName, '<div class="empty-state">No rows returned</div>');
@@ -4451,13 +4452,14 @@ async function previewTable(sourceName, tableName) {
     }
     const cols = Object.keys(rows[0]);
     let html = '<div style="overflow-x:auto;"><table class="data-table"><thead><tr>';
-    cols.forEach(c => { html += `<th>${c}</th>`; });
+    // Column names and values are the source's data: every one is escaped, attribute too.
+    cols.forEach(c => { html += `<th>${escHtml(c)}</th>`; });
     html += '</tr></thead><tbody>';
     rows.forEach(r => {
       html += '<tr>';
       cols.forEach(c => {
         const v = r[c];
-        html += `<td title="${String(v ?? '')}">${v === null ? '<span style="color:var(--text-muted)">NULL</span>' : escHtml(String(v))}</td>`;
+        html += `<td title="${escHtml(String(v ?? ''))}">${v === null ? '<span style="color:var(--text-muted)">NULL</span>' : escHtml(String(v))}</td>`;
       });
       html += '</tr>';
     });

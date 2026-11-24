@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from r2g.connectors.base import quote_backtick
 from r2g.log import get_logger
 from r2g.types import Column, Schema, Table
 
@@ -134,7 +135,7 @@ class ClickHouseSession:
         return self._client
 
     def _qualified(self, table: str) -> str:
-        return f"`{self._database}`.`{table}`"
+        return f"{quote_backtick(self._database)}.{quote_backtick(table)}"
 
     def close(self, *, abort: bool = False) -> None:
         if self._client is None:
@@ -161,7 +162,7 @@ class ClickHouseSession:
         sql = f"SELECT count() FROM {self._qualified(table)}"  # noqa: S608 — identifier is backtick-quoted
         params: dict[str, Any] = {}
         if since_column and since_value is not None:
-            sql += f" WHERE `{since_column}` >= {{since:String}}"
+            sql += f" WHERE {quote_backtick(since_column)} >= {{since:String}}"
             params["since"] = since_value
         rows = self._client_or_build().query(sql, parameters=params).result_rows
         return int(rows[0][0]) if rows else 0
@@ -179,7 +180,7 @@ class ClickHouseSession:
         sql = f"SELECT * FROM {qualified}"  # noqa: S608 — identifier is backtick-quoted
         params: dict[str, Any] = {}
         if since_column and since_value is not None:
-            sql += f" WHERE `{since_column}` >= {{since:String}}"
+            sql += f" WHERE {quote_backtick(since_column)} >= {{since:String}}"
             params["since"] = since_value
         client = self._client_or_build()
         columns = [r[0] for r in client.query(f"DESCRIBE TABLE {qualified}").result_rows]
