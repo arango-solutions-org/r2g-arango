@@ -32,6 +32,7 @@ from r2g.generators.arangoimport import (
     ImportCommandSpec,
 )
 from r2g.log import get_logger
+from r2g.security import LOOPBACK_HOSTS
 from r2g.security import redact_source_dump as _redact_source
 from r2g.security import redact_target_dump as _redact_target
 from r2g.streaming.pipeline import StreamingPipeline
@@ -114,7 +115,29 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _running_loads: dict[str, dict[str, Any]] = {}  # load_id -> {"thread", "queue", "pipeline"}
 
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+#: Host names a loopback-bound, open Studio answers to (see ``_local_host_only``).
+_LOCAL_HOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _host_name(header: str) -> str:
+    """The host name in a ``Host`` header, lower-cased and without its port
+    (``[::1]:8501`` gives ``::1``, ``LocalHost:8501`` gives ``localhost``). A header
+    that is not a host and optional port is returned whole, so it names no host."""
+    h = header.strip().lower()
+    if h.startswith("["):
+        name, bracket, rest = h[1:].partition("]")
+        return name if bracket and (rest == "" or re.fullmatch(r":\d+", rest)) else h
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _origin_parts(origin: str) -> tuple[str, str] | None:
+    """The scheme and the host and port of an ``Origin`` header, lower-cased
+    (``http://LocalHost:8501`` gives ``("http", "localhost:8501")``), or ``None`` for
+    ``null`` or anything that is not an origin."""
+    scheme, sep, rest = origin.strip().partition("://")
+    if not sep or scheme.lower() not in ("http", "https") or not rest or "/" in rest:
+        return None
+    return scheme.lower(), rest.lower()
 
 
 #: A route about one transformation project: ``/api/projects/<name>[/...]``.
@@ -322,12 +345,48 @@ def create_app(
 
     # ── Otherwise, optional Bearer-token auth. ──
     token = (api_token or os.environ.get("R2G_API_TOKEN") or "").strip()
-    loopback = host in _LOOPBACK_HOSTS
+    loopback = host in LOOPBACK_HOSTS
     require_auth = not governed and (bool(token) or not loopback)
     if require_auth and not token:
         token = secrets.token_urlsafe(32)
     app.state.api_token = token
     app.state.api_auth_required = require_auth
+
+    if loopback and not require_auth and not governed:
+        # An open Studio trusts that only this machine can reach it. A web page can
+        # rebind its own host name to 127.0.0.1 and then call the API same-origin, so the
+        # open Studio answers only requests addressed to a local name. A token, or a
+        # control plane's context, already stops such a page, so neither needs this, and
+        # a reverse proxy in front of them keeps working.
+        allowed = _LOCAL_HOST_NAMES | {
+            h.strip().lower()
+            for h in os.environ.get("R2G_ALLOWED_HOSTS", "").split(",") if h.strip()
+        }
+
+        @app.middleware("http")
+        async def _local_host_only(request: Request, call_next):
+            if _host_name(request.headers.get("host", "")) not in allowed:
+                return JSONResponse(
+                    {"detail": "This Studio answers only requests addressed to localhost; "
+                               "set R2G_ALLOWED_HOSTS to add another name"},
+                    status_code=400,
+                )
+            # Nor does a page on another site get to change anything: a browser names the
+            # page a request comes from, and a form or a script elsewhere can still send
+            # a request to localhost without being able to read the answer.
+            # Its own pages are same-origin: the Origin names the scheme, host and port
+            # the request was sent to. Another local app (a dev server, a notebook) is not,
+            # unless R2G_CORS_ORIGINS lets it in.
+            origin = request.headers.get("origin")
+            if (origin is not None and request.method not in ("GET", "HEAD", "OPTIONS")
+                    and _origin_parts(origin) != (request.url.scheme,
+                                                  request.headers.get("host", "").strip().lower())
+                    and origin.strip() not in cors_origins):
+                return JSONResponse(
+                    {"detail": "This Studio accepts changes only from its own pages"},
+                    status_code=403,
+                )
+            return await call_next(request)
 
     if require_auth:
         @app.middleware("http")

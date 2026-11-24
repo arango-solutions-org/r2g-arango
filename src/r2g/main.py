@@ -2296,9 +2296,10 @@ def mcp_cmd(
 
     import uvicorn
 
-    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+    from r2g.security import LOOPBACK_HOSTS
+
     token = (os.environ.get("R2G_API_TOKEN") or "").strip()
-    require_auth = bool(token) or host not in _LOOPBACK_HOSTS
+    require_auth = bool(token) or host not in LOOPBACK_HOSTS
     if require_auth and not token:
         token = secrets.token_urlsafe(32)
 

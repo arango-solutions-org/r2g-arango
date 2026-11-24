@@ -145,6 +145,18 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `key_exposures` in JSON) names every sensitive column a load would write into a key. A migration after a load with `allow_sensitive` now
   needs `allow_sensitive` too, or it removes the sensitive fields that load wrote.
 
+- **An open Studio answers only requests addressed to a local name.** Bound to a
+  loopback address with no token, the Studio trusts that only this machine can reach
+  it, but it did not check the `Host` header, so a web page could rebind its own name
+  to 127.0.0.1 and call the API. It now refuses any request not addressed to
+  `localhost`, `127.0.0.1` or `[::1]`. `R2G_ALLOWED_HOSTS` adds names. Nor does it
+  accept a change from a page on another site, another local app included: a request
+  that changes something is refused when it names an `Origin` other than the Studio's
+  own scheme, host and port, or one listed in `R2G_CORS_ORIGINS`. A Studio with a token, or
+  under a control plane, is unchanged. An empty bind address (`--host ""`) listens on
+  every interface, and the Studio and `r2g mcp` no longer treat it as loopback, so it
+  needs a token like any other address others can reach.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added

@@ -228,6 +228,10 @@ def redact_connection_string(url: str) -> str:
     )
 
 
+#: Bind addresses that listen only on this machine, where the Studio and the MCP server
+#: run without a token. Not ``""``: an empty bind address listens on every interface.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
 def one_line(text: str) -> str:
     """``text`` with every control or line-separator character written as its escape.
 
