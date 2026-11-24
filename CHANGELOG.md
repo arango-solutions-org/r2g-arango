@@ -75,6 +75,27 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load wrote documents and edge endpoints that a later stream or CDC run could not
   find. A separator containing `[` or `]`, which `--merge-attributes` cannot express,
   is now refused with a pointer to JSONL mode.
+- **A Forge bulk run replaces what an earlier run wrote (#94).** `BulkWriter`, `write_bulk`,
+  `generate_bulk` and `forge generate --bulk` wrote into whatever `out_dir` held. A second, smaller
+  run left the first run's extra chunk files beside a manifest that did not list them. A run that
+  failed part-way rewrote chunks under the earlier run's `forge.bulk.json`, whose SHA-256s then no
+  longer matched. A run is now written to `out_dir/.forge-staging/` and moved in once every file is
+  written. A run that fails before that leaves `out_dir` as it was, and a failed first run leaves no
+  `out_dir`. A directory where the run writes a file, a `data` that is not a directory, or an
+  `out_dir` or `data` that is not writable fails the run before anything moves. Moving in removes
+  the chunks the earlier manifest lists, each only if it still holds the SHA-256 recorded there, and
+  every file at one of Forge's fixed names (`forge.sql`, `forge.rows.json`, `forge.load.py`, …),
+  whoever wrote it, including those of another mode or dialect. Every other file in `out_dir` is
+  kept, except one at a path the new run writes, which is overwritten as before, and anything at
+  `out_dir/.forge-staging`, which Forge uses as its staging directory and removes. **What changes
+  for a caller:** Forge files from an earlier run of another mode or dialect are removed. A
+  directory where the run writes a file raises `ForgeError` instead of `IsADirectoryError`.
+  `out_dir` and `data/` must be writable directories; a non-writable one is refused before anything
+  changes. While a run moves in, `out_dir` holds the earlier run and the new one in full, about
+  twice the disk of one run; on `main` a run overwrote the earlier chunks in place. A run that fails
+  or is killed while it moves in leaves `out_dir` with no manifest, and its leftover chunks, and the
+  earlier run's, stay until removed by hand. A run killed earlier leaves `out_dir/.forge-staging/`,
+  which the next run removes.
 
 ### Security
 
