@@ -157,6 +157,14 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every interface, and the Studio and `r2g mcp` no longer treat it as loopback, so it
   needs a token like any other address others can reach.
 
+- **The Studio escapes a source's names and data.** Column names and each cell's
+  tooltip were written into the table preview's HTML unescaped, so a value stored in a
+  source row could put markup, and script, into the Studio of whoever previewed that
+  table. The table panel's primary-key list and the expression editor's column chips
+  wrote column names the same way, where whoever clicked the table ran it, under a
+  control plane too. All are now escaped, and the preview request encodes the source
+  and table names.
+
 ## [0.11.1] — 2026-11-19
 
 ### Added
