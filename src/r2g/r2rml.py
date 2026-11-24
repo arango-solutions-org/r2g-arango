@@ -217,7 +217,12 @@ def mapping_to_r2rml(
     # the class IRI the fabric queries with), for resolving FK edge endpoints
     # to the TriplesMaps that host them. Physical table/column names stay in
     # rr:tableName / rr:column / rr:template.
-    from .csi import curated_plan_for_mapping, entity_names_for_mapping, owl_property_name
+    from .csi import (
+        curated_plan_for_mapping,
+        entity_names_for_mapping,
+        is_entity_collection,
+        owl_property_name,
+    )
 
     generated_names, _ = entity_names_for_mapping(config, schema)
 
@@ -239,7 +244,7 @@ def mapping_to_r2rml(
     entity_by_source: Dict[str, str] = {
         cm.source_table: _entity(generated_names[cm.target_collection])
         for cm in config.collections.values()
-        if cm.collection_type != "edge" and not cm.is_join_table
+        if is_entity_collection(cm)
     }
 
     # Group FK relationships by the entity that hosts the referencing object
@@ -271,7 +276,7 @@ def mapping_to_r2rml(
     ]
 
     for cm in config.collections.values():
-        if cm.collection_type == "edge" or cm.is_join_table:
+        if not is_entity_collection(cm):
             continue
         # CC-12 conceptual class name; physical names stay in the logical table.
         generated_entity = generated_names[cm.target_collection]

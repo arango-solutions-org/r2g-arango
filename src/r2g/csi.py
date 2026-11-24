@@ -80,6 +80,21 @@ _ENTITY_STYLE_LPG = "LABEL"
 _RELATIONSHIP_STYLE_LPG = "GENERIC_WITH_TYPE"
 
 
+def is_entity_collection(cm: CollectionMapping) -> bool:
+    """Whether a collection is exported as an entity: exactly when it is loaded as one.
+
+    ``collection_type`` is ``"document"`` or ``"edge"``. The loaders write every
+    ``document`` collection as a node collection, and a flagged join table is one of
+    them until its ``collection_type`` is set to ``"edge"`` (PRD Phase 10: "loaded as
+    a vertex + FK edges"). ``is_join_table`` is a review hint, not a storage decision, so it
+    does not hide that vertex here: hiding it left the CSI with relationships from an
+    entity it never declared and the R2RML with neither of the join table's
+    foreign-key relationships, so the many-to-many link the table carries could not
+    be queried on the relational leg.
+    """
+    return cm.collection_type != "edge"
+
+
 def owl_entity_name(name: str) -> str:
     """Conceptual entity name per the fabric's CC-12 OWL convention.
 
@@ -401,6 +416,141 @@ def _resolve_label_collisions(
     return records
 
 
+def _yield_join_entity_labels(
+    join_entities: List[Dict[str, Any]],
+    settled_entities: List[Dict[str, Any]],
+    physical_entities: Dict[str, Dict[str, Any]],
+    policy: str,
+    *,
+    join_key_labels: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Resolve a join-table entity's label collisions by renaming the join entity only.
+
+    A join table left as a ``document`` collection is exported as an entity (see
+    :func:`is_entity_collection`), and its columns usually repeat labels the
+    entities it links already carry: its foreign-key columns are named after the
+    keys they reference (``student_id``), and junction metadata (``created_at``)
+    often appears on a linked table too. Run through
+    :func:`_resolve_label_collisions` with everything else, those shared labels
+    would rename properties of the linked entities (``Student.studentId`` →
+    ``studentStudentId`` under ``qualify``), so exporting one more entity would
+    change the names a consumer of the CSI already queries by.
+
+    So ``settled_entities`` (every other entity, already resolved) keep their
+    labels, and the join entity yields: each of its labels that a settled entity
+    holds, or that another join entity also holds, is qualified on the join
+    entity — ``enrollmentStudentId``, ``enrollmentCreatedAt``. This is the
+    ``roles`` policy's foreign-key rule (the entity that owns a key keeps the bare
+    label, the one that references it is qualified) applied to every label of a
+    join entity, whose columns all describe the link rather than the entities it
+    links. ``qualify`` concatenates as it does elsewhere; ``roles`` collapses the
+    seam. A declared cross-source join key stays bare on every join entity that
+    carries it, ``warn`` only records, ``off`` skips, and a qualified name that
+    would itself collide is refused and recorded ``unresolved``, as in
+    :func:`_resolve_label_collisions`.
+    Mutates the join entities in place and returns one record per collision.
+    """
+    if policy == "off" or not join_entities:
+        return []
+    join_key_labels = join_key_labels or set()
+
+    settled: Dict[str, List[str]] = {}
+    for entity in settled_entities:
+        for prop in entity["properties"]:
+            settled.setdefault(prop["name"], []).append(entity["name"])
+    joining: Dict[str, List[str]] = {}
+    for entity in join_entities:
+        for prop in entity["properties"]:
+            joining.setdefault(prop["name"], []).append(entity["name"])
+
+    colliding = sorted(
+        label for label, names in joining.items() if label in settled or len(names) > 1
+    )
+    if not colliding:
+        return []
+
+    # Every label already held is taken, shared ones too: a qualification processed
+    # before a shared join key's own turn must not claim it.
+    occupied = set(settled) | set(joining)
+    records: List[Dict[str, Any]] = []
+    renames: Dict[str, Dict[str, str]] = {}  # join entity -> {old: new}
+
+    for label in colliding:
+        yielding = sorted(joining[label])
+        keepers = sorted(settled.get(label, []))
+        # ``kind`` tells these records from the first pass's: a label can carry one
+        # record per pass (two linked entities and a join entity sharing it).
+        record: Dict[str, Any] = {
+            "label": label,
+            "entities": sorted(keepers + yielding),
+            "kind": "join_entity",
+        }
+
+        if label in join_key_labels:
+            record["resolution"] = "join_key"
+            record["detail"] = (
+                "declared cross-source join key (P6.7) — kept bare on every "
+                "entity so the federation join spine survives; the shared label "
+                "is intentional, not an ambiguity"
+            )
+            records.append(record)
+            occupied.add(label)
+            continue
+
+        if policy in {"warn", "reported"}:
+            record["resolution"] = "reported"
+            records.append(record)
+            occupied.add(label)
+            continue
+
+        candidates = {
+            name: _qualified_label(name, label, collapse_seam=policy == "roles")
+            for name in yielding
+        }
+        values = list(candidates.values())
+        clashes = sorted(
+            {c for c in values if c in occupied} | {c for c in values if values.count(c) > 1}
+        )
+        if clashes:
+            record["resolution"] = "unresolved"
+            record["reason"] = (
+                "qualifying would collide with an existing label: " + ", ".join(clashes)
+            )
+            occupied.add(label)
+            records.append(record)
+            continue
+
+        record["resolution"] = "qualified"
+        record["renamedTo"] = candidates
+        if len(keepers) == 1:
+            record["owner"] = keepers[0]
+        record["detail"] = (
+            "join-table entity yields: the label stays on the entities it links "
+            "and is qualified on the join entity only"
+        )
+        for name, new_label in candidates.items():
+            renames.setdefault(name, {})[label] = new_label
+            occupied.add(new_label)
+        records.append(record)
+
+    for entity in join_entities:
+        mapping = renames.get(entity["name"])
+        if not mapping:
+            continue
+        entity["properties"] = [
+            {**prop, "name": mapping.get(prop["name"], prop["name"])}
+            for prop in entity["properties"]
+        ]
+        physical = physical_entities.get(entity["name"])
+        if physical is not None:
+            physical["properties"] = {
+                mapping.get(prop_name, prop_name): spec
+                for prop_name, spec in physical["properties"].items()
+            }
+
+    return records
+
+
 def _apply_curated_plan(
     plan,
     conceptual_entities: List[Dict[str, Any]],
@@ -509,18 +659,32 @@ def _entity_property_names(cm: CollectionMapping, table: Optional[Table]) -> Lis
     return names
 
 
-def _join_key_labels(config: MappingConfig) -> set:
-    """Generated conceptual labels that are declared cross-source join keys (P6.7)."""
+def _join_key_labels(config: MappingConfig, *, join_tables: bool = True) -> set:
+    """Generated conceptual labels that are declared cross-source join keys (P6.7).
+
+    ``join_tables=False`` leaves out bindings on a join-table entity, so the
+    collision check among the other entities sees exactly the join keys it saw
+    before join tables were exported as entities.
+    """
+    return {
+        label
+        for cm, label in _join_key_bindings(config)
+        if join_tables or not cm.is_join_table
+    }
+
+
+def _join_key_bindings(config: MappingConfig) -> List[Tuple[CollectionMapping, str]]:
+    """Each declared cross-source join-key binding (P6.7) as (entity collection, label)."""
     collection_by_source_table = {cm.source_table: cm for cm in config.collections.values()}
-    labels: set = set()
+    bindings: List[Tuple[CollectionMapping, str]] = []
     for sk in config.shared_keys:
         for b in sk.bindings:
             cm_b = collection_by_source_table.get(b.table)
-            if cm_b is None or cm_b.collection_type == "edge" or cm_b.is_join_table:
+            if cm_b is None or not is_entity_collection(cm_b):
                 continue
             stored = cm_b.field_mappings.get(b.column, b.column)
-            labels.add(owl_property_name(stored))
-    return labels
+            bindings.append((cm_b, owl_property_name(stored)))
+    return bindings
 
 
 _KEY_SUFFIX = re.compile(r"(?i)(?:_id|id)$")
@@ -570,9 +734,7 @@ def entity_names_for_mapping(
                     continue
                 referencing.setdefault(fk.foreign_table, []).append((table_name, fk.columns[0]))
 
-    entity_maps = [
-        cm for cm in config.collections.values() if cm.collection_type != "edge" and not cm.is_join_table
-    ]
+    entity_maps = [cm for cm in config.collections.values() if is_entity_collection(cm)]
     sharing = Counter(cm.target_collection for cm in entity_maps)
     names: Dict[str, str] = {}
     evidence: List[Dict[str, Any]] = []
@@ -631,17 +793,24 @@ def curated_plan_for_mapping(
     names, _ = entity_names_for_mapping(config, schema)
     entities: Dict[str, List[str]] = {}
     for cm in config.collections.values():
-        if cm.collection_type == "edge" or cm.is_join_table:
+        if not is_entity_collection(cm):
             continue
         entities[names[cm.target_collection]] = [
             owl_property_name(p)
             for p in _entity_property_names(cm, tables.get(cm.source_table))
         ]
+    # A join key bound on a join-table entity is refused on that entity alone, so
+    # exporting the join table never blocks a curated rename on an entity it links.
+    entity_join_key_labels: Dict[str, set] = {}
+    for cm, label in _join_key_bindings(config):
+        if cm.is_join_table:
+            entity_join_key_labels.setdefault(names[cm.target_collection], set()).add(label)
     return plan_curated_labels(
         curated,
         entities=entities,
         relationships=[owl_property_name(e.edge_collection) for e in config.edges],
-        join_key_labels=_join_key_labels(config),
+        join_key_labels=_join_key_labels(config, join_tables=False),
+        entity_join_key_labels=entity_join_key_labels,
     )
 
 
@@ -702,7 +871,10 @@ def mapping_to_csi(
             the owning entity keeps the bare label); ``"warn"`` records them
             untouched; ``"off"`` skips the check. Whatever the policy, every
             collision is recorded in ``provenance.labelCollisions``; see
-            :func:`_resolve_label_collisions`.
+            :func:`_resolve_label_collisions`. A join table exported as an
+            entity never renames a property of another entity: its own
+            colliding labels are qualified instead (records with ``kind``
+            ``"join_entity"``); see :func:`_yield_join_entity_labels`.
         curated_labels: an optional curated-labels document
             (:mod:`r2g.curated_labels`, P12.12). Its renames are applied
             *before* the label-collision check, carry ``prefLabel`` /
@@ -732,8 +904,10 @@ def mapping_to_csi(
     pk_columns, fk_columns = _structural_columns(config, schema)
     property_roles: Dict[tuple, str] = {}
     for cm in config.collections.values():
-        if cm.collection_type == "edge" or cm.is_join_table:
-            # Join tables / edge collections are relationships, not entities.
+        if not is_entity_collection(cm):
+            # Edge collections are relationships, not entities. A join table
+            # still mapped as a document collection is loaded as a vertex, so it
+            # is an entity until it is promoted to an edge.
             continue
         # Conceptual name follows CC-12 (singular PascalCase), or the schema's own
         # foreign keys (P12.13); the physical collection name is preserved in the
@@ -805,11 +979,28 @@ def mapping_to_csi(
     # Resolve attribute labels shared by two or more entities *before* anything
     # downstream sees them: this is the only place with the whole document in
     # view, so a collision left here is unrecoverable for every consumer.
+    #
+    # A join table exported as an entity yields: the other entities are resolved
+    # among themselves first, exactly as if the join table were absent, and the
+    # join entity's colliding labels are then qualified on it alone, so adding it
+    # never renames a property of an entity it links.
+    join_names = {
+        entity_name_by_collection[cm.target_collection]
+        for cm in config.collections.values()
+        if is_entity_collection(cm) and cm.is_join_table
+    }
     label_collisions = _resolve_label_collisions(
-        conceptual_entities,
+        [e for e in conceptual_entities if e["name"] not in join_names],
         physical_entities,
         label_policy,
         property_roles=property_roles,
+        join_key_labels=_join_key_labels(config, join_tables=False),
+    )
+    label_collisions += _yield_join_entity_labels(
+        [e for e in conceptual_entities if e["name"] in join_names],
+        [e for e in conceptual_entities if e["name"] not in join_names],
+        physical_entities,
+        label_policy,
         join_key_labels=join_key_labels,
     )
 

@@ -25,6 +25,7 @@ from r2g.types import (  # noqa: E402
     Column,
     EdgeDefinition,
     FieldExpression,
+    ForeignKey,
     MappingConfig,
     Schema,
     Table,
@@ -372,7 +373,7 @@ def test_join_table_edge_endpoint_is_skipped_with_note():
     config.edges.append(
         EdgeDefinition(
             edge_collection="tagged",
-            from_collection="user_orders",  # a join table, not a document entity
+            from_collection="user_orders",  # a table missing from the mapping
             to_collection="users",
             from_fields=["x"],
             to_fields=["id"],
@@ -382,6 +383,134 @@ def test_join_table_edge_endpoint_is_skipped_with_note():
     assert "Skipped edges" in ttl and "tagged" in ttl
     # Still valid Turtle.
     assert len(_parse(ttl)) > 0
+
+
+# ── A join table Auto-Map flags but leaves a document collection ───────────
+#
+# generate-config flags a two-FK table ``is_join_table`` and keeps it a
+# ``document`` collection, so the loaders write it as a vertex plus one edge
+# per foreign key (PRD Phase 10: "loaded as a vertex + FK edges"). The export
+# must describe that vertex: skipping it dropped both of its foreign-key
+# relationships, so the many-to-many link it carries could not be queried.
+
+
+def _join_table_schema() -> Schema:
+    """student ↔ course_section through student_section; course_section's key is composite."""
+    return Schema(
+        tables={
+            "student": Table(
+                name="student",
+                columns=[
+                    Column(name="student_id", data_type="integer", is_primary_key=True),
+                    Column(name="full_name", data_type="text"),
+                ],
+                primary_key=["student_id"],
+            ),
+            "course_section": Table(
+                name="course_section",
+                columns=[
+                    Column(name="course_id", data_type="integer", is_primary_key=True),
+                    Column(name="term_start", data_type="date", is_primary_key=True),
+                ],
+                primary_key=["course_id", "term_start"],
+            ),
+            "student_section": Table(
+                name="student_section",
+                columns=[
+                    Column(name="student_id", data_type="integer", is_primary_key=True),
+                    Column(name="course_id", data_type="integer", is_primary_key=True),
+                    Column(name="term_start", data_type="date", is_primary_key=True),
+                ],
+                primary_key=["student_id", "course_id", "term_start"],
+                foreign_keys=[
+                    ForeignKey(columns=["student_id"], foreign_table="student", foreign_columns=["student_id"]),
+                    ForeignKey(
+                        columns=["course_id", "term_start"],
+                        foreign_table="course_section",
+                        foreign_columns=["course_id", "term_start"],
+                    ),
+                ],
+            ),
+        }
+    )
+
+
+def _auto_map_join_table():
+    from r2g.config import ConfigManager
+
+    schema = _join_table_schema()
+    config = ConfigManager.generate_default_config(schema)
+    # The shape under test: flagged, but still a document collection.
+    jt = config.collections["student_section"]
+    assert jt.is_join_table and jt.collection_type == "document"
+    return config, schema
+
+
+def test_join_table_left_a_document_collection_gets_a_triplesmap():
+    config, schema = _auto_map_join_table()
+    ttl = mapping_to_r2rml(config, schema)
+    tms = _triples_maps(_parse(ttl))
+    assert set(tms) == {"Student", "CourseSection", "StudentSection"}
+    assert "Skipped edges" not in ttl
+
+
+def test_join_table_triplesmap_reads_the_join_table_by_its_whole_key():
+    config, schema = _auto_map_join_table()
+    g = _parse(mapping_to_r2rml(config, schema, resource_base="http://r/"))
+    tm = _triples_maps(g)["StudentSection"]
+    assert str(g.value(g.value(tm, RR.logicalTable), RR.tableName)) == "student_section"
+    template = str(g.value(g.value(tm, RR.subjectMap), RR.template))
+    assert template == "http://r/StudentSection/{student_id}/{course_id}/{term_start}"
+
+
+def test_join_table_carries_both_foreign_key_relationships():
+    config, schema = _auto_map_join_table()
+    g = _parse(mapping_to_r2rml(config, schema))
+    tms = _triples_maps(g)
+    poms = _poms(g, tms["StudentSection"])
+
+    to_student = poms["studentSectionToStudent"]
+    assert g.value(to_student, RR.parentTriplesMap) == tms["Student"]
+    joins = {(str(g.value(j, RR.child)), str(g.value(j, RR.parent))) for j in g.objects(to_student, RR.joinCondition)}
+    assert joins == {("student_id", "student_id")}
+
+    # A composite foreign key joins on every one of its columns.
+    to_section = poms["studentSectionToCourseSection"]
+    assert g.value(to_section, RR.parentTriplesMap) == tms["CourseSection"]
+    joins = {(str(g.value(j, RR.child)), str(g.value(j, RR.parent))) for j in g.objects(to_section, RR.joinCondition)}
+    assert joins == {("course_id", "course_id"), ("term_start", "term_start")}
+
+
+def test_join_table_promoted_to_an_edge_collection_still_gets_no_triplesmap():
+    # The other half of the rule: once a join table is an edge collection it is
+    # loaded as edges only, so it is a relationship, not a TriplesMap of its own.
+    config, schema = _auto_map_join_table()
+    config.collections["student_section"].collection_type = "edge"
+    ttl = mapping_to_r2rml(config, schema)
+    assert set(_triples_maps(_parse(ttl))) == {"Student", "CourseSection"}
+    assert "student_section_to_student" in ttl  # its FK edges are listed as skipped
+
+
+def test_export_r2rml_cli_counts_a_join_table_triplesmap(tmp_path):
+    from typer.testing import CliRunner
+
+    from r2g.config import ConfigManager
+    from r2g.main import app
+
+    config, schema = _auto_map_join_table()
+    schema_path = tmp_path / "schema.json"
+    schema.save_to_file(str(schema_path))
+    config_path = tmp_path / "mapping.yaml"
+    ConfigManager.save_config(config, str(config_path))
+
+    out = tmp_path / "m.ttl"
+    result = CliRunner().invoke(
+        app,
+        ["export-r2rml", "--config", str(config_path), "--schema", str(schema_path), "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(_triples_maps(_parse(out.read_text(encoding="utf-8")))) == 3
+    assert "3 TriplesMaps" in result.output
 
 
 def test_export_r2rml_cli(tmp_path):

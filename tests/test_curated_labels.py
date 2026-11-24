@@ -257,6 +257,132 @@ def test_refuses_renaming_a_declared_join_key():
     assert "accountId" in _prop_names(doc, "Account")
 
 
+def test_an_entity_join_key_is_refused_on_that_entity_alone():
+    plan = plan_curated_labels(
+        _labels(
+            properties=[
+                {"entity": "A", "name": "x", "label": "a x"},
+                {"entity": "J", "name": "x", "label": "j x"},
+            ]
+        ),
+        entities={"A": ["x"], "J": ["x"]},
+        relationships=[],
+        entity_join_key_labels={"J": {"x"}},
+    )
+    by_entity = {r["entity"]: r for r in plan.records}
+    assert by_entity["A"]["resolution"] == "applied"
+    assert by_entity["J"]["resolution"] == "refused"
+    assert "join key" in by_entity["J"]["reason"]
+    assert plan.prop("A", "x") == "aX"
+    assert plan.prop("J", "x") == "x"
+
+
+def _join_table_mapping():
+    """Student and its join table Enrollment both carry created_at; a shared key
+    binds only Enrollment's (#88: the join table is exported as an entity)."""
+    config, schema = _join_table_config()
+    config.shared_keys = [
+        SharedKey(
+            key="createdAt",
+            concept="Enrollment",
+            bindings=[SharedKeyBinding(source="school", table="enrollment", column="created_at")],
+        )
+    ]
+    return config, schema
+
+
+def _join_table_config(junction=("created_at", "timestamp")):
+    """student, course and their join table enrollment, whose junction column is `junction`."""
+    from r2g.config import ConfigManager
+    from r2g.types import ForeignKey
+
+    def table(name, cols, pk, fks=()):
+        return Table(
+            name=name,
+            columns=[Column(name=c, data_type=t, is_primary_key=c in pk) for c, t in cols],
+            primary_key=list(pk),
+            foreign_keys=[
+                ForeignKey(columns=[c], foreign_table=ft, foreign_columns=[fc])
+                for c, ft, fc in fks
+            ],
+        )
+
+    schema = Schema(
+        tables={
+            "student": table(
+                "student",
+                [("student_id", "integer"), ("full_name", "text"), ("created_at", "timestamp")],
+                ["student_id"],
+            ),
+            "course": table("course", [("course_id", "integer"), ("title", "text")], ["course_id"]),
+            "enrollment": table(
+                "enrollment",
+                [("student_id", "integer"), ("course_id", "integer"), junction],
+                ["student_id", "course_id"],
+                [("student_id", "student", "student_id"), ("course_id", "course", "course_id")],
+            ),
+        }
+    )
+    config = ConfigManager.generate_default_config(schema)
+    assert config.collections["enrollment"].is_join_table
+    return config, schema
+
+
+def test_a_join_tables_join_key_does_not_block_a_rename_on_an_entity_it_links():
+    # As before join tables were exported: Student.createdAt is renamed, and the
+    # join entity keeps the bare join-key label the bind-join references.
+    config, schema = _join_table_mapping()
+    labels = _labels(
+        properties=[
+            {"entity": "Student", "name": "createdAt", "label": "enrolled on"},
+            {"entity": "Enrollment", "name": "createdAt", "label": "joined on"},
+        ]
+    )
+    doc = mapping_to_csi(config, schema, label_policy="warn", curated_labels=labels)
+    validate_csi(doc)
+    assert "enrolledOn" in _prop_names(doc, "Student")
+    assert "createdAt" in _prop_names(doc, "Enrollment")
+    by_entity = {r["entity"]: r for r in doc["provenance"]["curatedLabels"]}
+    assert by_entity["Student"]["resolution"] == "applied"
+    assert by_entity["Enrollment"]["resolution"] == "refused"
+    assert "join key" in by_entity["Enrollment"]["reason"]
+
+    ttl = mapping_to_r2rml(config, schema, curated_labels=labels)
+    assert {"enrolledOn", "createdAt"} <= _r2rml_predicates(ttl)
+
+
+# The join entity's labels and name are held like any entity's (P12.12: a curated
+# name another entity carries is refused), so two renames `main` applied, when the
+# join table was not exported, are refused now.
+@pytest.mark.parametrize("policy", ["warn", "qualify"])
+def test_a_linked_entity_rename_onto_a_label_only_the_join_entity_carries_is_refused(policy):
+    config, schema = _join_table_config(junction=("quantity", "integer"))
+    labels = _labels(properties=[{"entity": "Course", "name": "title", "label": "quantity"}])
+    doc = mapping_to_csi(config, schema, label_policy=policy, curated_labels=labels)
+    validate_csi(doc)
+    record = _record(doc, "title")
+    assert record["resolution"] == "refused"
+    assert record["reason"] == "label 'quantity' is already carried by Enrollment.quantity"
+    assert "title" in _prop_names(doc, "Course")
+    assert "quantity" in _prop_names(doc, "Enrollment")
+
+
+@pytest.mark.parametrize("policy", ["warn", "qualify"])
+def test_an_entity_rename_onto_the_join_entity_name_is_refused(policy):
+    config, schema = _join_table_config()
+    labels = _labels(entities=[{"name": "Course", "label": "Enrollment"}])
+    doc = mapping_to_csi(config, schema, label_policy=policy, curated_labels=labels)
+    validate_csi(doc)
+    record = _record(doc, "Course")
+    assert record["resolution"] == "refused"
+    assert record["reason"] == "entity name 'Enrollment' is already taken by Enrollment"
+    assert {e["name"] for e in doc["conceptualModel"]["entities"]} == {
+        "Student",
+        "Course",
+        "Enrollment",
+    }
+
+
 def test_two_entries_for_one_concept_are_both_refused():
     labels = _labels(
         properties=[
