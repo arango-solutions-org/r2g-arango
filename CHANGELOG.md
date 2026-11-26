@@ -9,7 +9,7 @@ and this project aspires to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A read-only view of a project's exported mapping (#54, PRD P14.16).** `r2g export-csi --project
+- **A read-only view of a project's exported mapping (#54, PRD P14.19).** `r2g export-csi --project
   NAME` and `r2g export-r2rml --project NAME` export a catalog project's mapping against the latest
   snapshot of its source, to the project's directory, each with a receipt of its inputs. They refuse
   a mapping that names a table or column the snapshot lacks. The Studio's **View exported mapping**
